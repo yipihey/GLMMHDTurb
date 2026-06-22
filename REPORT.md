@@ -190,5 +190,11 @@ all-edges-live (the natural ab=1) was fastest.
 
 **Validation:** hydro PPM Sod mass-exact (972000→972000), ρ>0, *sharper* contact than PLM (ρmax
 0.997, no overshoot). MHD PPM Orszag-Tang vrms=0.7910 (= PLM-HLL), div·B 1.16 (between HLL 0.96 and
-HLLD 3.59), ρ>0, finite. Both kernels live in `/tmp/ppm_hydro.jl`, `/tmp/ppm_mhd.jl` (not wired into
-the module — PLM stays the default; PPM is the accuracy-for-throughput option, ~1.5×/~2.9× the cost).
+HLLD 3.59), ρ>0, finite.
+
+**Now in the module** as an opt-in: `step_plm!(...; recon=:ppm)` (GLM-MHD `integrator_plm_ppm!`) and
+`step_hydro!(...; recon=:ppm)` (`integrator_hydro_ppm!`). PLM stays the default; `recon=:ppm` requires
+the f16+HLL path (`half=true, riemann=:hll`, tb=4 or 6) and errors otherwise. The single-zone edge
+(`ppm_edges`/`ppm_mono`) is shared by both; MHD adds `ppm9`/`mhd_face9`/`spj`, hydro adds the
+characteristic trace (`ppm_avg`/`ppm_side`/`ppm_trace5`/`ppm_dir`). PPM is the accuracy-for-throughput
+option (~1.5× hydro / ~2.9× MHD cost).

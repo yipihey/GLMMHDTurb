@@ -876,14 +876,24 @@ end
 # Supported configs: (tb=6,half=true,riemann=:hll|:llf), (tb=4,half=false,riemann=:hlld bit-repro),
 # (tb=4,half=true,riemann=:hll). Other combos: error (add a branch if needed).
 function step_plm!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
-                   do_turb::Bool=false, nthreads::Int=192, tb::Int=0, half::Bool=true, riemann::Symbol=:hll)
+                   do_turb::Bool=false, nthreads::Int=192, tb::Int=0, half::Bool=true,
+                   riemann::Symbol=:hll, recon::Symbol=:plm)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
     tb == 0 && (tb = N % 6 == 0 ? 6 : 4)   # auto: nsubgrid=3 when it divides N, else nsubgrid=2
     @assert N % tb == 0 "N=$N not divisible by tb=$tb (need N%6==0 for the fast TB=6 path, or N%4==0)"
     ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0); nb = N ÷ tb
-    if tb==6 && half && riemann===:hll
+    if recon === :ppm   # lean parabolic-PPM (single-zone edges + Hancock + shock fallback); f16+HLL only
+        (half && riemann===:hll) || error("step_plm! recon=:ppm supports only half=true,riemann=:hll (got half=$half, riemann=$riemann)")
+        if tb==6
+            _plm_ppm_launch(Val(6),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
+        elseif tb==4
+            _plm_ppm_launch(Val(4),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
+        else
+            error("step_plm! recon=:ppm: unsupported tb=$tb (use 4 or 6)")
+        end
+    elseif tb==6 && half && riemann===:hll
         _plm_launch(Val(6),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
     elseif tb==6 && half && riemann===:llf
         _plm_launch(Val(6),Val(true),Val(:llf), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
@@ -895,6 +905,119 @@ function step_plm!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
         error("step_plm!: unsupported (tb=$tb, half=$half, riemann=$riemann); add a branch")
     end
     return nothing
+end
+
+# ============================================================================
+# PPM reconstruction (single-zone, ±1 stencil → SAME (TB+4) tile as PLM). Transliterated from
+# the reference `mini-ramses-metal/gpu/gpu_hydro.cuf` (`local_ppm_*`, `trace_3d_mhd_par`) and
+# Vespa.jl `lib/PPMKernels`: 3-point parabolic edges + Colella-Woodward (CW84) monotonize.
+# Penalty vs PLM (N=480, f16, TB6, HLL): hydro 1.49x, GLM-MHD 2.86x — an occupancy cliff set by
+# the register budget (9-var MHD PLM is already 144 regs/2 blocks/SM; PPM's 201 regs → 1 block/SM).
+# ============================================================================
+@fastmath @inline function ppm_mono(ql, q0, qr)   # CW84 monotonize -> (lo, hi)
+    dq=qr-ql; diff=(q0-0.5f0*(ql+qr))*dq
+    ifelse((qr-q0)*(q0-ql)<=0f0, (q0,q0),
+      ifelse(diff>dq*dq/6f0, (3f0*q0-2f0*qr, qr),
+        ifelse(diff<(-dq*dq/6f0), (ql, 3f0*q0-2f0*ql), (ql,qr))))
+end
+@fastmath @inline ppm_edges(qm,q0,qp) = (slope=0.25f0*(qp-qm); curve=(qm-2f0*q0+qp)/12f0; ppm_mono(q0-slope+curve, q0, q0+slope+curve))
+@fastmath @inline function ppm9(l,m,r); e=ntuple(v->ppm_edges(l[v],m[v],r[v]),9); (ntuple(v->e[v][1],9), ntuple(v->e[v][2],9)); end
+@fastmath @inline mhd_face9(mh,ed,m0) = ntuple(v->mh[v]+ed[v]-m0[v], 9)   # PPM spatial edge + Hancock time prediction
+@fastmath @inline spj(a,b,c) = (hi=max(a,max(b,c)); lo=max(min(a,min(b,c)),1f-20); hi/lo>2.0f0)   # strong_pressure_jump
+
+# MHD lean parabolic-PPM kernel: identical to integrator_plm! except the reconstruction stage —
+# MonCen slope + Hancock predictor (unchanged), PPM only sets the spatial face mh+edge-m0, with a
+# per-cell strong_pressure_jump -> PLM fallback at shocks.
+function integrator_plm_ppm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, afield,
+                         gamma::Float32, smallr::Float32, pfl::Float32, smallc::Float32,
+                         dt::Float32, dx::Float32, ch::Float32, glm_fac::Float32,
+                         llf_dmin::Float32, llf_pmin::Float32, N::Int,
+                         boxlen::Float32, ramp::Float32, turb_min_rho::Float32, do_turb::Bool) where {TB,HALF,RIEM}
+    TT = TB + 4; ST = HALF ? Float16 : Float32
+    SP = CuStaticSharedArray(ST, 9*TT*TT*TT)
+    LX = CuStaticSharedArray(ST, 9*(TB+1)*TB*TB); RX = CuStaticSharedArray(ST, 9*(TB+1)*TB*TB)
+    LY = CuStaticSharedArray(ST, 9*TB*(TB+1)*TB); RY = CuStaticSharedArray(ST, 9*TB*(TB+1)*TB)
+    LZ = CuStaticSharedArray(ST, 9*TB*TB*(TB+1)); RZ = CuStaticSharedArray(ST, 9*TB*TB*(TB+1))
+    lt(pi,pj,pk)=pi+TT*(pj+TT*pk); lfx(fi,fj,fk)=fi+(TB+1)*(fj+TB*fk); lfy(fi,fj,fk)=fi+TB*(fj+(TB+1)*fk); lfz(fi,fj,fk)=fi+TB*(fj+TB*fk)
+    rv = Val(RIEM)
+    @fastmath @inbounds begin
+        dtdx = dt/dx; tid = threadIdx().x; nth = blockDim().x
+        ox=(blockIdx().x-1)*TB; oy=(blockIdx().y-1)*TB; oz=(blockIdx().z-1)*TB
+        t = tid
+        while t <= TT*TT*TT
+            l=t-1; pi=l%TT; pj=(l÷TT)%TT; pk=l÷(TT*TT)
+            _spT(SP, lt(pi,pj,pk), cons2prim(loadc(uold, wrp(ox+pi-1,N), wrp(oy+pj-1,N), wrp(oz+pk-1,N)), gamma,smallr,pfl)); t+=nth
+        end
+        sync_threads(); t=tid
+        while t <= (TB+2)^3
+            l=t-1; ci=l%(TB+2); cj=(l÷(TB+2))%(TB+2); ck=l÷((TB+2)*(TB+2)); pi=ci+1;pj=cj+1;pk=ck+1
+            m0 = _sgT(SP, lt(pi,pj,pk))
+            mxl=_sgT(SP,lt(pi-1,pj,pk));mxr=_sgT(SP,lt(pi+1,pj,pk));myl=_sgT(SP,lt(pi,pj-1,pk));myr=_sgT(SP,lt(pi,pj+1,pk));mzl=_sgT(SP,lt(pi,pj,pk-1));mzr=_sgT(SP,lt(pi,pj,pk+1))
+            sx=prim_slope(mxl,m0,mxr); sy=prim_slope(myl,m0,myr); sz=prim_slope(mzl,m0,mzr)
+            mh = cons2prim(hancock(m0,sx,sy,sz,dtdx,gamma), gamma,smallr,pfl)
+            (mh[1]<=smallr || mh[5]<=pfl) && (mh = m0)
+            up = !(spj(mxl[5],m0[5],mxr[5])||spj(myl[5],m0[5],myr[5])||spj(mzl[5],m0[5],mzr[5]))
+            pmx,ppx=ppm9(mxl,m0,mxr); pmy,ppy=ppm9(myl,m0,myr); pmz,ppz=ppm9(mzl,m0,mzr)
+            inxt=(pj>=2&&pj<=TB+1)&&(pk>=2&&pk<=TB+1); inyt=(pi>=2&&pi<=TB+1)&&(pk>=2&&pk<=TB+1); inzt=(pi>=2&&pi<=TB+1)&&(pj>=2&&pj<=TB+1)
+            if inxt
+                pi<=TB+1 && _spT(LX, lfx(pi-1,pj-2,pk-2), iflo(up ? mhd_face9(mh,ppx,m0) : padd(mh,sx,1.0f0),m0,smallr,pfl))
+                pi>=2    && _spT(RX, lfx(pi-2,pj-2,pk-2), iflo(up ? mhd_face9(mh,pmx,m0) : padd(mh,sx,-1.0f0),m0,smallr,pfl))
+            end
+            if inyt
+                pj<=TB+1 && _spT(LY, lfy(pi-2,pj-1,pk-2), iflo(up ? mhd_face9(mh,ppy,m0) : padd(mh,sy,1.0f0),m0,smallr,pfl))
+                pj>=2    && _spT(RY, lfy(pi-2,pj-2,pk-2), iflo(up ? mhd_face9(mh,pmy,m0) : padd(mh,sy,-1.0f0),m0,smallr,pfl))
+            end
+            if inzt
+                pk<=TB+1 && _spT(LZ, lfz(pi-2,pj-2,pk-1), iflo(up ? mhd_face9(mh,ppz,m0) : padd(mh,sz,1.0f0),m0,smallr,pfl))
+                pk>=2    && _spT(RZ, lfz(pi-2,pj-2,pk-2), iflo(up ? mhd_face9(mh,pmz,m0) : padd(mh,sz,-1.0f0),m0,smallr,pfl))
+            end
+            t+=nth
+        end
+        sync_threads(); nfx=(TB+1)*TB*TB; t=tid
+        while t <= 3*nfx
+            if t<=nfx
+                l=t-1;fi=l%(TB+1);fj=(l÷(TB+1))%TB;fk=l÷((TB+1)*TB)
+                _spT(LX, lfx(fi,fj,fk), riemann_sel(rv, _sgT(LX,lfx(fi,fj,fk)), _sgT(RX,lfx(fi,fj,fk)), 1, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+            elseif t<=2*nfx
+                l=t-1-nfx;fi=l%TB;fj=(l÷TB)%(TB+1);fk=l÷(TB*(TB+1))
+                _spT(LY, lfy(fi,fj,fk), riemann_sel(rv, _sgT(LY,lfy(fi,fj,fk)), _sgT(RY,lfy(fi,fj,fk)), 2, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+            else
+                l=t-1-2*nfx;fi=l%TB;fj=(l÷TB)%TB;fk=l÷(TB*TB)
+                _spT(LZ, lfz(fi,fj,fk), riemann_sel(rv, _sgT(LZ,lfz(fi,fj,fk)), _sgT(RZ,lfz(fi,fj,fk)), 3, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+            end
+            t+=nth
+        end
+        sync_threads(); t=tid
+        while t <= TB*TB*TB
+            l=t-1;a=l%TB;b=(l÷TB)%TB;c=l÷(TB*TB); gi=wrp(ox+a+1,N);gj=wrp(oy+b+1,N);gk=wrp(oz+c+1,N)
+            Fxl=_sgT(LX,lfx(a,b,c));Fxh=_sgT(LX,lfx(a+1,b,c));Fyl=_sgT(LY,lfy(a,b,c));Fyh=_sgT(LY,lfy(a,b+1,c));Fzl=_sgT(LZ,lfz(a,b,c));Fzh=_sgT(LZ,lfz(a,b,c+1))
+            u0 = loadc(uold,gi,gj,gk)
+            r1 = ntuple(v -> u0[v] + dtdx*((Fxl[v]-Fxh[v])+(Fyl[v]-Fyh[v])+(Fzl[v]-Fzh[v])), 9)
+            if r1[1] < smallr
+                emag=0.5f0*(r1[6]*r1[6]+r1[7]*r1[7]+r1[8]*r1[8])
+                r1=(smallr,0.0f0,0.0f0,0.0f0,pfl/(gamma-1.0f0)+emag,r1[6],r1[7],r1[8],r1[9])
+            end
+            r=(r1[1],r1[2],r1[3],r1[4],r1[5],r1[6],r1[7],r1[8], r1[9]*glm_fac)
+            if do_turb && r[1] >= turb_min_rho
+                ax,ay,az = turb_interp(afield, gi,gj,gk, boxlen/N, boxlen, ramp)
+                rhom=max(r[1],smallr); sc2=smallc*smallc; rho=r[1]; e=r[5]
+                e=max(e-0.5f0*r[2]*r[2]/rhom,rho*sc2);e=max(e-0.5f0*r[3]*r[3]/rhom,rho*sc2);e=max(e-0.5f0*r[4]*r[4]/rhom,rho*sc2)
+                m2=r[2]+rhom*ax*dt;m3=r[3]+rhom*ay*dt;m4=r[4]+rhom*az*dt
+                e=max(e+0.5f0*m2*m2/rhom,rho*sc2);e=max(e+0.5f0*m3*m3/rhom,rho*sc2);e=max(e+0.5f0*m4*m4/rhom,rho*sc2)
+                r=(r[1],m2,m3,m4,e,r[6],r[7],r[8],r[9])
+            end
+            for v in 1:9; unew[gi,gj,gk,v]=r[v]; end
+            t+=nth
+        end
+    end
+    return nothing
+end
+
+@inline function _plm_ppm_launch(tv::Val, hv::Val, rv::Val, nthreads, nb, unew, uold, afield, p::Params,
+                                 pfl, dt, dx, ch, glm_fac, ramp, do_turb)
+    @cuda threads=nthreads blocks=(nb,nb,nb) integrator_plm_ppm!(
+        tv, hv, rv, unew, uold, afield, p.gamma, p.smallr, pfl, p.smallc, dt, dx, ch, glm_fac,
+        p.switch_llf_dmin, p.switch_llf_pmin, p.N, p.boxlen, ramp, p.turb_min_rho, do_turb)
 end
 
 # ============================================================================
@@ -1015,11 +1138,21 @@ end
 end
 # Pure-hydro PLM step. Default = MonCen-PLM + Hancock + HLL, f16, TB auto (6 if N%6==0 else 4).
 function step_hydro!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
-                     do_turb::Bool=false, nthreads::Int=192, tb::Int=0, half::Bool=true, riemann::Symbol=:hll)
+                     do_turb::Bool=false, nthreads::Int=192, tb::Int=0, half::Bool=true,
+                     riemann::Symbol=:hll, recon::Symbol=:plm)
     N=p.N; dx=dxof(p); pfl=pfloor(p); ramp=min(t/p.turb_T,1.0f0)
     tb==0 && (tb = N%6==0 ? 6 : 4); @assert N%tb==0 "N=$N not divisible by tb=$tb"
     nb=N÷tb
-    if tb==6 && half && riemann===:hll
+    if recon === :ppm   # single-zone 3-wave characteristic PPM; f16+HLL only
+        (half && riemann===:hll) || error("step_hydro! recon=:ppm supports only half=true,riemann=:hll")
+        if tb==6
+            _hydro_ppm_launch(Val(6),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+        elseif tb==4
+            _hydro_ppm_launch(Val(4),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+        else
+            error("step_hydro! recon=:ppm: unsupported tb=$tb (use 4 or 6)")
+        end
+    elseif tb==6 && half && riemann===:hll
         _hydro_launch(Val(6),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
     elseif tb==6 && half && riemann===:llf
         _hydro_launch(Val(6),Val(true),Val(:llf), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
@@ -1031,6 +1164,110 @@ function step_hydro!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
         error("step_hydro!: unsupported (tb=$tb, half=$half, riemann=$riemann); add a branch")
     end
     return nothing
+end
+
+# ---- Hydro single-zone PPM: parabolic edges (ppm_edges, shared with MHD) + 3-wave characteristic
+# trace (local_ppm_trace: parabola integrated over each acoustic/entropy wave's domain of dependence
+# via ppm_avg). ±1 stencil → same (TB+4) tile as PLM. ~2856 Mcell/s vs PLM 4250 (1.49x). ----
+@fastmath @inline ppm_avg(ql,qa,qr,lo,hi) = (b=-4f0*ql+6f0*qa-2f0*qr; c=3f0*(ql-2f0*qa+qr); ql+0.5f0*b*(lo+hi)+c*(lo*lo+lo*hi+hi*hi)/3f0)
+@fastmath @inline function ppm_side(::Val{R}, m, cs, dtdx, dl,dr,ul,ur,vl,vr,wl,wr,pl,pr) where {R}
+    rg=R ? dr : dl; ug=R ? ur : ul; vg=R ? vr : vl; wg=R ? wr : wl; pg=R ? pr : pl
+    od=0f0;ou=0f0;ov=0f0;ow=0f0;op=0f0; ics=1f0/cs; irho=1f0/m[1]
+    @inbounds for wave in 1:3
+        lam = wave==1 ? m[2]-cs : (wave==2 ? m[2] : m[2]+cs)
+        go = R ? (lam>0f0) : (lam<0f0)
+        if go
+            sigma=min(abs(lam)*dtdx,1f0); a = R ? 1f0-sigma : 0f0; b = R ? 1f0 : sigma
+            du=ppm_avg(ul,m[2],ur,a,b)-ug; dpr=ppm_avg(pl,m[5],pr,a,b)-pg
+            if wave==1
+                amp=-m[1]*du*0.5f0*ics+dpr*0.5f0*ics*ics; ou+=(-cs*irho)*amp; od+=amp; op+=cs*cs*amp
+            elseif wave==3
+                amp= m[1]*du*0.5f0*ics+dpr*0.5f0*ics*ics; ou+=( cs*irho)*amp; od+=amp; op+=cs*cs*amp
+            else
+                od+=ppm_avg(dl,m[1],dr,a,b)-rg-dpr*ics*ics; ov+=ppm_avg(vl,m[3],vr,a,b)-vg; ow+=ppm_avg(wl,m[4],wr,a,b)-wg
+            end
+        end
+    end
+    q=(rg+od,ug+ou,vg+ov,wg+ow,pg+op); (q[1]<=0f0||q[5]<=0f0) ? m : q
+end
+@fastmath @inline function ppm_trace5(l,m,r,gamma,dtdx)   # -> (qplus,qminus); normal velocity in slot 2
+    sp=1f-30; sr=1f-10
+    dl,dr=ppm_edges(l[1],m[1],r[1]); ul,ur=ppm_edges(l[2],m[2],r[2]); vl,vr=ppm_edges(l[3],m[3],r[3]); wl,wr=ppm_edges(l[4],m[4],r[4]); pl,pr=ppm_edges(l[5],m[5],r[5])
+    cs=sqrt(gamma*max(m[5],sp)/max(m[1],sr))
+    dl,dr=ppm_mono(dl,m[1],dr); ul,ur=ppm_mono(ul,m[2],ur); vl,vr=ppm_mono(vl,m[3],vr); wl,wr=ppm_mono(wl,m[4],wr); pl,pr=ppm_mono(pl,m[5],pr)
+    (dl<=0f0||dr<=0f0)&&(dl=m[1];dr=m[1]); (pl<=0f0||pr<=0f0)&&(pl=m[5];pr=m[5])
+    dl=max(dl,sr);dr=max(dr,sr);pl=max(pl,sp);pr=max(pr,sp)
+    (ppm_side(Val(true),m,cs,dtdx,dl,dr,ul,ur,vl,vr,wl,wr,pl,pr), ppm_side(Val(false),m,cs,dtdx,dl,dr,ul,ur,vl,vr,wl,wr,pl,pr))
+end
+@fastmath @inline function ppm_dir(l,m,r,gamma,dtdx,::Val{D}) where {D}   # rotate dir D into slot 2, trace, rotate back
+    qp,qm=ppm_trace5(rot_to5(l,D),rot_to5(m,D),rot_to5(r,D),gamma,dtdx); (rot_flux5(qp,D), rot_flux5(qm,D))
+end
+
+# Hydro PPM kernel: identical to integrator_hydro! except stage 2 uses the per-direction
+# characteristic PPM trace instead of MonCen slope + Hancock.
+function integrator_hydro_ppm!(::Val{TB},::Val{HALF},::Val{RIEM}, unew, uold, afield,
+                           gamma::Float32, smallr::Float32, pfl::Float32, smallc::Float32,
+                           dt::Float32, dx::Float32, N::Int, boxlen::Float32, ramp::Float32,
+                           turb_min_rho::Float32, do_turb::Bool) where {TB,HALF,RIEM}
+    TT=TB+4; ST=HALF ? Float16 : Float32
+    SP=CuStaticSharedArray(ST,5*TT*TT*TT)
+    LX=CuStaticSharedArray(ST,5*(TB+1)*TB*TB);RX=CuStaticSharedArray(ST,5*(TB+1)*TB*TB)
+    LY=CuStaticSharedArray(ST,5*TB*(TB+1)*TB);RY=CuStaticSharedArray(ST,5*TB*(TB+1)*TB)
+    LZ=CuStaticSharedArray(ST,5*TB*TB*(TB+1));RZ=CuStaticSharedArray(ST,5*TB*TB*(TB+1))
+    lt(pi,pj,pk)=pi+TT*(pj+TT*pk);lfx(fi,fj,fk)=fi+(TB+1)*(fj+TB*fk);lfy(fi,fj,fk)=fi+TB*(fj+(TB+1)*fk);lfz(fi,fj,fk)=fi+TB*(fj+TB*fk)
+    rv=Val(RIEM)
+    @fastmath @inbounds begin
+        dtdx=dt/dx;tid=threadIdx().x;nth=blockDim().x;ox=(blockIdx().x-1)*TB;oy=(blockIdx().y-1)*TB;oz=(blockIdx().z-1)*TB
+        t=tid
+        while t<=TT*TT*TT
+            l=t-1;pi=l%TT;pj=(l÷TT)%TT;pk=l÷(TT*TT)
+            _sp5(SP,lt(pi,pj,pk),cons2prim5(loadc5(uold,wrp(ox+pi-1,N),wrp(oy+pj-1,N),wrp(oz+pk-1,N)),gamma,smallr,pfl));t+=nth
+        end
+        sync_threads();t=tid
+        while t<=(TB+2)^3
+            l=t-1;ci=l%(TB+2);cj=(l÷(TB+2))%(TB+2);ck=l÷((TB+2)*(TB+2));pi=ci+1;pj=cj+1;pk=ck+1
+            m0=_sg5(SP,lt(pi,pj,pk))
+            qpx,qmx=ppm_trace5(_sg5(SP,lt(pi-1,pj,pk)),m0,_sg5(SP,lt(pi+1,pj,pk)),gamma,dtdx)
+            qpy,qmy=ppm_dir(_sg5(SP,lt(pi,pj-1,pk)),m0,_sg5(SP,lt(pi,pj+1,pk)),gamma,dtdx,Val(2))
+            qpz,qmz=ppm_dir(_sg5(SP,lt(pi,pj,pk-1)),m0,_sg5(SP,lt(pi,pj,pk+1)),gamma,dtdx,Val(3))
+            inx=(pj>=2&&pj<=TB+1)&&(pk>=2&&pk<=TB+1);iny=(pi>=2&&pi<=TB+1)&&(pk>=2&&pk<=TB+1);inz=(pi>=2&&pi<=TB+1)&&(pj>=2&&pj<=TB+1)
+            if inx; pi<=TB+1&&_sp5(LX,lfx(pi-1,pj-2,pk-2),iflo5(qpx,m0,smallr,pfl)); pi>=2&&_sp5(RX,lfx(pi-2,pj-2,pk-2),iflo5(qmx,m0,smallr,pfl)); end
+            if iny; pj<=TB+1&&_sp5(LY,lfy(pi-2,pj-1,pk-2),iflo5(qpy,m0,smallr,pfl)); pj>=2&&_sp5(RY,lfy(pi-2,pj-2,pk-2),iflo5(qmy,m0,smallr,pfl)); end
+            if inz; pk<=TB+1&&_sp5(LZ,lfz(pi-2,pj-2,pk-1),iflo5(qpz,m0,smallr,pfl)); pk>=2&&_sp5(RZ,lfz(pi-2,pj-2,pk-2),iflo5(qmz,m0,smallr,pfl)); end
+            t+=nth
+        end
+        sync_threads();nfx=(TB+1)*TB*TB;t=tid
+        while t<=3*nfx
+            if t<=nfx;l=t-1;fi=l%(TB+1);fj=(l÷(TB+1))%TB;fk=l÷((TB+1)*TB);_sp5(LX,lfx(fi,fj,fk),riem5(_sg5(LX,lfx(fi,fj,fk)),_sg5(RX,lfx(fi,fj,fk)),1,gamma,smallr,pfl,rv))
+            elseif t<=2*nfx;l=t-1-nfx;fi=l%TB;fj=(l÷TB)%(TB+1);fk=l÷(TB*(TB+1));_sp5(LY,lfy(fi,fj,fk),riem5(_sg5(LY,lfy(fi,fj,fk)),_sg5(RY,lfy(fi,fj,fk)),2,gamma,smallr,pfl,rv))
+            else;l=t-1-2*nfx;fi=l%TB;fj=(l÷TB)%TB;fk=l÷(TB*TB);_sp5(LZ,lfz(fi,fj,fk),riem5(_sg5(LZ,lfz(fi,fj,fk)),_sg5(RZ,lfz(fi,fj,fk)),3,gamma,smallr,pfl,rv)) end
+            t+=nth
+        end
+        sync_threads();t=tid
+        while t<=TB*TB*TB
+            l=t-1;a=l%TB;b=(l÷TB)%TB;c=l÷(TB*TB);gi=wrp(ox+a+1,N);gj=wrp(oy+b+1,N);gk=wrp(oz+c+1,N)
+            Fxl=_sg5(LX,lfx(a,b,c));Fxh=_sg5(LX,lfx(a+1,b,c));Fyl=_sg5(LY,lfy(a,b,c));Fyh=_sg5(LY,lfy(a,b+1,c));Fzl=_sg5(LZ,lfz(a,b,c));Fzh=_sg5(LZ,lfz(a,b,c+1))
+            u0=loadc5(uold,gi,gj,gk)
+            r=ntuple(v->u0[v]+dtdx*((Fxl[v]-Fxh[v])+(Fyl[v]-Fyh[v])+(Fzl[v]-Fzh[v])),5)
+            r[1]<smallr && (r=(smallr,0.0f0,0.0f0,0.0f0,pfl/(gamma-1.0f0)))
+            if do_turb && r[1]>=turb_min_rho
+                ax,ay,az=turb_interp(afield,gi,gj,gk,boxlen/N,boxlen,ramp)
+                rhom=max(r[1],smallr);sc2=smallc*smallc;rho=r[1];e=r[5]
+                e=max(e-0.5f0*r[2]*r[2]/rhom,rho*sc2);e=max(e-0.5f0*r[3]*r[3]/rhom,rho*sc2);e=max(e-0.5f0*r[4]*r[4]/rhom,rho*sc2)
+                m2=r[2]+rhom*ax*dt;m3=r[3]+rhom*ay*dt;m4=r[4]+rhom*az*dt
+                e=max(e+0.5f0*m2*m2/rhom,rho*sc2);e=max(e+0.5f0*m3*m3/rhom,rho*sc2);e=max(e+0.5f0*m4*m4/rhom,rho*sc2)
+                r=(r[1],m2,m3,m4,e)
+            end
+            for v in 1:5; unew[gi,gj,gk,v]=r[v]; end
+            t+=nth
+        end
+    end
+    return nothing
+end
+
+@inline function _hydro_ppm_launch(tv::Val,hv::Val,rv::Val,nthreads,nb,unew,uold,afield,p::Params,pfl,dt,dx,ramp,do_turb)
+    @cuda threads=nthreads blocks=(nb,nb,nb) integrator_hydro_ppm!(
+        tv,hv,rv,unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,p.N,p.boxlen,ramp,p.turb_min_rho,do_turb)
 end
 
 # ============================================================================

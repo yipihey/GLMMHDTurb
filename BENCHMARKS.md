@@ -47,4 +47,5 @@ Memory gate: 72 B/cell (two fp32 (N,N,N,9) buffers, no scratch). Throughput gate
 | Orszag-Tang (N=120)| MHD PPM   | vrms 0.7910 (= PLM-HLL), div·B 1.16 (HLL 0.96 < this < HLLD 3.59), ρmin 0.0835, finite |
 | Orszag-Tang        | MHD PLM/HLLD | bit-identical across 3 integrator paths, vrms 0.7887 |
 
-PPM kernels: `/tmp/ppm_hydro.jl`, `/tmp/ppm_mhd.jl` (validated; not wired into module — PLM stays default).
+PPM is wired into the module as an opt-in: `step_plm!(...; recon=:ppm)` / `step_hydro!(...; recon=:ppm)`
+(f16+HLL path only; PLM stays the default). Numbers above reproduced through the public API.
