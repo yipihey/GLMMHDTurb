@@ -1,0 +1,7 @@
+/.git
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+/docs/build/
+.DS_Store
+LocalPreferences.toml

@@ -1,0 +1,21 @@
+name = "GLMMHDTurb"
+version = "0.1.0"
+authors = ["Tom Abel"]
+
+[deps]
+AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Random123 = "74087812-796a-5b5d-8853-05524746bad3"
+SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
+ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"
+
+[compat]
+CUDA = "5"
+FFTW = "1"
+KernelAbstractions = "0.9"
+ThreadPinning = "1"
+julia = "1.10"
