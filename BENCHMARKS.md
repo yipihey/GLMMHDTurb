@@ -29,6 +29,29 @@ Penalty mechanism = register-budget occupancy cliff, not arithmetic. Hydro PLM (
 | 128 | 2 | 292 | 6.56× |
 |  96 | 2 | 220 | 8.69× |
 
+## Fastest solver: nvcc light line-march, driven from Julia (`march_bridge/`)
+
+The throughput ceiling on this A6000. A hand-written CUDA 2.5D light line-march (transverse-free
+1D-Hancock + HLL + Dedner GLM, f16 shared tile) compiled with `--use_fast_math` and driven from
+CUDA.jl over shared device memory — nvcc's codegen with the Julia test rig. See `march_bridge/`.
+
+| solver | config | regs | blocks/SM | N=480 Mcell/s | vs cube |
+|---|---|---|---|---:|---:|
+| **GLM-MHD march** | HLL, f16, fast-math | 128 | 2 | **~3100** | 1.6× (`step_plm!` 1923) |
+| **Hydro march**   | HLL, f16, fast-math |  64 | 4 | **~6800** | — (5.9× Julia-native lmarch 1153) |
+
+Zero bridge overhead (driven ≥ standalone; timed loop is pure kernel launches). `--use_fast_math`
+is load-bearing: it frees the registers (hydro 80→64 → the 4-block tile; not a driver/ptxas-version
+effect — confirmed across ptxas 11.8/12.9/13.3). MHD is register+shared-bound at 2 blocks (38 KB f16
+tile mandatory: fp32 9-var = 76 KB > 48 KB) and only ~29% of peak BW, so it is the A6000 ceiling for
+the scheme; H200 (more regs, 228 KB shared) would reach 3+ blocks.
+
+Correctness of the fastest MHD path: matched-IC Orszag-Tang vs the cube agrees to ~1% in all physical
+fields (the slowly-accumulating transverse term), vrms to 0.2%; div·B drift ~5e-5, GLM cleaning active
+(`ot_validate.jl`). Turbulent driving stable to Mach~6 at CFL≤0.4, but with ~10× looser ∇·B than the
+cube — the transverse-free scheme's tradeoff (`turb_robustness.jl`). So ~3100 is the fastest
+correct-to-1% MHD throughput; the cube (~1920) remains the ∇·B-tight reference.
+
 ## Production solver throughput (prior sessions, for context)
 
 | solver | config | N=480 pure | N=480 +turb | N=512 (gate) |
