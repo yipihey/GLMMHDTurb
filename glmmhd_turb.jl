@@ -1535,6 +1535,102 @@ function step_hydro_lmarch!(uold,unew,afield,p::Params,dt::Float32,t::Float32; d
     return nothing
 end
 
+# ============================================================================
+# FULL compact scheme: light 1D-Hancock + 2 passive SPECIES via CMA (consistent
+# multi-fluid advection: species ride the mass flux -> Sum X_i conserved). 7-var
+# (rho,mom_xyz,E, rhoX1,rhoX2). GH=2. The integration capstone of the optimized stack.
+# ============================================================================
+@inline loadc7(u,i,j,k)=ntuple(v->@inbounds(u[i,j,k,v]),7)
+@fastmath @inline function cons2prim7(c,gamma::Float32,smallr::Float32,pfl::Float32)
+    rho=max(c[1],smallr);ir=1f0/rho
+    p=max((gamma-1f0)*(c[5]-0.5f0*(c[2]*c[2]+c[3]*c[3]+c[4]*c[4])*ir),pfl)
+    # species linear (exact Sum=1; for ISOLATED trace tracers use log2 storage -- accuracy6)
+    (rho,c[2]*ir,c[3]*ir,c[4]*ir,p, c[6]*ir, c[7]*ir)
+end
+@fastmath @inline prim_slope7(L,M,R)=ntuple(i->0.5f0*minmod(M[i]-L[i],R[i]-M[i]),7)
+@inline padd7(q,s,a)=ntuple(i->q[i]+a*s[i],7)
+@fastmath @inline function hanc1d7(m,s,dir::Int,dtdx,gamma)
+    un=dir==1 ? m[2] : (dir==2 ? m[3] : m[4]); sn=dir==1 ? s[2] : (dir==2 ? s[3] : s[4]); ir=1f0/m[1]; h=0.5f0*dtdx
+    (m[1]-h*(un*s[1]+m[1]*sn),
+     m[2]-h*(un*s[2]+(dir==1 ? s[5]*ir : 0f0)),
+     m[3]-h*(un*s[3]+(dir==2 ? s[5]*ir : 0f0)),
+     m[4]-h*(un*s[4]+(dir==3 ? s[5]*ir : 0f0)),
+     m[5]-h*(un*s[5]+gamma*m[5]*sn),
+     m[6]-h*un*s[6], m[7]-h*un*s[7])   # species: pure advection
+end
+@fastmath @inline function face7(qLm,L,R,qRp,dir,dtdx,gamma,smallr,pfl,rv)
+    sL=prim_slope7(qLm,L,R); sR=prim_slope7(L,R,qRp)
+    eR=padd7(hanc1d7(L,sL,dir,dtdx,gamma),sL, 1f0)
+    eL=padd7(hanc1d7(R,sR,dir,dtdx,gamma),sR,-1f0)
+    Fh=riem5((eR[1],eR[2],eR[3],eR[4],eR[5]),(eL[1],eL[2],eL[3],eL[4],eL[5]),dir,gamma,smallr,pfl,rv)
+    Fm=Fh[1]                                   # mass flux -> CMA: species ride it (upwind)
+    X6 = Fm>=0f0 ? eR[6] : eL[6]; X7 = Fm>=0f0 ? eR[7] : eL[7]
+    (Fh[1],Fh[2],Fh[3],Fh[4],Fh[5], Fm*X6, Fm*X7)
+end
+function integrator_hydro_lmarch_sp!(::Val{OX},::Val{OY},::Val{RIEM}, unew,uold,afield,
+        gamma::Float32,smallr::Float32,pfl::Float32,smallc::Float32,
+        dt::Float32,dx::Float32,N::Int,boxlen::Float32,ramp::Float32,
+        turb_min_rho::Float32,do_turb::Bool) where {OX,OY,RIEM}
+    GX=OX+4;GY=OY+4;GG=GX*GY;PL=5
+    SP=CuStaticSharedArray(Float16,7*PL*GG); rv=Val(RIEM)
+    pget(s,lx,ly)=(b=7*(s*GG+lx+GX*ly); ntuple(v->Float32(@inbounds SP[b+v]),7))
+    pput(s,lx,ly,q)=(b=7*(s*GG+lx+GX*ly); @inbounds for v in 1:7; SP[b+v]=Float16(q[v]); end)
+    @fastmath @inbounds begin
+        dtdx=dt/dx;tid=threadIdx().x;nth=blockDim().x
+        tx=(tid-1)%OX;ty=(tid-1)÷OX; ox0=(blockIdx().x-1)*OX;oy0=(blockIdx().y-1)*OY; li=tx+2;lj=ty+2
+        loadpl(s,gz)=begin
+            c=tid
+            while c<=GG
+                lx=(c-1)%GX;ly=(c-1)÷GX
+                pput(s,lx,ly,cons2prim7(loadc7(uold,wrp(ox0+lx-1,N),wrp(oy0+ly-1,N),gz),gamma,smallr,pfl)); c+=nth
+            end
+        end
+        for pp in -2:2; loadpl(mod(pp,PL),wrp(pp+1,N)); end
+        sync_threads(); p=0
+        while p<N
+            s0=mod(p,PL);sm1=mod(p-1,PL);sp1=mod(p+1,PL);sm2=mod(p-2,PL);sp2=mod(p+2,PL)
+            m0=pget(s0,li,lj); r0=loadc7(uold,wrp(ox0+tx+1,N),wrp(oy0+ty+1,N),p+1)
+            rx=let cm1=pget(s0,li-1,lj),cp1=pget(s0,li+1,lj)
+                Fl=face7(pget(s0,li-2,lj),cm1,m0,cp1,1,dtdx,gamma,smallr,pfl,rv)
+                Fh=face7(cm1,m0,cp1,pget(s0,li+2,lj),1,dtdx,gamma,smallr,pfl,rv)
+                ntuple(v->r0[v]+dtdx*(Fl[v]-Fh[v]),7)
+            end
+            ry=let cm1=pget(s0,li,lj-1),cp1=pget(s0,li,lj+1)
+                Fl=face7(pget(s0,li,lj-2),cm1,m0,cp1,2,dtdx,gamma,smallr,pfl,rv)
+                Fh=face7(cm1,m0,cp1,pget(s0,li,lj+2),2,dtdx,gamma,smallr,pfl,rv)
+                ntuple(v->rx[v]+dtdx*(Fl[v]-Fh[v]),7)
+            end
+            r=let cm1=pget(sm1,li,lj),cp1=pget(sp1,li,lj)
+                Fl=face7(pget(sm2,li,lj),cm1,m0,cp1,3,dtdx,gamma,smallr,pfl,rv)
+                Fh=face7(cm1,m0,cp1,pget(sp2,li,lj),3,dtdx,gamma,smallr,pfl,rv)
+                ntuple(v->ry[v]+dtdx*(Fl[v]-Fh[v]),7)
+            end
+            gi=wrp(ox0+tx+1,N);gj=wrp(oy0+ty+1,N);gk=p+1
+            r[1]<smallr && (r=(smallr,0f0,0f0,0f0,pfl/(gamma-1f0),r[6],r[7]))
+            if do_turb && r[1]>=turb_min_rho
+                ax,ay,az=turb_interp(afield,gi,gj,gk,boxlen/N,boxlen,ramp)
+                rhom=max(r[1],smallr);sc2=smallc*smallc;rho=r[1];e=r[5]
+                e=max(e-0.5f0*r[2]*r[2]/rhom,rho*sc2);e=max(e-0.5f0*r[3]*r[3]/rhom,rho*sc2);e=max(e-0.5f0*r[4]*r[4]/rhom,rho*sc2)
+                m2=r[2]+rhom*ax*dt;m3=r[3]+rhom*ay*dt;m4=r[4]+rhom*az*dt
+                e=max(e+0.5f0*m2*m2/rhom,rho*sc2);e=max(e+0.5f0*m3*m3/rhom,rho*sc2);e=max(e+0.5f0*m4*m4/rhom,rho*sc2)
+                r=(r[1],m2,m3,m4,e,r[6],r[7])
+            end
+            for v in 1:7; unew[gi,gj,gk,v]=r[v]; end
+            sync_threads(); loadpl(sm2,wrp(p+4,N)); sync_threads(); p+=1
+        end
+    end
+    return nothing
+end
+function step_hydro_lmarch_sp!(uold,unew,afield,p::Params,dt::Float32,t::Float32; do_turb::Bool=false, ox::Int=32, oy::Int=8)
+    dx=dxof(p); pfl=pfloor(p); ramp=min(t/p.turb_T,1f0); N=p.N
+    if ox==32&&oy==8
+        @cuda threads=256 blocks=(N÷32,N÷8,1) integrator_hydro_lmarch_sp!(Val(32),Val(8),Val(:hll),unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,N,p.boxlen,ramp,p.turb_min_rho,do_turb)
+    elseif ox==16&&oy==16
+        @cuda threads=256 blocks=(N÷16,N÷16,1) integrator_hydro_lmarch_sp!(Val(16),Val(16),Val(:hll),unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,N,p.boxlen,ramp,p.turb_min_rho,do_turb)
+    else; error("ox=$ox oy=$oy: add a literal-Val branch"); end
+    return nothing
+end
+
 # ---- Hydro single-zone PPM: parabolic edges (ppm_edges, shared with MHD) + 3-wave characteristic
 # trace (local_ppm_trace: parabola integrated over each acoustic/entropy wave's domain of dependence
 # via ppm_avg). ±1 stencil → same (TB+4) tile as PLM. ~2856 Mcell/s vs PLM 4250 (1.49x). ----
