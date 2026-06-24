@@ -1423,6 +1423,114 @@ function step_hydro_march2!(uold,unew,afield,p::Params,dt::Float32,t::Float32; d
     return nothing
 end
 
+# ============================================================================
+# LIGHT 2.5D march: transverse-free 1D Hancock (normal-only predictor) — the
+# register-light 2nd-order-in-space-AND-time scheme (cf. mini-ramses spike_25d.cu
+# -DHANCOCK1D: 64 regs / full throughput). Parametric ghost width GH:
+#   GH=2 -> all faces 2nd order (baseline light march)
+#   GH=1 -> DONOR-CELL at the x/y block-boundary faces (1st order, both sides ->
+#           consistent flux -> conserved), 2nd order interior + all of marched z.
+# The donor seam drops the x-y tile 2-ghost->1-ghost (less over-read / shared).
+# ============================================================================
+@fastmath @inline function hanc1d5(m, s, dir::Int, dtdx, gamma)
+    un = dir==1 ? m[2] : (dir==2 ? m[3] : m[4])
+    sn = dir==1 ? s[2] : (dir==2 ? s[3] : s[4]); ir=1f0/m[1]; h=0.5f0*dtdx
+    (m[1]-h*(un*s[1]+m[1]*sn),
+     m[2]-h*(un*s[2]+(dir==1 ? s[5]*ir : 0f0)),
+     m[3]-h*(un*s[3]+(dir==2 ? s[5]*ir : 0f0)),
+     m[4]-h*(un*s[4]+(dir==3 ? s[5]*ir : 0f0)),
+     m[5]-h*(un*s[5]+gamma*m[5]*sn))
+end
+# 2nd-order face between cells L,R (qLm=L-1, qRp=R+1): 1D-Hancock traced HLL flux.
+@fastmath @inline function face2nd(qLm,L,R,qRp,dir,dtdx,gamma,smallr,pfl,rv)
+    sL=prim_slope5(qLm,L,R); sR=prim_slope5(L,R,qRp)
+    eR=padd5(hanc1d5(L,sL,dir,dtdx,gamma),sL, 1f0)
+    eL=padd5(hanc1d5(R,sR,dir,dtdx,gamma),sR,-1f0)
+    riem5(eR,eL,dir,gamma,smallr,pfl,rv)
+end
+
+function integrator_hydro_lmarch!(::Val{OX},::Val{OY},::Val{GH},::Val{RIEM}, unew,uold,afield,
+        gamma::Float32,smallr::Float32,pfl::Float32,smallc::Float32,
+        dt::Float32,dx::Float32,N::Int,boxlen::Float32,ramp::Float32,
+        turb_min_rho::Float32,do_turb::Bool) where {OX,OY,GH,RIEM}
+    GX=OX+2GH; GY=OY+2GH; GG=GX*GY; PL=5
+    SP=CuStaticSharedArray(Float16,5*PL*GG)
+    rv=Val(RIEM)
+    pget(s,lx,ly)=(b=5*(s*GG+lx+GX*ly); ntuple(v->Float32(@inbounds SP[b+v]),5))
+    pput(s,lx,ly,q)=(b=5*(s*GG+lx+GX*ly); @inbounds for v in 1:5; SP[b+v]=Float16(q[v]); end)
+    @fastmath @inbounds begin
+        dtdx=dt/dx; tid=threadIdx().x; nth=blockDim().x
+        tx=(tid-1)%OX; ty=(tid-1)÷OX
+        ox0=(blockIdx().x-1)*OX; oy0=(blockIdx().y-1)*OY
+        li=tx+GH; lj=ty+GH
+        loadpl(s,gz)=begin
+            c=tid
+            while c<=GG
+                lx=(c-1)%GX; ly=(c-1)÷GX
+                pput(s,lx,ly, cons2prim5(loadc5(uold,wrp(ox0+lx-GH+1,N),wrp(oy0+ly-GH+1,N),gz),gamma,smallr,pfl)); c+=nth
+            end
+        end
+        for pp in -2:2; loadpl(mod(pp,PL),wrp(pp+1,N)); end
+        sync_threads()
+        # clamp helpers keep masked-off 2nd-order reads in-bounds when GH==1
+        clo(i)= i<0 ? 0 : i; chi(i)= i>GX-1 ? GX-1 : i; cloy(j)= j<0 ? 0 : j; chiy(j)= j>GY-1 ? GY-1 : j
+        p=0
+        while p<N
+            s0=mod(p,PL); sm1=mod(p-1,PL); sp1=mod(p+1,PL); sm2=mod(p-2,PL); sp2=mod(p+2,PL)
+            m0=pget(s0,li,lj)
+            r0=loadc5(uold,wrp(ox0+tx+1,N),wrp(oy0+ty+1,N),p+1)
+            # x
+            rx=let cm1=pget(s0,li-1,lj),cp1=pget(s0,li+1,lj)
+                Fl = (GH==1 && tx==0)    ? riem5(cm1,m0,1,gamma,smallr,pfl,rv) : face2nd(pget(s0,clo(li-2),lj),cm1,m0,cp1,1,dtdx,gamma,smallr,pfl,rv)
+                Fh = (GH==1 && tx==OX-1) ? riem5(m0,cp1,1,gamma,smallr,pfl,rv) : face2nd(cm1,m0,cp1,pget(s0,chi(li+2),lj),1,dtdx,gamma,smallr,pfl,rv)
+                ntuple(v->r0[v]+dtdx*(Fl[v]-Fh[v]),5)
+            end
+            # y
+            ry=let cm1=pget(s0,li,lj-1),cp1=pget(s0,li,lj+1)
+                Fl = (GH==1 && ty==0)    ? riem5(cm1,m0,2,gamma,smallr,pfl,rv) : face2nd(pget(s0,li,cloy(lj-2)),cm1,m0,cp1,2,dtdx,gamma,smallr,pfl,rv)
+                Fh = (GH==1 && ty==OY-1) ? riem5(m0,cp1,2,gamma,smallr,pfl,rv) : face2nd(cm1,m0,cp1,pget(s0,li,chiy(lj+2)),2,dtdx,gamma,smallr,pfl,rv)
+                ntuple(v->rx[v]+dtdx*(Fl[v]-Fh[v]),5)
+            end
+            # z (marched, always 2nd order — no block seam)
+            r=let cm1=pget(sm1,li,lj),cp1=pget(sp1,li,lj)
+                Fl=face2nd(pget(sm2,li,lj),cm1,m0,cp1,3,dtdx,gamma,smallr,pfl,rv)
+                Fh=face2nd(cm1,m0,cp1,pget(sp2,li,lj),3,dtdx,gamma,smallr,pfl,rv)
+                ntuple(v->ry[v]+dtdx*(Fl[v]-Fh[v]),5)
+            end
+            gi=wrp(ox0+tx+1,N);gj=wrp(oy0+ty+1,N);gk=p+1
+            r[1]<smallr && (r=(smallr,0f0,0f0,0f0,pfl/(gamma-1f0)))
+            if do_turb && r[1]>=turb_min_rho
+                ax,ay,az=turb_interp(afield,gi,gj,gk,boxlen/N,boxlen,ramp)
+                rhom=max(r[1],smallr);sc2=smallc*smallc;rho=r[1];e=r[5]
+                e=max(e-0.5f0*r[2]*r[2]/rhom,rho*sc2);e=max(e-0.5f0*r[3]*r[3]/rhom,rho*sc2);e=max(e-0.5f0*r[4]*r[4]/rhom,rho*sc2)
+                m2=r[2]+rhom*ax*dt;m3=r[3]+rhom*ay*dt;m4=r[4]+rhom*az*dt
+                e=max(e+0.5f0*m2*m2/rhom,rho*sc2);e=max(e+0.5f0*m3*m3/rhom,rho*sc2);e=max(e+0.5f0*m4*m4/rhom,rho*sc2)
+                r=(r[1],m2,m3,m4,e)
+            end
+            for v in 1:5; unew[gi,gj,gk,v]=r[v]; end
+            sync_threads(); loadpl(sm2,wrp(p+4,N)); sync_threads()
+            p+=1
+        end
+    end
+    return nothing
+end
+@inline function _lmarch_launch(::Val{OX},::Val{OY},::Val{GH},rv::Val,unew,uold,afield,p::Params,pfl,dt,dx,ramp,do_turb) where {OX,OY,GH}
+    @cuda threads=(OX*OY) blocks=(p.N÷OX,p.N÷OY,1) integrator_hydro_lmarch!(
+        Val(OX),Val(OY),Val(GH),rv,unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,p.N,p.boxlen,ramp,p.turb_min_rho,do_turb)
+end
+function step_hydro_lmarch!(uold,unew,afield,p::Params,dt::Float32,t::Float32; do_turb::Bool=false, ox::Int=32, oy::Int=8, gh::Int=2, riemann::Symbol=:hll)
+    dx=dxof(p); pfl=pfloor(p); ramp=min(t/p.turb_T,1f0); rv = riemann===:hll ? Val(:hll) : Val(:llf)
+    if     ox==32&&oy==8 &&gh==2; _lmarch_launch(Val(32),Val(8),Val(2),rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    elseif ox==32&&oy==8 &&gh==1; _lmarch_launch(Val(32),Val(8),Val(1),rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    elseif ox==16&&oy==16&&gh==2; _lmarch_launch(Val(16),Val(16),Val(2),rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    elseif ox==16&&oy==16&&gh==1; _lmarch_launch(Val(16),Val(16),Val(1),rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    elseif ox==32&&oy==16&&gh==1; _lmarch_launch(Val(32),Val(16),Val(1),rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    elseif ox==32&&oy==16&&gh==2; _lmarch_launch(Val(32),Val(16),Val(2),rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    else error("step_hydro_lmarch!: add a literal-Val branch for ox=$ox,oy=$oy,gh=$gh")
+    end
+    return nothing
+end
+
 # ---- Hydro single-zone PPM: parabolic edges (ppm_edges, shared with MHD) + 3-wave characteristic
 # trace (local_ppm_trace: parabola integrated over each acoustic/entropy wave's domain of dependence
 # via ppm_avg). ±1 stencil → same (TB+4) tile as PLM. ~2856 Mcell/s vs PLM 4250 (1.49x). ----
