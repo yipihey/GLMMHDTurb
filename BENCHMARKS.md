@@ -99,12 +99,22 @@ f32 base → 9e-5). fast-math holds it at 64 regs. NG=3 halo (CT's EMF reaches o
 | **staged f16 (`spike_ct2.cu`)** | **1206** | **64 / 1 blk** | **9e-5 = machine-0** | **7.5×** |
 
 Validated on OT N=128: div·B 9.3e-5 = the Julia 8.4e-5; fields match Julia to ~4% (f16 tile).
-Tile sweep: 8×8×4 wins (1294 @288); all 64 regs, shared-limited to **1 block** (66 KB > the 50 KB
-for 2 blocks). **Revised conclusion (my "~300–700, 5× gap intrinsic" was WRONG):** staged f16 CT is
-**~63% of the GLM cube (1923) and ~39% of the GLM march (3100)** — and it gives **exact
-(machine-zero) div·B** where GLM only cleans it. The production CT's 8× deficit was layout +
-orchestration, NOT the scheme. Headroom: dropping to 2 blocks (shared < 50 KB via face-B-from-global
-or mag-only flux storage) should reach ~1800–2000.
+
+**2-block tuning (`spike_ct3.cu`): ~1500 Mcell/s.** Drop the 3 face-B slots from the prim tile and
+read normal-B from global in the flux routine → shared 66→48 KB at OZ=3 → **2 blocks/SM**.
+
+| variant | Mcell/s @480 | regs | blocks | note |
+|---|---:|---|---|---|
+| `spike_ct2.cu` store-full, faceB-in-tile | 1206 | 64 | 1 | any even N |
+| **`spike_ct3.cu` faceB-from-global, OZ=3** | **1501** | 74 | **2** | needs N%3==0 |
+| `spike_ct4.cu` mag-only + recompute hydro | 492 | 128 | 2 | recompute blows regs — negative |
+
+The mag-only/recompute path is a trap (the cube>march lesson once more: 6 live recomputed fluxes →
+128 regs). **Final hand-tuned CT: 1501 Mcell/s @480** — **9.4× the production CT (160)**, **~78% of
+the GLM cube (1923)**, **~48% of the GLM march (3100)** — with **exact (machine-zero) div·B** where
+GLM only cleans it. **Verdict: the production CT's ~9× deficit was layout + orchestration, NOT the
+scheme; a hand-tuned f16 staged CT is GLM-cube-class with a hard div·B=0.** Remaining lever: the 2.5D
+z-streaming march (kills the z-halo → more blocks) — the structural next step, higher risk.
 
 ## Production solver throughput (prior sessions, for context)
 
