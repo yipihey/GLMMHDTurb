@@ -52,6 +52,28 @@ fields (the slowly-accumulating transverse term), vrms to 0.2%; div·B drift ~5e
 cube — the transverse-free scheme's tradeoff (`turb_robustness.jl`). So ~3100 is the fastest
 correct-to-1% MHD throughput; the cube (~1920) remains the ∇·B-tight reference.
 
+## CT-MHD in the prototype (`ct_mhd.jl`) — div·B = 0 by construction
+
+Lean constrained transport: 8 reals/cell (5 cell-centered conserved + 3 face-staggered B; no ψ,
+no redundant 6-component face storage → fits 512³ where production CT OOMs at 22/cell). The
+cell-centered Godunov is the GLM light-march machinery verbatim (PLM MonCen + transverse-free
+1D-Hancock + HLL, fp32); only the induction step is new — face-B updated by curl of Balsara-Spicer
+edge-EMFs. Validated on Orszag-Tang N=128: initial div·B **exactly 0** (face-B from a vector
+potential), vrms 0.78 @t=0.21 (matches the GLM cube's 0.79).
+
+| solver | form | N=192/256 Mcell/s | div·B | notes |
+|---|---|---:|---|---|
+| CT-MHD `ct_mhd.jl` | Julia, 7-kernel, fp32 | **205** | ~1e-4 (fp32 floor, bounded) | > production CT ~160 already |
+| (production CT, mini-ramses) | CUDA fused, full-step | ~160 (256³) | machine-0 (f64 EMF) | OOMs at 512³ |
+
+The 205 is **traffic-bound** (7 global passes, fluxes spilled to DRAM) — *not* the ceiling. The
+fused f16-tile path (flux tile in shared, EMF computed in-tile, fast-math) is exactly what lifted
+GLM from multi-kernel to the ~3100 march; the same applies here. **Finding: a lean fused f16 CT
+should be GLM-march-class, not the 5× slower the production CT showed — that 5× was layout +
+orchestration (22-var, multi-pass), not the scheme.** div·B is fp32-roundoff-bounded (~1e-3 over
+2000 steps); f64 EMF accumulation pins it to machine-0 (as the production CT does). Next step: the
+fused `.cu` CT kernel via the march_bridge.
+
 ## Production solver throughput (prior sessions, for context)
 
 | solver | config | N=480 pure | N=480 +turb | N=512 (gate) |
