@@ -1166,6 +1166,263 @@ function step_hydro!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
     return nothing
 end
 
+# ============================================================================
+# 2.5D fused line-march hydro kernel (unigrid). Each thread owns one (x,y) column
+# and marches z through a rolling 5-plane f16 ring; per cell it does fused
+# c2p(at load)->slopes/Hancock->HLL x6 faces->update with neighbor traces
+# recomputed (no shared face tiles). Two barriers per plane-advance (vs the cube's
+# 4 staged barriers) and EVERY thread stays active every step — the fix for what
+# sank the earlier integrator_stream! (per-plane phases underfilled warps). Same
+# physics as integrator_hydro! (MonCen-PLM + Hancock + HLL, f16 ring). Tests
+# whether the CUDA spike's +40-75% over the cube materializes here.
+# ============================================================================
+@fastmath @inline function mhsl5(m0,xm,xp,ym,yp,zm,zp,dtdx,gamma,smallr,pfl)
+    sx=prim_slope5(xm,m0,xp); sy=prim_slope5(ym,m0,yp); sz=prim_slope5(zm,m0,zp)
+    mh=hancock5(m0,sx,sy,sz,dtdx,gamma); (mh[1]<=smallr||mh[5]<=pfl) && (mh=m0)
+    (mh,sx,sy,sz)
+end
+
+function integrator_hydro_march!(::Val{OX},::Val{OY},::Val{RIEM}, unew,uold,afield,
+        gamma::Float32,smallr::Float32,pfl::Float32,smallc::Float32,
+        dt::Float32,dx::Float32,N::Int,boxlen::Float32,ramp::Float32,
+        turb_min_rho::Float32,do_turb::Bool) where {OX,OY,RIEM}
+    GX=OX+4; GY=OY+4; GG=GX*GY; PL=5
+    SP=CuStaticSharedArray(Float16, 5*PL*GG)
+    rv=Val(RIEM)
+    rget(s,lx,ly)=(b=5*(s*GG+lx+GX*ly); ntuple(v->Float32(@inbounds SP[b+v]),5))
+    rput(s,lx,ly,q)=(b=5*(s*GG+lx+GX*ly); @inbounds for v in 1:5; SP[b+v]=Float16(q[v]); end)
+    @fastmath @inbounds begin
+        dtdx=dt/dx; tid=threadIdx().x; nth=blockDim().x
+        tx=(tid-1)%OX; ty=(tid-1)÷OX
+        ox=(blockIdx().x-1)*OX; oy=(blockIdx().y-1)*OY
+        li=tx+2; lj=ty+2
+        loadpl(s,gz)=begin
+            c=tid
+            while c<=GG
+                lx=(c-1)%GX; ly=(c-1)÷GX
+                rput(s,lx,ly, cons2prim5(loadc5(uold,wrp(ox+lx-1,N),wrp(oy+ly-1,N),gz),gamma,smallr,pfl))
+                c+=nth
+            end
+        end
+        for pp in -2:2; loadpl(mod(pp,PL), wrp(pp+1,N)); end
+        sync_threads()
+        p=0
+        while p < N
+            sm2=mod(p-2,PL);sm1=mod(p-1,PL);s0=mod(p,PL);sp1=mod(p+1,PL);sp2=mod(p+2,PL)
+            m0=rget(s0,li,lj)
+            (mh0,sx0,sy0,sz0)=mhsl5(m0,rget(s0,li-1,lj),rget(s0,li+1,lj),rget(s0,li,lj-1),rget(s0,li,lj+1),rget(sm1,li,lj),rget(sp1,li,lj),dtdx,gamma,smallr,pfl)
+            mxm=rget(s0,li-1,lj); (mhxm,sxm,_,_)=mhsl5(mxm,rget(s0,li-2,lj),m0,rget(s0,li-1,lj-1),rget(s0,li-1,lj+1),rget(sm1,li-1,lj),rget(sp1,li-1,lj),dtdx,gamma,smallr,pfl)
+            mxp=rget(s0,li+1,lj); (mhxp,sxp,_,_)=mhsl5(mxp,m0,rget(s0,li+2,lj),rget(s0,li+1,lj-1),rget(s0,li+1,lj+1),rget(sm1,li+1,lj),rget(sp1,li+1,lj),dtdx,gamma,smallr,pfl)
+            mym=rget(s0,li,lj-1); (mhym,_,sym,_)=mhsl5(mym,rget(s0,li-1,lj-1),rget(s0,li+1,lj-1),rget(s0,li,lj-2),m0,rget(sm1,li,lj-1),rget(sp1,li,lj-1),dtdx,gamma,smallr,pfl)
+            myp=rget(s0,li,lj+1); (mhyp,_,syp,_)=mhsl5(myp,rget(s0,li-1,lj+1),rget(s0,li+1,lj+1),m0,rget(s0,li,lj+2),rget(sm1,li,lj+1),rget(sp1,li,lj+1),dtdx,gamma,smallr,pfl)
+            mzm=rget(sm1,li,lj); (mhzm,_,_,szm)=mhsl5(mzm,rget(sm1,li-1,lj),rget(sm1,li+1,lj),rget(sm1,li,lj-1),rget(sm1,li,lj+1),rget(sm2,li,lj),m0,dtdx,gamma,smallr,pfl)
+            mzp=rget(sp1,li,lj); (mhzp,_,_,szp)=mhsl5(mzp,rget(sp1,li-1,lj),rget(sp1,li+1,lj),rget(sp1,li,lj-1),rget(sp1,li,lj+1),m0,rget(sp2,li,lj),dtdx,gamma,smallr,pfl)
+            Fxl=riem5(iflo5(padd5(mhxm,sxm, 1f0),mxm,smallr,pfl), iflo5(padd5(mh0,sx0,-1f0),m0,smallr,pfl),1,gamma,smallr,pfl,rv)
+            Fxh=riem5(iflo5(padd5(mh0,sx0, 1f0),m0,smallr,pfl),   iflo5(padd5(mhxp,sxp,-1f0),mxp,smallr,pfl),1,gamma,smallr,pfl,rv)
+            Fyl=riem5(iflo5(padd5(mhym,sym, 1f0),mym,smallr,pfl), iflo5(padd5(mh0,sy0,-1f0),m0,smallr,pfl),2,gamma,smallr,pfl,rv)
+            Fyh=riem5(iflo5(padd5(mh0,sy0, 1f0),m0,smallr,pfl),   iflo5(padd5(mhyp,syp,-1f0),myp,smallr,pfl),2,gamma,smallr,pfl,rv)
+            Fzl=riem5(iflo5(padd5(mhzm,szm, 1f0),mzm,smallr,pfl), iflo5(padd5(mh0,sz0,-1f0),m0,smallr,pfl),3,gamma,smallr,pfl,rv)
+            Fzh=riem5(iflo5(padd5(mh0,sz0, 1f0),m0,smallr,pfl),   iflo5(padd5(mhzp,szp,-1f0),mzp,smallr,pfl),3,gamma,smallr,pfl,rv)
+            gi=wrp(ox+tx+1,N);gj=wrp(oy+ty+1,N);gk=p+1
+            u0=loadc5(uold,gi,gj,gk)
+            r=ntuple(v->u0[v]+dtdx*((Fxl[v]-Fxh[v])+(Fyl[v]-Fyh[v])+(Fzl[v]-Fzh[v])),5)
+            r[1]<smallr && (r=(smallr,0f0,0f0,0f0,pfl/(gamma-1f0)))
+            if do_turb && r[1]>=turb_min_rho
+                ax,ay,az=turb_interp(afield,gi,gj,gk,boxlen/N,boxlen,ramp)
+                rhom=max(r[1],smallr);sc2=smallc*smallc;rho=r[1];e=r[5]
+                e=max(e-0.5f0*r[2]*r[2]/rhom,rho*sc2);e=max(e-0.5f0*r[3]*r[3]/rhom,rho*sc2);e=max(e-0.5f0*r[4]*r[4]/rhom,rho*sc2)
+                m2=r[2]+rhom*ax*dt;m3=r[3]+rhom*ay*dt;m4=r[4]+rhom*az*dt
+                e=max(e+0.5f0*m2*m2/rhom,rho*sc2);e=max(e+0.5f0*m3*m3/rhom,rho*sc2);e=max(e+0.5f0*m4*m4/rhom,rho*sc2)
+                r=(r[1],m2,m3,m4,e)
+            end
+            for v in 1:5; unew[gi,gj,gk,v]=r[v]; end
+            sync_threads(); loadpl(sm2, wrp(p+4,N)); sync_threads()
+            p+=1
+        end
+    end
+    return nothing
+end
+
+@inline function _hydro_march_launch(::Val{OX},::Val{OY},rv::Val,unew,uold,afield,p::Params,pfl,dt,dx,ramp,do_turb) where {OX,OY}
+    @cuda threads=(OX*OY) blocks=(p.N÷OX,p.N÷OY,1) integrator_hydro_march!(
+        Val(OX),Val(OY),rv,unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,p.N,p.boxlen,ramp,p.turb_min_rho,do_turb)
+end
+
+# Fused 2.5D march hydro step. ox,oy = owned tile per block (concrete-literal Vals).
+function step_hydro_march!(uold,unew,afield,p::Params,dt::Float32,t::Float32;
+                           do_turb::Bool=false, ox::Int=32, oy::Int=8, riemann::Symbol=:hll)
+    dx=dxof(p); pfl=pfloor(p); ramp=min(t/p.turb_T,1f0)
+    @assert p.N%ox==0 && p.N%oy==0 "N=$(p.N) not divisible by ox=$ox,oy=$oy"
+    rv = riemann===:hll ? Val(:hll) : Val(:llf)
+    if     ox==32&&oy==8;  _hydro_march_launch(Val(32),Val(8), rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    elseif ox==16&&oy==16; _hydro_march_launch(Val(16),Val(16),rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    elseif ox==16&&oy==8;  _hydro_march_launch(Val(16),Val(8), rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    elseif ox==24&&oy==8;  _hydro_march_launch(Val(24),Val(8), rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    elseif ox==48&&oy==8;  _hydro_march_launch(Val(48),Val(8), rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    elseif ox==32&&oy==4;  _hydro_march_launch(Val(32),Val(4), rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    else error("step_hydro_march!: add a literal-Val branch for ox=$ox,oy=$oy")
+    end
+    return nothing
+end
+
+# Bench + validate the march vs the cube (step_hydro!) on identical random IC.
+function bench_hydro(; N::Int=480, nsteps::Int=30, warm::Int=5, kind::Symbol=:cube,
+                     ox::Int=32, oy::Int=8, do_turb::Bool=false, tb::Int=0)
+    p = Params(N=N)
+    u1 = CUDA.zeros(Float32,N,N,N,NV); u2 = CUDA.zeros(Float32,N,N,N,NV)
+    afield = CUDA.zeros(Float32,3,TURB_GS,TURB_GS,TURB_GS)
+    p0=p.rho0*p.cs0^2/p.gamma
+    ic_uniform_kernel!(CUDABackend())(u1,p.rho0,p0,p.b0,p.gamma; ndrange=(N,N,N)); CUDA.synchronize()
+    dt=1f-4
+    stepfn = kind===:march ?
+        (a,b)->step_hydro_march!(a,b,afield,p,dt,0.1f0; do_turb=do_turb, ox=ox, oy=oy) :
+        (a,b)->step_hydro!(a,b,afield,p,dt,0.1f0; do_turb=do_turb, tb=tb)
+    for s in 1:warm; stepfn(u1,u2); u1,u2=u2,u1; end; CUDA.synchronize()
+    el = CUDA.@elapsed begin
+        for s in 1:nsteps; stepfn(u1,u2); u1,u2=u2,u1; end; CUDA.synchronize()
+    end
+    mcell=N^3*nsteps/el/1e6; fin=all(isfinite,Array(@view u1[1:2,1:2,1:2,:]))
+    @printf("HYDRO %-6s N=%d %s: %.0f Mcell/s (%.2f ms/step) finite=%s\n",
+            kind, N, kind===:march ? "ox=$ox oy=$oy" : "tb=$(tb==0 ? (N%6==0 ? 6 : 4) : tb)",
+            mcell, el/nsteps*1e3, fin)
+    return mcell
+end
+
+function validate_hydro_march(; N::Int=96, nsteps::Int=15, ox::Int=32, oy::Int=8)
+    p = Params(N=N); Random.seed!(7)
+    h=zeros(Float32,N,N,N,NV)
+    h[:,:,:,1].=1f0 .+ 0.3f0.*rand(Float32,N,N,N)
+    h[:,:,:,2].=0.2f0.*(rand(Float32,N,N,N).-0.5f0)
+    h[:,:,:,3].=0.2f0.*(rand(Float32,N,N,N).-0.5f0)
+    h[:,:,:,4].=0.2f0.*(rand(Float32,N,N,N).-0.5f0)
+    h[:,:,:,5].=2.5f0 .+ 0.5f0.*rand(Float32,N,N,N)
+    uc=CuArray(h); uc2=CUDA.zeros(Float32,N,N,N,NV)
+    um=copy(uc);   um2=CUDA.zeros(Float32,N,N,N,NV)
+    af=CUDA.zeros(Float32,3,TURB_GS,TURB_GS,TURB_GS); dt=5f-4
+    for s in 1:nsteps
+        step_hydro!(uc,uc2,af,p,dt,0f0; do_turb=false); uc,uc2=uc2,uc
+        step_hydro_march!(um,um2,af,p,dt,0f0; do_turb=false, ox=ox, oy=oy); um,um2=um2,um
+    end
+    CUDA.synchronize()
+    a=Array(uc); b=Array(um)
+    dmax=maximum(abs.(a[:,:,:,1].-b[:,:,:,1]))/maximum(abs.(a[:,:,:,1]))
+    emax=maximum(abs.(a[:,:,:,5].-b[:,:,:,5]))/maximum(abs.(a[:,:,:,5]))
+    @printf("VALIDATE march vs cube N=%d steps=%d: rel|Δρ|=%.2e rel|ΔE|=%.2e (f16-roundoff expected ~1e-2)\n",
+            N, nsteps, dmax, emax)
+    return (dmax=dmax, emax=emax)
+end
+
+# --- march2: non-redundant variant. Precompute Hancock-predicted prim mh ONCE per cell
+# into a second rolling ring (MH), so the flux stage reads mh + recomputes only the
+# 1 direction-slope per edge (no 7x mh recompute). prim-ring 2-ghost x5 planes,
+# mh-ring 1-ghost x4 planes. 3 barriers/plane. Tests whether removing the Hancock
+# redundancy lets the march beat the cube. ---
+function integrator_hydro_march2!(::Val{OX},::Val{OY},::Val{RIEM}, unew,uold,afield,
+        gamma::Float32,smallr::Float32,pfl::Float32,smallc::Float32,
+        dt::Float32,dx::Float32,N::Int,boxlen::Float32,ramp::Float32,
+        turb_min_rho::Float32,do_turb::Bool) where {OX,OY,RIEM}
+    GX=OX+4;GY=OY+4;GG=GX*GY;PL=5;ML=4
+    SP=CuStaticSharedArray(Float16,5*PL*GG)
+    MH=CuStaticSharedArray(Float16,5*ML*GG)
+    rv=Val(RIEM)
+    pget(s,lx,ly)=(b=5*(s*GG+lx+GX*ly);ntuple(v->Float32(@inbounds SP[b+v]),5))
+    pput(s,lx,ly,q)=(b=5*(s*GG+lx+GX*ly);@inbounds for v in 1:5;SP[b+v]=Float16(q[v]);end)
+    mget(s,lx,ly)=(b=5*(s*GG+lx+GX*ly);ntuple(v->Float32(@inbounds MH[b+v]),5))
+    mput(s,lx,ly,q)=(b=5*(s*GG+lx+GX*ly);@inbounds for v in 1:5;MH[b+v]=Float16(q[v]);end)
+    @fastmath @inbounds begin
+        dtdx=dt/dx;tid=threadIdx().x;nth=blockDim().x
+        tx=(tid-1)%OX;ty=(tid-1)÷OX
+        ox=(blockIdx().x-1)*OX;oy=(blockIdx().y-1)*OY
+        li=tx+2;lj=ty+2
+        loadpl(s,gz)=begin
+            c=tid
+            while c<=GG
+                lx=(c-1)%GX;ly=(c-1)÷GX
+                pput(s,lx,ly,cons2prim5(loadc5(uold,wrp(ox+lx-1,N),wrp(oy+ly-1,N),gz),gamma,smallr,pfl)); c+=nth
+            end
+        end
+        mhpl(sM,sd,sP,su)=begin
+            c=tid
+            while c<=GG
+                lx=(c-1)%GX;ly=(c-1)÷GX
+                if lx>=1&&lx<=GX-2&&ly>=1&&ly<=GY-2
+                    m0=pget(sP,lx,ly)
+                    sx=prim_slope5(pget(sP,lx-1,ly),m0,pget(sP,lx+1,ly))
+                    sy=prim_slope5(pget(sP,lx,ly-1),m0,pget(sP,lx,ly+1))
+                    sz=prim_slope5(pget(sd,lx,ly),m0,pget(su,lx,ly))
+                    mh=hancock5(m0,sx,sy,sz,dtdx,gamma);(mh[1]<=smallr||mh[5]<=pfl)&&(mh=m0)
+                    mput(sM,lx,ly,mh)
+                end
+                c+=nth
+            end
+        end
+        for pp in -2:2; loadpl(mod(pp,PL),wrp(pp+1,N)); end
+        sync_threads()
+        mhpl(mod(-1,ML),mod(-2,PL),mod(-1,PL),mod(0,PL))
+        mhpl(mod(0,ML), mod(-1,PL),mod(0,PL), mod(1,PL))
+        mhpl(mod(1,ML), mod(0,PL), mod(1,PL), mod(2,PL))
+        sync_threads()
+        p=0
+        while p<N
+            s0=mod(p,PL);sm1=mod(p-1,PL);sp1=mod(p+1,PL)
+            mc=mod(p,ML);md=mod(p-1,ML);mu=mod(p+1,ML)
+            m0=pget(s0,li,lj); mh0=mget(mc,li,lj)
+            gi=wrp(ox+tx+1,N);gj=wrp(oy+ty+1,N);gk=p+1
+            r0=loadc5(uold,gi,gj,gk)
+            # accumulate flux divergence one direction at a time, FRESH name per stage
+            # (reassigning a lambda-captured var boxes -> GC alloc; bind a new name instead).
+            # Each block's slopes/fluxes die before the next -> small peak live state.
+            rx=let mm=pget(s0,li-1,lj),mp=pget(s0,li+1,lj)
+                sm=prim_slope5(pget(s0,li-2,lj),mm,m0); s0d=prim_slope5(mm,m0,mp); sp=prim_slope5(m0,mp,pget(s0,li+2,lj))
+                Fl=riem5(iflo5(padd5(mget(mc,li-1,lj),sm,1f0),mm,smallr,pfl), iflo5(padd5(mh0,s0d,-1f0),m0,smallr,pfl),1,gamma,smallr,pfl,rv)
+                Fh=riem5(iflo5(padd5(mh0,s0d,1f0),m0,smallr,pfl), iflo5(padd5(mget(mc,li+1,lj),sp,-1f0),mp,smallr,pfl),1,gamma,smallr,pfl,rv)
+                ntuple(v->r0[v]+dtdx*(Fl[v]-Fh[v]),5)
+            end
+            ry=let mm=pget(s0,li,lj-1),mp=pget(s0,li,lj+1)
+                sm=prim_slope5(pget(s0,li,lj-2),mm,m0); s0d=prim_slope5(mm,m0,mp); sp=prim_slope5(m0,mp,pget(s0,li,lj+2))
+                Fl=riem5(iflo5(padd5(mget(mc,li,lj-1),sm,1f0),mm,smallr,pfl), iflo5(padd5(mh0,s0d,-1f0),m0,smallr,pfl),2,gamma,smallr,pfl,rv)
+                Fh=riem5(iflo5(padd5(mh0,s0d,1f0),m0,smallr,pfl), iflo5(padd5(mget(mc,li,lj+1),sp,-1f0),mp,smallr,pfl),2,gamma,smallr,pfl,rv)
+                ntuple(v->rx[v]+dtdx*(Fl[v]-Fh[v]),5)
+            end
+            r=let mm=pget(sm1,li,lj),mp=pget(sp1,li,lj)
+                sm=prim_slope5(pget(mod(p-2,PL),li,lj),mm,m0); s0d=prim_slope5(mm,m0,mp); sp=prim_slope5(m0,mp,pget(mod(p+2,PL),li,lj))
+                Fl=riem5(iflo5(padd5(mget(md,li,lj),sm,1f0),mm,smallr,pfl), iflo5(padd5(mh0,s0d,-1f0),m0,smallr,pfl),3,gamma,smallr,pfl,rv)
+                Fh=riem5(iflo5(padd5(mh0,s0d,1f0),m0,smallr,pfl), iflo5(padd5(mget(mu,li,lj),sp,-1f0),mp,smallr,pfl),3,gamma,smallr,pfl,rv)
+                ntuple(v->ry[v]+dtdx*(Fl[v]-Fh[v]),5)
+            end
+            r[1]<smallr&&(r=(smallr,0f0,0f0,0f0,pfl/(gamma-1f0)))
+            if do_turb && r[1]>=turb_min_rho
+                ax,ay,az=turb_interp(afield,gi,gj,gk,boxlen/N,boxlen,ramp)
+                rhom=max(r[1],smallr);sc2=smallc*smallc;rho=r[1];e=r[5]
+                e=max(e-0.5f0*r[2]*r[2]/rhom,rho*sc2);e=max(e-0.5f0*r[3]*r[3]/rhom,rho*sc2);e=max(e-0.5f0*r[4]*r[4]/rhom,rho*sc2)
+                m2=r[2]+rhom*ax*dt;m3=r[3]+rhom*ay*dt;m4=r[4]+rhom*az*dt
+                e=max(e+0.5f0*m2*m2/rhom,rho*sc2);e=max(e+0.5f0*m3*m3/rhom,rho*sc2);e=max(e+0.5f0*m4*m4/rhom,rho*sc2)
+                r=(r[1],m2,m3,m4,e)
+            end
+            for v in 1:5;unew[gi,gj,gk,v]=r[v];end
+            sync_threads(); loadpl(mod(p-2,PL),wrp(p+4,N)); sync_threads()
+            mhpl(mod(p+2,ML),mod(p+1,PL),mod(p+2,PL),mod(p+3,PL)); sync_threads()
+            p+=1
+        end
+    end
+    return nothing
+end
+
+@inline function _hydro_march2_launch(::Val{OX},::Val{OY},rv::Val,unew,uold,afield,p::Params,pfl,dt,dx,ramp,do_turb) where {OX,OY}
+    @cuda threads=(OX*OY) blocks=(p.N÷OX,p.N÷OY,1) integrator_hydro_march2!(
+        Val(OX),Val(OY),rv,unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,p.N,p.boxlen,ramp,p.turb_min_rho,do_turb)
+end
+function step_hydro_march2!(uold,unew,afield,p::Params,dt::Float32,t::Float32; do_turb::Bool=false, ox::Int=32, oy::Int=8, riemann::Symbol=:hll)
+    dx=dxof(p); pfl=pfloor(p); ramp=min(t/p.turb_T,1f0); rv = riemann===:hll ? Val(:hll) : Val(:llf)
+    if     ox==32&&oy==8;  _hydro_march2_launch(Val(32),Val(8), rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    elseif ox==16&&oy==16; _hydro_march2_launch(Val(16),Val(16),rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    elseif ox==32&&oy==4;  _hydro_march2_launch(Val(32),Val(4), rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    elseif ox==16&&oy==8;  _hydro_march2_launch(Val(16),Val(8), rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
+    else error("step_hydro_march2!: add a literal-Val branch for ox=$ox,oy=$oy")
+    end
+    return nothing
+end
+
 # ---- Hydro single-zone PPM: parabolic edges (ppm_edges, shared with MHD) + 3-wave characteristic
 # trace (local_ppm_trace: parabola integrated over each acoustic/entropy wave's domain of dependence
 # via ppm_avg). ±1 stencil → same (TB+4) tile as PLM. ~2856 Mcell/s vs PLM 4250 (1.49x). ----
