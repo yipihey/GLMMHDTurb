@@ -66,13 +66,30 @@ potential), vrms 0.78 @t=0.21 (matches the GLM cube's 0.79).
 | CT-MHD `ct_mhd.jl` | Julia, 7-kernel, fp32 | **205** | ~1e-4 (fp32 floor, bounded) | > production CT ~160 already |
 | (production CT, mini-ramses) | CUDA fused, full-step | ~160 (256³) | machine-0 (f64 EMF) | OOMs at 512³ |
 
-The 205 is **traffic-bound** (7 global passes, fluxes spilled to DRAM) — *not* the ceiling. The
-fused f16-tile path (flux tile in shared, EMF computed in-tile, fast-math) is exactly what lifted
-GLM from multi-kernel to the ~3100 march; the same applies here. **Finding: a lean fused f16 CT
-should be GLM-march-class, not the 5× slower the production CT showed — that 5× was layout +
-orchestration (22-var, multi-pass), not the scheme.** div·B is fp32-roundoff-bounded (~1e-3 over
-2000 steps); f64 EMF accumulation pins it to machine-0 (as the production CT does). Next step: the
-fused `.cu` CT kernel via the march_bridge.
+### Fused `.cu` CT (`march_bridge/cu/spike_ct.cu`) — correct, but the fusion is register-bound
+
+Built the single-kernel fused CT (load prim+faceB tile once; each owned thread updates hydro from
+6 face HLL fluxes AND its 3 face-B from curl of edge-EMFs, recomputing the magnetic fluxes from the
+tile — recompute-determinism ⇒ div·B preserved at block seams with no shared flux store). Validated
+vs `ct_mhd.jl` on OT N=128: **div·B 7.4e-5 = the Julia 8.4e-5** (machine-zero, fp32 floor, across
+block boundaries), fields agree to ~5% (fast-math + predictor).
+
+| CT variant | form | Mcell/s | regs/blk | div·B |
+|---|---|---:|---|---|
+| `ct_mhd.jl` | Julia, 7-kernel | **205** | — | ~1e-4 |
+| `spike_ct.cu` | .cu fused recompute | **61** | 255 / 1 blk | ~7e-5 |
+
+**Honest finding (tempering the earlier optimism):** the naive fused CT is *register-bound* (255
+regs → 1 block), SLOWER than the multi-kernel — because each thread recomputes ~20 Riemann solves
+(every edge-EMF re-derives 4 face fluxes). This is the GLM cube>march lesson reconfirmed: a heavy
+multi-output fused kernel blows registers (cf. faithful transverse-Hancock GLM = 227 regs). CT's
+2-D EMF makes fusion genuinely register-heavy, so it does NOT trivially inherit the GLM march's
+fusion win. The register-optimal structure is **staged-through-shared** (compute each face flux
+once into a shared flux tile, then EMF+update read it) — which is what the production CT does for
+its ~160. Realistic CT ceiling on the A6000 is therefore likely **~300–700 Mcell/s (staged f16)**,
+2–4× the production 160 and beating the 205 multi-kernel — but NOT the GLM march's ~3100. **Much of
+the ~5× GLM>CT gap is real (the EMF), not just layout.** Next: the staged `.cu` CT. div·B is
+fp32-roundoff-bounded (~1e-3 over 2000 steps); f64 EMF pins it to machine-0.
 
 ## Production solver throughput (prior sessions, for context)
 
