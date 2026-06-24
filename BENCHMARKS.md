@@ -79,17 +79,32 @@ block boundaries), fields agree to ~5% (fast-math + predictor).
 | `ct_mhd.jl` | Julia, 7-kernel | **205** | — | ~1e-4 |
 | `spike_ct.cu` | .cu fused recompute | **61** | 255 / 1 blk | ~7e-5 |
 
-**Honest finding (tempering the earlier optimism):** the naive fused CT is *register-bound* (255
-regs → 1 block), SLOWER than the multi-kernel — because each thread recomputes ~20 Riemann solves
-(every edge-EMF re-derives 4 face fluxes). This is the GLM cube>march lesson reconfirmed: a heavy
-multi-output fused kernel blows registers (cf. faithful transverse-Hancock GLM = 227 regs). CT's
-2-D EMF makes fusion genuinely register-heavy, so it does NOT trivially inherit the GLM march's
-fusion win. The register-optimal structure is **staged-through-shared** (compute each face flux
-once into a shared flux tile, then EMF+update read it) — which is what the production CT does for
-its ~160. Realistic CT ceiling on the A6000 is therefore likely **~300–700 Mcell/s (staged f16)**,
-2–4× the production 160 and beating the 205 multi-kernel — but NOT the GLM march's ~3100. **Much of
-the ~5× GLM>CT gap is real (the EMF), not just layout.** Next: the staged `.cu` CT. div·B is
-fp32-roundoff-bounded (~1e-3 over 2000 steps); f64 EMF pins it to machine-0.
+The fused-*recompute* CT is register-bound (255 regs → 1 block) because each thread recomputes
+~20 Riemann solves (every edge-EMF re-derives 4 face fluxes) — the GLM cube>march lesson. The fix
+is **staging**, below.
+
+### ★ STAGED f16 CT (`spike_ct2.cu`) — the hand-tuned A6000 rewrite: ~1200 Mcell/s
+
+Compute each face flux **once** into a shared **f16** flux tile (phase A); then hydro update + edge
+EMF + face-B all **read** it (phase B). Two keys: (1) staging drops registers 255→**64** (the sweet
+spot) — each phase has tiny live state; (2) the update base (hydro U *and* face-B) is read **f32
+from global**, the f16 tile is reconstruction-input only — this is the GLM "f16-tile + f32-update"
+lesson, and it's what keeps div·B machine-zero (f16-rounding the face-B base broke div·B → 1.15;
+f32 base → 9e-5). fast-math holds it at 64 regs. NG=3 halo (CT's EMF reaches one cell past hydro).
+
+| CT variant | Mcell/s @480 | regs | div·B | vs production CT (160) |
+|---|---:|---|---|---:|
+| fused recompute (`spike_ct.cu`) | 61 | 255 / 1 blk | 7e-5 | 0.4× |
+| Julia multi-kernel (`ct_mhd.jl`) | 205 | — | 1e-4 | 1.3× |
+| **staged f16 (`spike_ct2.cu`)** | **1206** | **64 / 1 blk** | **9e-5 = machine-0** | **7.5×** |
+
+Validated on OT N=128: div·B 9.3e-5 = the Julia 8.4e-5; fields match Julia to ~4% (f16 tile).
+Tile sweep: 8×8×4 wins (1294 @288); all 64 regs, shared-limited to **1 block** (66 KB > the 50 KB
+for 2 blocks). **Revised conclusion (my "~300–700, 5× gap intrinsic" was WRONG):** staged f16 CT is
+**~63% of the GLM cube (1923) and ~39% of the GLM march (3100)** — and it gives **exact
+(machine-zero) div·B** where GLM only cleans it. The production CT's 8× deficit was layout +
+orchestration, NOT the scheme. Headroom: dropping to 2 blocks (shared < 50 KB via face-B-from-global
+or mag-only flux storage) should reach ~1800–2000.
 
 ## Production solver throughput (prior sessions, for context)
 
