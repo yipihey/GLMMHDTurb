@@ -113,8 +113,14 @@ The mag-only/recompute path is a trap (the cube>march lesson once more: 6 live r
 128 regs). **Final hand-tuned CT: 1501 Mcell/s @480** — **9.4× the production CT (160)**, **~78% of
 the GLM cube (1923)**, **~48% of the GLM march (3100)** — with **exact (machine-zero) div·B** where
 GLM only cleans it. **Verdict: the production CT's ~9× deficit was layout + orchestration, NOT the
-scheme; a hand-tuned f16 staged CT is GLM-cube-class with a hard div·B=0.** Remaining lever: the 2.5D
-z-streaming march (kills the z-halo → more blocks) — the structural next step, higher risk.
+scheme; a hand-tuned f16 staged CT is GLM-cube-class with a hard div·B=0.** Remaining lever: the 2.5D z-streaming march (kills the z-halo → more blocks) — **attempted
+(`spike_ctm.cu`), does NOT transfer.** Unlike the GLM march (no cross-plane flux coupling), CT's
+edge-EMF couples planes, so the periodic z-wrap breaks the forward pipeline: plane 0's face-B needs
+plane NZ−1's magnetic flux (computed last), and plane NZ−1 needs plane 0's (already evicted from the
+3-plane mag ring) — both boundary planes have wrap dependencies the small ring can't hold (needs
+persistent boundary storage or a 2nd sweep). The lag also splits mag/hydro flux computation across
+steps (recompute redundancy), and 256-thread tiles fall back to ~1 block. **Conclusion: ct3's 1501
+is the hand-tuned A6000 ceiling for staged f16 CT; the streaming win is GLM-specific.**
 
 ## Production solver throughput (prior sessions, for context)
 
