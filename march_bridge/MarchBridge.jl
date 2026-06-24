@@ -52,6 +52,14 @@ function set_glm(m::Lib, ch::Real, glmfac::Real)
     ccall(m.f_glm, Cvoid, (Cfloat, Cfloat), Float32(ch), Float32(glmfac))
 end
 
+"Override the adiabatic index (a __constant__ in the .cu; default 1.4). Needed e.g. for
+Orszag-Tang (gamma=5/3). GLM-MHD lib only."
+function set_gamma(m::Lib, g::Real)
+    f = dlsym(m.h, :march_set_gamma; throw_error=false)
+    f === nothing && error("this lib has no march_set_gamma")
+    ccall(f, Cvoid, (Cfloat,), Float32(g))
+end
+
 # Build a host vector of device addresses (one per SoA plane) for the float** ABI.
 _addrs(planes) = [reinterpret(Ptr{Float32}, UInt(UInt64(pointer(p)))) for p in planes]
 

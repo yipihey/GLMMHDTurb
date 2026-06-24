@@ -225,6 +225,7 @@ int march_nv(){ return NV; }
 int march_nx(){ return NX; }
 void march_set_dtdx(float v){ cudaMemcpyToSymbol(DTDX, &v, sizeof(float)); }
 void march_set_glm(float ch,float fac){ cudaMemcpyToSymbol(CH,&ch,sizeof(float)); cudaMemcpyToSymbol(GLMFAC,&fac,sizeof(float)); }
+void march_set_gamma(float g){ cudaMemcpyToSymbol(GAMMA, &g, sizeof(float)); }
 double march_run_dev(float* const* qv, float* const* ov, int nsteps){
     size_t n=(size_t)NX*NY*NZ; Ptrs q,o;
     for(int v=0;v<NV;v++){ q.v[v]=qv[v]; o.v[v]=ov[v]; }

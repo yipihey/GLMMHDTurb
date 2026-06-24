@@ -51,6 +51,23 @@ finite, and **div·B is actively cleaned** (max|div·B| 30→3.4 over 55 steps, 
 bounded). Register-bound at 2 blocks (both regs and the 38 KB f16 tile cap it);
 fp32 traffic is only ~29% of peak BW, so this is the A6000 ceiling for the scheme.
 
+### Orszag-Tang cross-validation (`ot_validate.jl`)
+
+Matched-IC OT: the same `ic_ot_kernel!` state copied bit-identically into both layouts,
+the same fixed dt sequence + ch/glmfac, both HLL + f16 tile, no forcing — so the field
+difference isolates *exactly* the reconstruction predictor (cube = full transverse
+Hancock, march = transverse-free 1D Hancock). N=192, γ=5/3:
+
+| field | relL2 @40 | @120 | @300 |
+|-------|-----------|------|------|
+| ρ, mx, my, E, Bx, By | 0.3–0.5% | 0.7–1.2% | 1.6–2.5% |
+| mz, Bz, ψ (≈0 in 2D OT) | max\|Δ\| 5e-10 / 0 / 2e-3 — noise |
+
+vrms agrees to ~0.2% (0.9996 vs 1.0015 @120). So the march **matches the validated
+cube to ~1%** on OT, the difference being the slowly-accumulating transverse term —
+PASS. Consistent caveat: march divBmax ~10× the cube's (0.48 vs 0.05 @120), still
+small on this smooth test; the looser ∇·B is the light scheme's known tradeoff.
+
 ### Turbulence robustness (`turb_robustness.jl`)
 
 Driving the nvcc MHD march with the project's OU forcing (the cube's own forcing +
