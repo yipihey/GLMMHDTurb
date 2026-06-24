@@ -1066,7 +1066,10 @@ end
 @fastmath @inline function riem5(Lq,Rq,dir,gamma::Float32,smallr::Float32,pfl::Float32,::Val{RIEM}) where RIEM
     L0=rot_to5(Lq,dir);R0=rot_to5(Rq,dir)
     L=(max(L0[1],smallr),L0[2],L0[3],L0[4],max(L0[5],pfl)); R=(max(R0[1],smallr),R0[2],R0[3],R0[4],max(R0[5],pfl))
-    rot_flux5(RIEM===:hll ? hll5x(L,R,gamma) : llf5x(L,R,gamma), dir)
+    f = RIEM===:hll ? hll5x(L,R,gamma) :
+        RIEM===:llf ? llf5x(L,R,gamma) :
+        ((L[1]<1f-3||L[5]<1f-3||R[1]<1f-3||R[5]<1f-3) ? llf5x(L,R,gamma) : hll5x(L,R,gamma))  # :fb HLL+LLF fallback
+    rot_flux5(f, dir)
 end
 @inline iflo5(f,m0,smallr,pfl) = (f[1]<smallr||f[5]<pfl) ? m0 : f
 @inline _sg5(S,lin) = ntuple(v -> Float32(@inbounds(S[5*lin+v])), 5)
@@ -1519,7 +1522,8 @@ end
         Val(OX),Val(OY),Val(GH),rv,unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,p.N,p.boxlen,ramp,p.turb_min_rho,do_turb)
 end
 function step_hydro_lmarch!(uold,unew,afield,p::Params,dt::Float32,t::Float32; do_turb::Bool=false, ox::Int=32, oy::Int=8, gh::Int=2, riemann::Symbol=:hll)
-    dx=dxof(p); pfl=pfloor(p); ramp=min(t/p.turb_T,1f0); rv = riemann===:hll ? Val(:hll) : Val(:llf)
+    dx=dxof(p); pfl=pfloor(p); ramp=min(t/p.turb_T,1f0)
+    rv = riemann===:hll ? Val(:hll) : riemann===:fb ? Val(:fb) : Val(:llf)
     if     ox==32&&oy==8 &&gh==2; _lmarch_launch(Val(32),Val(8),Val(2),rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
     elseif ox==32&&oy==8 &&gh==1; _lmarch_launch(Val(32),Val(8),Val(1),rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
     elseif ox==16&&oy==16&&gh==2; _lmarch_launch(Val(16),Val(16),Val(2),rv,unew,uold,afield,p,pfl,dt,dx,ramp,do_turb)
