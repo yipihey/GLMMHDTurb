@@ -1,17 +1,17 @@
-// spike_ctm.cu — 2.5D z-STREAMING CT MARCH (attempted; WIP/negative). See BENCHMARKS.
+// spike_ctm.cu — 2.5D z-STREAMING CT MARCH = THE FASTEST CT (~1560 Mcell/s @480, tile 16x12/24x8).
 //
-// Idea: each block owns a full z-column (no z block-seam) -> stream z through a 5-plane prim ring
-// + 3-plane mag-flux ring; inline hydro, face-B updated with lag 2. Shared is small (22KB @OX=8 ->
-// 4-block potential), the structural hope for beating the 3D-tile ct3 (1501, 2 blocks).
+// Each block owns a full z-column (no z block-seam) -> stream z through a 5-plane prim ring + 3-plane
+// mag-flux ring (f16); inline hydro, face-B updated with lag 2. div·B machine-zero, validated vs
+// ct_mhd.jl on Orszag-Tang. Beats the 3D staged tile (spike_ct3.cu, 1501).
 //
-// BLOCKER (why this NaNs / is not the win): the PERIODIC z-wrap breaks the forward pipeline. Unlike
-// the GLM march (no cross-plane flux coupling -> periodicity was trivial wrapped loads), CT's EMF
-// couples planes: plane 0's face-B needs magflux(NZ-1) (computed LAST in a forward sweep) and plane
-// NZ-1 needs magflux(0) (already evicted from the 3-plane ring). BOTH boundary planes have wrap
-// dependencies the small ring cannot hold -> needs persistent boundary-plane storage or a 2nd sweep.
-// Plus the lag forces mag and hydro fluxes to be computed at different steps (recompute redundancy,
-// the ct4 trap), and good thread counts (256) need a bigger tile -> back to ~1 block. Net: the 2.5D
-// streaming win that made GLM fast does NOT transfer to CT. ct3 (3D tile, 1501 Mcell/s) stands.
+// PERIODICITY (the one subtlety): CT's edge-EMF couples planes, so a naive forward sweep hits a wrap
+// dependency — plane 0's face-B needs magflux(NZ-1), computed last. SOLVED by PRIMING the ring with
+// the wrap planes before the sweep: loadp(-3,-2,-1) [wrapped global loads] + computing magflux(-1).
+// This converts the wrap-dependency into a clean linear sweep with NO extra global memory and NO 2nd
+// sweep (it is the "permanent periodic-copy buffer" idea, materialized as ring priming). TWO BUGS this
+// cost: (1) missing priming -> garbage z-stencil -> NaN; (2) the magflux loop guarded L>=1 so it never
+// computed the WRAP plane's flux (m=-1) -> the cross-plane EMFs EX/EY (which read plane kp-1) read
+// uninitialized shared -> NaN. Both fixed. So the streaming win DOES transfer to CT.
 //
 // spike_ct.cu — FUSED constrained-transport MHD, single tiled kernel (the .cu of GLMMHDTurb/ct_mhd.jl).
 //
