@@ -25,8 +25,11 @@ reference CPU scalar (`Grid1D`), a **SIMD CPU** backend (`Grid1DSoA`, `Vec{8,Flo
 contract. The same branch-free physics source runs **bit-identically** on a CPU thread, a SIMD lane,
 and a GPU thread (max |Δ| = 0 vs the scalar backend on Sod/smooth wave across HLLC/HLL/LLF).
 Throughput on an A6000: CPU scalar ~9–14, CPU SIMD ~60 (single core), **CUDA ~11,400 Mcell/s**.
-Convergence runs in Float64 from the same Float32 physics (2nd order). See `DESIGN_fvkernel.md` for
-the contract and roadmap (next: CPU threads, multi-D + GLM-MHD, then Metal/CT).
+Convergence runs in Float64 from the same Float32 physics (2nd order). A **2D backend** (`Grid2D`,
+Strang splitting) validates the rotation design: the y-flux — obtained by rotating the marked vector
+components and calling the same `physflux_x` the user wrote — is **bit-identical** to the x-flux, and
+the 2D scheme is 2nd order. See `DESIGN_fvkernel.md` for the contract and roadmap (next: GLM-MHD via
+the same contract, then 2D SIMD/CUDA, Metal/CT).
 
 See `DESIGN_fvkernel.md` for the contract, the rotation/Riemann design wins, the three locked
 decisions, and the roadmap. Run the tests with `julia --project=. -e 'using Pkg; Pkg.test()'`.

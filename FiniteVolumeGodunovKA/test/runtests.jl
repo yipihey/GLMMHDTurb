@@ -95,6 +95,38 @@ end
 end
 
 # ---------------------------------------------------------------------------
+# 2D + rotation — the design-defining test. The user wrote only physflux_x; the
+# y-flux is obtained by rotating the marked vector components. Isotropy must be
+# bit-exact, and the Strang-split 2D scheme must be 2nd order.
+# ---------------------------------------------------------------------------
+@testset "2D rotation isotropy + convergence" begin
+    s = Euler(γ = 1.4f0)
+
+    # one x-sweep on an x-varying Sod ≡ one y-sweep on the same profile along y (u↔v).
+    n = 96; d = 1f0/n; m = 4
+    xprob = [prim2cons(s, (i <= n÷2 ? 1f0 : 0.125f0, 0.3f0,0f0,0f0, i <= n÷2 ? 1f0 : 0.1f0)) for i in 1:n, _ in 1:m]
+    gx = Grid2D(s, xprob; dx=d, dy=d, bc=:periodic, recon=PLM(), rsol=HLLC()); FV._sweep_x!(gx, 0.1f0*d)
+    yprob = [prim2cons(s, (j <= n÷2 ? 1f0 : 0.125f0, 0f0,0.3f0,0f0, j <= n÷2 ? 1f0 : 0.1f0)) for _ in 1:m, j in 1:n]
+    gy = Grid2D(s, yprob; dx=d, dy=d, bc=:periodic, recon=PLM(), rsol=HLLC()); FV._sweep_y!(gy, 0.1f0*d)
+    iso = maximum(maximum(abs.(gx.U[a,b] .- (gy.U[b,a][1], gy.U[b,a][3], gy.U[b,a][2], gy.U[b,a][4], gy.U[b,a][5])))
+                  for a in 1:n, b in 1:m)
+    @test iso == 0f0                                   # y-flux-via-rotation ≡ x-flux, bit-exact
+
+    # diagonal entropy wave (Float64), exact at t=1 → 2nd order.
+    ρ0(x, y) = 1.0 + 0.2 * sinpi(2 * (x + y))
+    err2d(nn) = begin
+        dx = 1.0/nn
+        U0 = [prim2cons(s, (ρ0((i-0.5)*dx, (j-0.5)*dx), 1.0, 1.0, 0.0, 1.0)) for i in 1:nn, j in 1:nn]
+        g = Grid2D(s, U0; dx=dx, dy=dx, bc=:periodic, recon=PLM(:none), rsol=HLL(), cfl=0.4)
+        FV.evolve2d!(g, 1.0); W = FV.primitives(g)
+        sum(abs(W[i,j][1] - ρ0((i-0.5)*dx, (j-0.5)*dx)) for i in 1:nn, j in 1:nn) * dx * dx
+    end
+    es = [err2d(nn) for nn in (16, 32, 64)]
+    @test all(diff(es) .< 0)
+    @test log2(es[2] / es[3]) ≥ 1.9                    # 2nd order at the finest pair
+end
+
+# ---------------------------------------------------------------------------
 # CUDA backend — same physics, T = Float32 on a GPU thread. Must be bit-identical
 # to the scalar backend. Skipped automatically when no functional GPU is present.
 # ---------------------------------------------------------------------------

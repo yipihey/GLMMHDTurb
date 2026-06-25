@@ -29,3 +29,12 @@ end
     (W0 .- 0.5f0 .* d, W0 .+ 0.5f0 .* d)
 end
 @inline faces(::PCM, Wm, W0::NTuple{N,T}, Wp) where {N,T} = (W0, W0)
+
+# MUSCL-Hancock predictor for one cell: limited faces evolved by dt/2 (x-direction physical
+# flux). Generic over the element type (Float32 scalar, Vec lane). Shared by every backend.
+@inline function _halfstep(s, r, Um, U0, Up, λ)
+    Wm, W0, Wp = cons2prim(s, Um), cons2prim(s, U0), cons2prim(s, Up)
+    WLf, WRf = faces(r, Wm, W0, Wp)
+    dUh = (0.5f0 * λ) .* (physflux_x(s, WRf) .- physflux_x(s, WLf))
+    (cons2prim(s, prim2cons(s, WLf) .- dUh), cons2prim(s, prim2cons(s, WRf) .- dUh))
+end

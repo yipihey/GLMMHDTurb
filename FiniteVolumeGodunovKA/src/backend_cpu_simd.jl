@@ -69,14 +69,6 @@ function fillghosts!(g::Grid1DSoA{N}) where {N}
     end
 end
 
-# One cell's MUSCL-Hancock predictor, generic over the element type (Vec or Float32).
-@inline function _halfstep(s, r, Um, U0, Up, λ)
-    Wm, W0, Wp = cons2prim(s, Um), cons2prim(s, U0), cons2prim(s, Up)
-    WLf, WRf = faces(r, Wm, W0, Wp)
-    dUh = (0.5f0 * λ) .* (physflux_x(s, WRf) .- physflux_x(s, WLf))
-    (cons2prim(s, prim2cons(s, WLf) .- dUh), cons2prim(s, prim2cons(s, WRf) .- dUh))
-end
-
 function step!(g::Grid1DSoA{N}, dt) where {N}
     s, r, rs = g.sys, g.recon, g.rsol
     λ    = Float32(dt) / g.dx

@@ -31,6 +31,7 @@ export PLM, PCM, LLF, HLL, HLLC
 export Grid1D, step!, evolve!, primitives, conserved_total
 export Grid1DSoA, evolve_simd!, primitives_soa
 export Grid1DCU, evolve_cuda!, primitives_cuda
+export Grid2D, evolve2d!
 
 # ---------------------------------------------------------------------------
 # The contract. A system is a `<: FVSystem` value; the per-cell physics are
@@ -61,9 +62,11 @@ function eig_x end
 include("macro.jl")
 include("reconstruct.jl")
 include("riemann.jl")
+include("dimsplit.jl")
 include("backend_cpu.jl")
 include("backend_cpu_simd.jl")
 include("backend_cuda.jl")
+include("backend_cpu_2d.jl")
 include("systems.jl")
 
 end # module

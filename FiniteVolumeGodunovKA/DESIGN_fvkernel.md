@@ -77,6 +77,8 @@ Implemented and **passing** (`test/runtests.jl`):
   vector loads, `T = Vec{8,Float32}` lanes + a scalar tail — reusing the per-cell physics verbatim.
 - A **CUDA 1D** backend (`Grid1DCU`): one GPU thread per cell, fused per-cell recompute, `T =
   Float32`, in-kernel BC (mod1/clamp), double-buffered device state — the same physics verbatim.
+- A **2D CPU** backend (`Grid2D`): Strang dimensional splitting (x·y·x), where the y-sweep reuses the
+  per-cell physics through `_update_dir` + the rotation perm — **the user wrote only `physflux_x`**.
 - **Sod shock tube (Float32, HLLC):** post-shock ρ=0.2655 / P=0.3031 vs exact 0.2656 / 0.3031;
   positivity + mass conservation hold.
 - **Entropy-wave convergence (Float64):** L1 order 2.34 → 2.15 → 2.05 → **2.01** (nx 16→256).
@@ -87,6 +89,10 @@ Implemented and **passing** (`test/runtests.jl`):
   the tail). The element-generic physics is provably the same code on a CPU thread, a SIMD lane, and
   a GPU thread. Throughput (A6000): **CPU scalar ~9–14, CPU SIMD ~60 (4.7×–6.8×, single core), CUDA
   ~11,400 Mcell/s** (≥1M cells; ~190× the single-core SIMD).
+- **Rotation is exact (the design-defining result).** A single y-sweep — the y-flux obtained purely by
+  swapping the marked vector components and calling the same `physflux_x` — is **bit-identical**
+  (max |Δ| = 0) to the x-sweep on the transposed problem. The 2D Strang scheme is 2nd order (diagonal
+  entropy wave, order 2.22 → 2.09). The user writes one flux function; the library does y and z.
 
 ## Roadmap (priority order)
 
@@ -97,7 +103,10 @@ Implemented and **passing** (`test/runtests.jl`):
    items: the staged shared-memory **cube** in multi-D; whether CUDA.jl plateaus below the `.cu`
    here (it didn't for this register-light fused 1D kernel) → the transpile-to-CUDA-C escape hatch
    only where needed; move CUDA to a **weakdep + package extension** so CPU-only installs stay light.
-3. **Multi-D + rotation** exercised (2D Sod/Kelvin-Helmholtz), then **GLM-MHD** via the same contract.
+3. ~~**Multi-D + rotation**~~ ✅ 2D CPU (`Grid2D`) via Strang splitting; rotation bit-exact, 2nd order.
+   Open: 2D SIMD/CUDA backends (same `_update_dir`, SoA/per-thread), 3D, true unsplit/CTU if splitting
+   errors matter. Next big step: **GLM-MHD** via the same contract (tests rotation under a real MHD
+   flux — B components join `vidx`, ψ source, HLLD built-in).
 4. **Metal** — measure the Metal.jl gap vs its bandwidth roofline before deciding native-vs-MSL.
 5. **CT** through the reserved staggered/EMF seam.
 
