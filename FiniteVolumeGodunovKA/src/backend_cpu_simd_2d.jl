@@ -48,23 +48,27 @@ end
 
 # One directional sweep, vectorized along x. `stride` selects the stencil axis: 1 for the
 # x-sweep (neighbours ±1 in memory), nxp for the y-sweep (neighbours ±a full row).
-@inline function _sweep_simd!(g::Grid2DSoA{N}, dt, d, stride, perm) where {N}
+# Threaded over rows (each writes a disjoint region of Ut → race-free, bit-identical).
+function _sweep_simd!(g::Grid2DSoA{N}, dt, d, stride, perm) where {N}
     s, r, rs = g.sys, g.recon, g.rsol; λ = Float32(dt) / d
     ng, nxp = _NG, g.nxp; s2 = 2*stride
-    @inbounds for jj in 1:g.ny
-        rb = (jj-1+ng)*nxp; p = ng+1; pend = ng+g.nx
-        while p + _W - 1 <= pend
-            b = rb + p
-            v = _update_dir(s, r, rs, loadv(g.U,Val(_W),b-s2), loadv(g.U,Val(_W),b-stride),
-                            loadv(g.U,Val(_W),b), loadv(g.U,Val(_W),b+stride),
-                            loadv(g.U,Val(_W),b+s2), λ, perm)
-            storev!(g.Ut, v, b); p += _W
-        end
-        while p <= pend
-            b = rb + p
-            v = _update_dir(s, r, rs, loads(g.U,b-s2), loads(g.U,b-stride), loads(g.U,b),
-                            loads(g.U,b+stride), loads(g.U,b+s2), λ, perm)
-            stores!(g.Ut, v, b); p += 1
+    nc = _nchunks(g.ny)
+    Threads.@threads for c in 1:nc
+        @inbounds for jj in _chunkrange(g.ny, nc, c)
+            rb = (jj-1+ng)*nxp; p = ng+1; pend = ng+g.nx
+            while p + _W - 1 <= pend
+                b = rb + p
+                v = _update_dir(s, r, rs, loadv(g.U,Val(_W),b-s2), loadv(g.U,Val(_W),b-stride),
+                                loadv(g.U,Val(_W),b), loadv(g.U,Val(_W),b+stride),
+                                loadv(g.U,Val(_W),b+s2), λ, perm)
+                storev!(g.Ut, v, b); p += _W
+            end
+            while p <= pend
+                b = rb + p
+                v = _update_dir(s, r, rs, loads(g.U,b-s2), loads(g.U,b-stride), loads(g.U,b),
+                                loads(g.U,b+stride), loads(g.U,b+s2), λ, perm)
+                stores!(g.Ut, v, b); p += 1
+            end
         end
     end
     g.U, g.Ut = g.Ut, g.U
@@ -75,20 +79,26 @@ function step!(g::Grid2DSoA{N}, dt) where {N}
     _fillghosts2d!(g); _sweep_simd!(g, dt/2, g.dx, 1, px)
     _fillghosts2d!(g); _sweep_simd!(g, dt,   g.dy, g.nxp, py)
     _fillghosts2d!(g); _sweep_simd!(g, dt/2, g.dx, 1, px)
-    s = g.sys; ng, nxp = _NG, g.nxp                       # operator-split source
-    @inbounds for jj in 1:g.ny, ii in 1:g.nx
-        b = (jj-1+ng)*nxp + (ii+ng); stores!(g.U, source(s, loads(g.U, b), Float32(dt)), b)
+    s = g.sys; ng, nxp = _NG, g.nxp; nc = _nchunks(g.ny)   # operator-split source
+    Threads.@threads for c in 1:nc
+        @inbounds for jj in _chunkrange(g.ny, nc, c), ii in 1:g.nx
+            b = (jj-1+ng)*nxp + (ii+ng); stores!(g.U, source(s, loads(g.U, b), Float32(dt)), b)
+        end
     end
     return g
 end
 
 function max_wavespeed(g::Grid2DSoA{N}) where {N}
-    s = g.sys; a = 0f0; ng, nxp = _NG, g.nxp; py = dirperm(s, N, 2)
-    @inbounds for jj in 1:g.ny, ii in 1:g.nx
-        W = cons2prim(s, loads(g.U, (jj-1+ng)*nxp + (ii+ng)))
-        a = max(a, fastspeed_x(s, W), fastspeed_x(s, _swap(W, py)))
+    s = g.sys; ng, nxp = _NG, g.nxp; py = dirperm(s, N, 2); nc = _nchunks(g.ny); cmax = zeros(Float32, nc)
+    Threads.@threads for c in 1:nc
+        a = 0f0
+        @inbounds for jj in _chunkrange(g.ny, nc, c), ii in 1:g.nx
+            W = cons2prim(s, loads(g.U, (jj-1+ng)*nxp + (ii+ng)))
+            a = max(a, fastspeed_x(s, W), fastspeed_x(s, _swap(W, py)))
+        end
+        cmax[c] = a
     end
-    return a
+    return maximum(cmax)
 end
 
 function evolve_simd2d!(g::Grid2DSoA, tend; maxsteps::Int = 10^7)

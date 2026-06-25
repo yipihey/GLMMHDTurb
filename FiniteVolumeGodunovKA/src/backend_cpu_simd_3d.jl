@@ -44,21 +44,25 @@ function _fillghosts3d!(g::Grid3DSoA{N}) where {N}
     end
 end
 
-@inline function _sweep_simd3d!(g::Grid3DSoA{N}, dt, d, stride, perm) where {N}
+# Threaded over z-planes (each writes a disjoint region of Ut → race-free, bit-identical).
+function _sweep_simd3d!(g::Grid3DSoA{N}, dt, d, stride, perm) where {N}
     s, r, rs = g.sys, g.recon, g.rsol; λ = Float32(dt) / d; ng, nxp, nyp = _NG, g.nxp, g.nyp; s2 = 2*stride
-    @inbounds for kk in 1:g.nz, jj in 1:g.ny
-        base = ((kk-1+ng)*nyp + (jj-1+ng))*nxp; p = ng+1; pend = ng+g.nx
-        while p + _W - 1 <= pend
-            b = base + p
-            v = _update_dir(s, r, rs, loadv(g.U,Val(_W),b-s2), loadv(g.U,Val(_W),b-stride),
-                            loadv(g.U,Val(_W),b), loadv(g.U,Val(_W),b+stride), loadv(g.U,Val(_W),b+s2), λ, perm)
-            storev!(g.Ut, v, b); p += _W
-        end
-        while p <= pend
-            b = base + p
-            v = _update_dir(s, r, rs, loads(g.U,b-s2), loads(g.U,b-stride), loads(g.U,b),
-                            loads(g.U,b+stride), loads(g.U,b+s2), λ, perm)
-            stores!(g.Ut, v, b); p += 1
+    nc = _nchunks(g.nz)
+    Threads.@threads for c in 1:nc
+        @inbounds for kk in _chunkrange(g.nz, nc, c), jj in 1:g.ny
+            base = ((kk-1+ng)*nyp + (jj-1+ng))*nxp; p = ng+1; pend = ng+g.nx
+            while p + _W - 1 <= pend
+                b = base + p
+                v = _update_dir(s, r, rs, loadv(g.U,Val(_W),b-s2), loadv(g.U,Val(_W),b-stride),
+                                loadv(g.U,Val(_W),b), loadv(g.U,Val(_W),b+stride), loadv(g.U,Val(_W),b+s2), λ, perm)
+                storev!(g.Ut, v, b); p += _W
+            end
+            while p <= pend
+                b = base + p
+                v = _update_dir(s, r, rs, loads(g.U,b-s2), loads(g.U,b-stride), loads(g.U,b),
+                                loads(g.U,b+stride), loads(g.U,b+s2), λ, perm)
+                stores!(g.Ut, v, b); p += 1
+            end
         end
     end
     g.U, g.Ut = g.Ut, g.U
@@ -71,20 +75,27 @@ function step!(g::Grid3DSoA{N}, dt) where {N}
     _fillghosts3d!(g); _sweep_simd3d!(g, dt,   g.dz, sxy, pz)
     _fillghosts3d!(g); _sweep_simd3d!(g, dt/2, g.dy, g.nxp, py)
     _fillghosts3d!(g); _sweep_simd3d!(g, dt/2, g.dx, 1, px)
-    s = g.sys; ng, nxp, nyp = _NG, g.nxp, g.nyp
-    @inbounds for kk in 1:g.nz, jj in 1:g.ny, ii in 1:g.nx
-        b = ((kk-1+ng)*nyp + (jj-1+ng))*nxp + (ii+ng); stores!(g.U, source(s, loads(g.U, b), Float32(dt)), b)
+    s = g.sys; ng, nxp, nyp = _NG, g.nxp, g.nyp; nc = _nchunks(g.nz)
+    Threads.@threads for c in 1:nc
+        @inbounds for kk in _chunkrange(g.nz, nc, c), jj in 1:g.ny, ii in 1:g.nx
+            b = ((kk-1+ng)*nyp + (jj-1+ng))*nxp + (ii+ng); stores!(g.U, source(s, loads(g.U, b), Float32(dt)), b)
+        end
     end
     return g
 end
 
 function max_wavespeed(g::Grid3DSoA{N}) where {N}
-    s = g.sys; a = 0f0; ng, nxp, nyp = _NG, g.nxp, g.nyp; py = dirperm(s, N, 2); pz = dirperm(s, N, 3)
-    @inbounds for kk in 1:g.nz, jj in 1:g.ny, ii in 1:g.nx
-        W = cons2prim(s, loads(g.U, ((kk-1+ng)*nyp + (jj-1+ng))*nxp + (ii+ng)))
-        a = max(a, fastspeed_x(s, W), fastspeed_x(s, _swap(W, py)), fastspeed_x(s, _swap(W, pz)))
+    s = g.sys; ng, nxp, nyp = _NG, g.nxp, g.nyp; py = dirperm(s, N, 2); pz = dirperm(s, N, 3)
+    nc = _nchunks(g.nz); cmax = zeros(Float32, nc)
+    Threads.@threads for c in 1:nc
+        a = 0f0
+        @inbounds for kk in _chunkrange(g.nz, nc, c), jj in 1:g.ny, ii in 1:g.nx
+            W = cons2prim(s, loads(g.U, ((kk-1+ng)*nyp + (jj-1+ng))*nxp + (ii+ng)))
+            a = max(a, fastspeed_x(s, W), fastspeed_x(s, _swap(W, py)), fastspeed_x(s, _swap(W, pz)))
+        end
+        cmax[c] = a
     end
-    return a
+    return maximum(cmax)
 end
 
 function evolve_simd3d!(g::Grid3DSoA, tend; maxsteps::Int = 10^7)

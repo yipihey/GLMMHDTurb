@@ -153,7 +153,15 @@ If profiling ever shows the dt sync mattering at scale, revisit with a *block-hi
    x·y·z·y·x; the z-sweep uses `dirperm(s,N,3)` — the rotation machinery generalized to all 3 axes with
    **no new code**. z-rotation isotropy bit-exact, 3D convergence 2nd order (2.19/2.14); SIMD & CUDA
    bit-identical to scalar (Euler/HLLC + GLM/HLLD). Throughput @128³: scalar 0.9, SIMD 6.7, CUDA 1703.
-   Remaining: **CPU threads + cache-blocking**; `Vec{16}` on AVX-512; **CT**; **Metal**.
+   Remaining: `Vec{16}` on AVX-512; **CT**; **Metal**.
+7. ~~**CPU threads**~~ ✅ chunk-capped `Threads.@threads` over rows (2D) / z-planes (3D) in the SIMD
+   backends; bit-identical at any thread count. **Peak ~145 Mcell/s at 16 threads** (12× over
+   single-thread, beats the `cpu_simd.jl` 120 target). KEY FINDING: these kernels are
+   **memory-bandwidth-bound**, so they peak at ~8–16 threads and **over-subscription hurts** (64→71,
+   128→collapses on small grids). The chunk-cap (`≥ _MINROWS` lines/task) prevents the worst
+   small-grid footgun, but the right knob is `JULIA_NUM_THREADS ≈ 8–16` — do NOT use `-t auto` (128)
+   for these. **Cache-blocking** (sweep-fusion over tiles) is a further refinement, not yet needed
+   since threading already exceeds the target; deferred.
 6. **Metal** — measure the Metal.jl gap vs its bandwidth roofline before deciding native-vs-MSL.
 7. **CT** through the reserved staggered/EMF seam (exact div·B, vs GLM's cleaning).
 8. **Packaging:** move CUDA to a weakdep + extension (CPU-only installs stay light).

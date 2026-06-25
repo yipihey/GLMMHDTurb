@@ -12,6 +12,14 @@
 
 const _W = 8  # lane width (Vec{8,Float32} = 256-bit; bump to 16 on AVX-512 hosts)
 
+# Chunk-capped threading: these sweeps are memory-bandwidth-bound, so spawning one task per
+# thread per sweep over-subscribes on small grids (128 threads × tiny work = barrier overhead
+# dominates — measured 25× SLOWER at 256²). Cap the number of chunks so each gets ≥ _MINROWS
+# lines; this keeps the win (~12×, ~140 Mcell/s at 16 threads) without the footgun.
+const _MINROWS = 32
+@inline _nchunks(n) = clamp(n ÷ _MINROWS, 1, Threads.nthreads())
+@inline _chunkrange(n, nc, c) = (((c-1)*n) ÷ nc + 1):((c*n) ÷ nc)
+
 struct Grid1DSoA{N,S<:FVSystem,R,RS}
     sys::S
     recon::R
