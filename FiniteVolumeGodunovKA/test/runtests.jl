@@ -144,6 +144,9 @@ end
     @test all(w -> w[1] > 0 && w[5] > 0, W)                   # positivity
     @test maximum(abs(w[6] - 0.75f0) for w in W) == 0f0       # normal field Bx exactly preserved
     @test isapprox(sum(u[1] for u in g.U)*dx, m0; rtol = 1f-4)
+    # @source hook: the GLM ψ-damping decays ψ (Euler's default source is identity).
+    @test FV.source(s, prim2cons(s, (1f0,0f0,0f0,0f0,1f0, 0.5f0,0.5f0,0f0, 1f0)), 0.1f0)[9] < 1f0
+    @test FV.source(Euler(γ=1.4f0), (1f0,2f0,3f0,4f0,5f0), 0.1f0) == (1f0,2f0,3f0,4f0,5f0)
 
     # rotation isotropy with TWO vectors: one x-sweep ≡ one y-sweep (momentum + B swapped).
     n = 96; d = 1f0/n; m = 4
@@ -181,6 +184,17 @@ if CUDA.functional()
         wave = [prim2cons(s, (1f0 + 0.2f0*sinpi(2f0*x), 1f0, 0f0, 0f0, 1f0)) for x in xs]
         @test cmp(sod,  dx, :outflow;  recon = PLM(), rsol = HLLC()) == 0f0
         @test cmp(wave, dx, :periodic; recon = PLM(), rsol = HLL())  == 0f0
+    end
+
+    @testset "2D CUDA ≡ 2D CPU (rotation on GPU)" begin
+        s = Euler(γ = 1.4f0); n = 64; d = 1f0/n
+        ρ0(x, y) = 1f0 + 0.3f0*sinpi(2f0*(x + y))
+        U0 = [prim2cons(s, (ρ0((i-0.5f0)*d, (j-0.5f0)*d), 0.5f0, 0.3f0, 0f0, 1f0)) for i in 1:n, j in 1:n]
+        gc = Grid2D(s, copy(U0); dx=d, dy=d, bc=:periodic, recon=PLM(), rsol=HLLC())
+        gg = Grid2DCU(s, copy(U0); dx=d, dy=d, bc=:periodic, recon=PLM(), rsol=HLLC())
+        for _ in 1:15; FV.step!(gc, 0.1f0*d); FV.step!(gg, 0.1f0*d); end
+        Wc = FV.primitives(gc); Wg = FV.primitives(gg)
+        @test maximum(maximum(abs.(Wc[i,j] .- Wg[i,j])) for i in 1:n, j in 1:n) == 0f0
     end
 else
     @info "CUDA not functional — skipping GPU backend tests"

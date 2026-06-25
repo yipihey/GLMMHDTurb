@@ -31,7 +31,7 @@ export PLM, PCM, LLF, HLL, HLLC
 export Grid1D, step!, evolve!, primitives, conserved_total
 export Grid1DSoA, evolve_simd!, primitives_soa
 export Grid1DCU, evolve_cuda!, primitives_cuda
-export Grid2D, evolve2d!
+export Grid2D, evolve2d!, Grid2DCU
 
 # ---------------------------------------------------------------------------
 # The contract. A system is a `<: FVSystem` value; the per-cell physics are
@@ -58,6 +58,9 @@ function physflux_x end
 function maxspeed_x end
 "`W -> (u_x, c)`: normal velocity and signal speed in x (HLL/HLLC). Optional."
 function eig_x end
+"`(U, dt) -> U`: optional operator-split source (e.g. GLM ψ-damping). Default: identity."
+function source end
+@inline source(::FVSystem, U, dt) = U
 
 include("macro.jl")
 include("reconstruct.jl")
@@ -67,6 +70,7 @@ include("backend_cpu.jl")
 include("backend_cpu_simd.jl")
 include("backend_cuda.jl")
 include("backend_cpu_2d.jl")
+include("backend_cuda_2d.jl")
 include("systems.jl")
 
 end # module

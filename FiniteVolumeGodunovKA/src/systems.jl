@@ -54,6 +54,7 @@ end
     vidx  = ((2, 3, 4), (6, 7, 8))         # TWO rotating vectors: momentum AND magnetic field
     @params γ  = 5f0/3f0
     @params ch = 1f0                        # cleaning speed (set to the max fast speed by the driver)
+    @params cr = 0.18f0                     # parabolic damping length (Dedner c_r)
 
     cons2prim(U, p) = begin
         ρ, mx, my, mz, E, Bx, By, Bz, ψ = U
@@ -91,6 +92,12 @@ end
         a2 = p.γ*P/ρ; b2 = (Bx*Bx + By*By + Bz*Bz)/ρ; bx2 = Bx*Bx/ρ
         cf = sqrt(0.5f0*(a2 + b2 + sqrt(max(0f0, (a2 + b2)*(a2 + b2) - 4f0*a2*bx2))))
         max(abs(u) + cf, p.ch)              # fast magnetosonic, floored by the cleaning speed
+    end
+
+    # Parabolic GLM source (operator-split): ψ decays at rate ch/cr (Dedner divergence cleaning).
+    source(U, dt, p) = begin
+        f = exp(-dt * p.ch / p.cr)
+        (U[1], U[2], U[3], U[4], U[5], U[6], U[7], U[8], U[9] * f)
     end
 end
 

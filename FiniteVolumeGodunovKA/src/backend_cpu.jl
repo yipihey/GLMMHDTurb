@@ -92,6 +92,9 @@ function step!(g::Grid1D{N,T}, dt) where {N,T}
         Fr = riemann(g.rsol, s, WRh[j],   WLh[j+1])  # interface i+1/2
         Unew[i] = g.U[i] .- λ .* (Fr .- Fl)
     end
+    @inbounds for i in 1:nx
+        Unew[i] = source(s, Unew[i], dt)        # operator-split source (identity unless defined)
+    end
     copyto!(g.U, Unew)
     return g
 end

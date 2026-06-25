@@ -49,11 +49,15 @@ function _sweep_y!(g::Grid2D{N,T}, dt) where {N,T}
     g.U, g.Ut = g.Ut, g.U
 end
 
-# Strang step: x(dt/2) · y(dt) · x(dt/2) → 2nd order in time.
+# Strang step: x(dt/2) · y(dt) · x(dt/2) → 2nd order in time, then the operator-split source.
 function step!(g::Grid2D, dt)
     _sweep_x!(g, dt / 2)
     _sweep_y!(g, dt)
     _sweep_x!(g, dt / 2)
+    s = g.sys
+    @inbounds for j in 1:g.ny, i in 1:g.nx
+        g.U[i, j] = source(s, g.U[i, j], dt)
+    end
     return g
 end
 

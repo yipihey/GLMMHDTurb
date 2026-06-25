@@ -80,7 +80,11 @@ Implemented and **passing** (`test/runtests.jl`):
 - A **2D CPU** backend (`Grid2D`): Strang dimensional splitting (x·y·x), where the y-sweep reuses the
   per-cell physics through `_update_dir` + the rotation perm — **the user wrote only `physflux_x`**.
 - **GLM-MHD** (`GLMMHD`) defined through the *same* contract: 9 vars, two rotating vectors (momentum
-  AND B via `vidx = ((2,3,4),(6,7,8))`), the Dedner flux, `ch` param — runs on every backend.
+  AND B via `vidx = ((2,3,4),(6,7,8))`), the Dedner flux, `ch` param, and a `source` (ψ-damping) — runs
+  on every backend.
+- A **2D CUDA** backend (`Grid2DCU`): one thread per cell, the same Strang sweeps + source, reusing
+  `_update_dir` + the perm. Bit-identical to the 2D CPU backend; runs Orszag-Tang on the GPU.
+- An optional **`@source`** contract hook (operator-split), applied after each step; default identity.
 - **Sod shock tube (Float32, HLLC):** post-shock ρ=0.2655 / P=0.3031 vs exact 0.2656 / 0.3031;
   positivity + mass conservation hold.
 - **Entropy-wave convergence (Float64):** L1 order 2.34 → 2.15 → 2.05 → **2.01** (nx 16→256).
@@ -111,13 +115,14 @@ Implemented and **passing** (`test/runtests.jl`):
    here (it didn't for this register-light fused 1D kernel) → the transpile-to-CUDA-C escape hatch
    only where needed; move CUDA to a **weakdep + package extension** so CPU-only installs stay light.
 3. ~~**Multi-D + rotation**~~ ✅ 2D CPU (`Grid2D`) via Strang splitting; rotation bit-exact, 2nd order.
-4. ~~**GLM-MHD via the contract**~~ ✅ 9 vars, two-vector rotation, Brio-Wu validated. Open MHD items:
-   the parabolic ψ-damping source (needs a `@source` hook) + dynamic `ch` = global max fast speed; an
-   HLLD built-in (v0 uses LLF); a 2D Orszag-Tang / div·B diagnostic. Then **2D SIMD/CUDA** backends
-   (reuse `_update_dir` + the perm), and **3D**.
-5. **Metal** — measure the Metal.jl gap vs its bandwidth roofline before deciding native-vs-MSL.
-6. **CT** through the reserved staggered/EMF seam (exact div·B, vs GLM's cleaning).
-7. **Packaging:** move CUDA to a weakdep + extension; CPU threads + cache-blocking; `Vec{16}`.
+4. ~~**GLM-MHD via the contract**~~ ✅ 9 vars, two-vector rotation, Brio-Wu validated, ψ-damping
+   `source` hook, **2D CUDA** backend (`Grid2DCU`, bit-identical to CPU), Orszag-Tang on GPU (256², 2.6 s,
+   stable, controlled div·B). Open MHD items: dynamic `ch` = global max fast speed each step; an HLLD
+   built-in (v0 uses LLF); CT for exact div·B.
+5. **2D SIMD** backend + **3D**; **CPU threads + cache-blocking**; `Vec{16}` on AVX-512.
+6. **Metal** — measure the Metal.jl gap vs its bandwidth roofline before deciding native-vs-MSL.
+7. **CT** through the reserved staggered/EMF seam (exact div·B, vs GLM's cleaning).
+8. **Packaging:** move CUDA to a weakdep + extension (CPU-only installs stay light).
 
 Conformance lives in the parent `GLMMHDTurb` repo (OT, Sod, turbulence, div·B, the gradient-IC
 benchmarks): the spec is "reproduce that matrix from one physics source on every backend."
