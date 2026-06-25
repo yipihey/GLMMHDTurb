@@ -33,6 +33,7 @@ export Grid1DSoA, evolve_simd!, primitives_soa
 export Grid1DCU, evolve_cuda!, primitives_cuda
 export Grid2D, evolve2d!, Grid2DCU, Grid2DSoA, evolve_simd2d!
 export Grid3D, evolve3d!, Grid3DCU, Grid3DSoA, evolve_simd3d!
+export Grid2DCT, evolve_ct!, divB_max
 
 # ---------------------------------------------------------------------------
 # The contract. A system is a `<: FVSystem` value; the per-cell physics are
@@ -86,5 +87,6 @@ include("backend_cuda_2d.jl")
 include("backend_cuda_3d.jl")
 include("systems.jl")
 include("riemann_mhd.jl")
+include("backend_ct_2d.jl")
 
 end # module

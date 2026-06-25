@@ -167,9 +167,14 @@ If profiling ever shows the dt sync mattering at scale, revisit with a *block-hi
    `Vec{8}` (87–98 vs 111–145 Mcell/s) because it lowers to 2× emulated 256-bit ops + register
    pressure. Kept `_W = 8`; documented that `_W = 16` is for real AVX-512 hosts (Zen 4 / Intel
    Skylake-X+), which we can't test here.
-6. **Metal** — measure the Metal.jl gap vs its bandwidth roofline before deciding native-vs-MSL.
-7. **CT** through the reserved staggered/EMF seam (exact div·B, vs GLM's cleaning).
-8. **Packaging:** move CUDA to a weakdep + extension (CPU-only installs stay light).
+9. ~~**CT** (constrained transport)~~ ✅ `Grid2DCT` (scalar, 2D, planar B): face-staggered B advanced
+   by the curl of an edge EMF (built from the Godunov magnetic fluxes) → **div·B at machine zero**.
+   Orszag-Tang: IC div·B = 0 exactly; after evolution max|div·B| = 2.9e-4 (Float32 roundoff × 1/dx)
+   vs the GLM cleaning's ~2.0 — ~7000× smaller. Uses the GLMMHD physics with ch=0 as the ideal-MHD
+   flux. Remaining CT: the `@staggered`/`@emf` CONTRACT seam (user-definable CT systems), PLM, 3D, GPU.
+10. **Metal** — write the backend (analogous to CUDA); CANNOT be compiled/tested on this Linux/NVIDIA
+    host (Metal.jl is macOS-only). Measure the Metal.jl gap on Apple hardware.
+11. **Packaging:** move CUDA to a weakdep + extension (CPU-only installs stay light).
 
 Conformance lives in the parent `GLMMHDTurb` repo (OT, Sod, turbulence, div·B, the gradient-IC
 benchmarks): the spec is "reproduce that matrix from one physics source on every backend."

@@ -164,6 +164,28 @@ end
 end
 
 # ---------------------------------------------------------------------------
+# CT (constrained transport) — face-staggered B + edge-EMF curl → div·B at machine
+# zero (vs GLM cleaning's ~2 on the same Orszag-Tang).
+# ---------------------------------------------------------------------------
+@testset "CT: machine-zero div·B (Orszag-Tang)" begin
+    n = 96; dx = 1f0/n; γ = 5f0/3f0; B0 = 1f0/sqrt(4f0*Float32(π))
+    ρ0 = 25f0/(36f0*Float32(π)); P0 = 5f0/(12f0*Float32(π)); s = GLMMHD(γ=γ, ch=0f0)
+    bx = [(-B0*sinpi(2f0*(j-0.5f0)*dx)) for i in 1:n, j in 1:n]   # Bx on x-faces (y-dependent)
+    by = [( B0*sinpi(4f0*(i-0.5f0)*dx)) for i in 1:n, j in 1:n]   # By on y-faces (x-dependent)
+    U = Matrix{NTuple{5,Float32}}(undef, n, n)
+    for j in 1:n, i in 1:n
+        u = -sinpi(2f0*(j-0.5f0)*dx); v = sinpi(2f0*(i-0.5f0)*dx)
+        Bxc = 0.5f0*(bx[i,j]+bx[mod1(i+1,n),j]); Byc = 0.5f0*(by[i,j]+by[i,mod1(j+1,n)])
+        U[i,j] = (ρ0, ρ0*u, ρ0*v, 0f0, P0/(γ-1) + 0.5f0*ρ0*(u*u+v*v) + 0.5f0*(Bxc*Bxc+Byc*Byc))
+    end
+    g = Grid2DCT(s, U, bx, by; dx=dx, dy=dx, rsol=LLF(), cfl=0.4f0)
+    @test FV.divB_max(g) == 0f0                       # IC divergence-free exactly
+    FV.evolve_ct!(g, 0.2f0)
+    @test FV.divB_max(g) < 1f-3                       # machine-zero (Float32 roundoff) vs GLM ~2
+    @test all(g.U[i,j][1] > 0 for i in 1:n, j in 1:n) # stable, positive density
+end
+
+# ---------------------------------------------------------------------------
 # 2D SIMD backend (Grid2DSoA) — vectorized along x for both sweeps. Bit-identical
 # to the 2D scalar backend for Euler/HLLC AND GLM-MHD/HLLD (the Vec path of every solver).
 # ---------------------------------------------------------------------------
