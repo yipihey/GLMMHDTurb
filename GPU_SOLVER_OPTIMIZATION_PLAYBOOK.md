@@ -112,16 +112,25 @@ the update/EMF. Each phase has tiny live state → **64 regs**. This single chan
 **61 → 1206 Mcell/s**. *When:* any kernel with cross-thread flux reuse. The staged "cube" structure is
 register-optimal for *heavy* kernels; the fused march only wins for *light* kernels (S1).
 
-> **Two-sweep / staging caveat (measured negative):** staging to *remove PPM register inflation* via a
-> separate reconstruction sweep is tempting, but on a 3D tile it BACKFIRES: tested a staged two-sweep
-> hydro (each face flux once → shared, then update) — it kept registers low (PPM 56–62 vs fused) and
-> conserved exactly, but was SLOWER than the fused 2.5D march at every tile (PLM 4967 vs 6865, PPM 3745
-> vs 3995). The 3D-tile halo redundancy (~70% halo flux recompute per block) costs more than the 2×
-> face-recompute it removes; the fused march's z-streaming (zero z-halo) wins. **Staging only wins when
-> the fused kernel is genuinely register-bound to 1 block** (full-characteristic PPM at 201 regs) — for
-> the *lean parabolic* PPM, which is already register-fine fused (GLM PPM = 128 regs = PLM), staging just
-> adds halo overhead. The one structure that might still win (untried): a staged *march* (z-stream + flux
-> ring → no halo AND each face once). See `cu/spike_hys.cu` (documented negative).
+> **★ Staging vs fused-recompute — the unified rule (3 structures measured).** To avoid a recompute you
+> can stage the flux to shared (compute once, read it). Whether that wins depends ENTIRELY on whether the
+> fused recompute is register-light or register-heavy. Hydro @480, all three structures:
+>
+> | structure | PLM | PPM | why |
+> |---|---:|---:|---|
+> | **fused march (recompute)** | **6865** | **3995** | 4 blocks (PLM)/3 (PPM), no flux storage |
+> | staged 3D tile | 4967 | 3745 | 2–3 blocks; halo redundancy (~70% halo recompute) |
+> | staged march (flux ring) | 3729 | 2732 | 2 blocks; the 15-comp×3-plane flux ring = 43 KB |
+>
+> The fused recompute WINS both. Storing the flux (15 vals/cell) to skip the 2× recompute costs more
+> shared than it saves → drops occupancy (4→2 blocks). **The recompute is cheap relative to the
+> occupancy the flux storage costs.** ⇒ **Stage only the recompute that genuinely blows registers to a
+> low occupancy tier.** The one case where staging won big was CT's fused edge-EMF (255 regs → 1 block):
+> staging it to shared went 61→1206. For register-light recompute (hydro/GLM/CT-PLM marches, 48–128
+> regs, already high occupancy) the fused recompute is optimal — never stage the cheap one. Also: the
+> lean parabolic PPM is already register-fine fused (GLM PPM 128 = PLM 128), so the original
+> "PPM inflates registers" premise doesn't hold for it. See `cu/spike_hys.cu`, `cu/spike_hym.cu`
+> (documented negatives).
 
 **S4. `--use_fast_math` (free register relief).** Approximate reciprocal/sqrt in the HLL wave-speed and
 `1/ρ` paths free ~16 registers — enough to cross a whole occupancy tier (hydro **80 regs/3 blocks/5300
