@@ -27,9 +27,13 @@ and a GPU thread (max |Δ| = 0 vs the scalar backend on Sod/smooth wave across H
 Throughput on an A6000: CPU scalar ~9–14, CPU SIMD ~60 (single core), **CUDA ~11,400 Mcell/s**.
 Convergence runs in Float64 from the same Float32 physics (2nd order). A **2D backend** (`Grid2D`,
 Strang splitting) validates the rotation design: the y-flux — obtained by rotating the marked vector
-components and calling the same `physflux_x` the user wrote — is **bit-identical** to the x-flux, and
-the 2D scheme is 2nd order. See `DESIGN_fvkernel.md` for the contract and roadmap (next: GLM-MHD via
-the same contract, then 2D SIMD/CUDA, Metal/CT).
+components and calling the same `physflux_x` the user wrote — is **bit-identical** to the x-flux.
+
+**GLM-MHD lives in the same contract.** Going from `Euler` (5 vars, momentum) to `GLMMHD` (9 vars,
+momentum *and* B) was: add variables, add the `ch` param, write `physflux_x`, and declare `vidx` as two
+vector triples — the library's rotation handled y/z automatically. Brio-Wu shock tube is stable and
+preserves the normal field exactly; the two-vector rotation isotropy is bit-exact. See
+`DESIGN_fvkernel.md` for the contract and roadmap (next: 2D SIMD/CUDA, ψ-source + HLLD, Metal/CT).
 
 See `DESIGN_fvkernel.md` for the contract, the rotation/Riemann design wins, the three locked
 decisions, and the roadmap. Run the tests with `julia --project=. -e 'using Pkg; Pkg.test()'`.

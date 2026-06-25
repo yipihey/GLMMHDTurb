@@ -7,7 +7,7 @@ const FV = FiniteVolumeGodunovKA
 @testset "contract / Euler roundtrip" begin
     s = Euler(γ = 1.4f0)
     @test nconserved(s) == 5
-    @test vidx(s) == (2, 3, 4)
+    @test vidx(s) == ((2, 3, 4),)
     W = (1.2f0, 0.3f0, -0.5f0, 0.1f0, 0.9f0)
     @test all(isapprox.(cons2prim(s, prim2cons(s, W)), W; rtol = 1f-5))
 end
@@ -124,6 +124,40 @@ end
     es = [err2d(nn) for nn in (16, 32, 64)]
     @test all(diff(es) .< 0)
     @test log2(es[2] / es[3]) ≥ 1.9                    # 2nd order at the finest pair
+end
+
+# ---------------------------------------------------------------------------
+# GLM-MHD through the SAME contract — 9 vars, TWO rotating vectors (momentum + B).
+# The payoff test: add variables + a param + the flux + vidx-as-two-triples, and the
+# library's rotation handles y/z automatically.
+# ---------------------------------------------------------------------------
+@testset "GLM-MHD via the contract (Brio-Wu + rotation)" begin
+    s = GLMMHD(γ = 2f0, ch = 2f0)
+    nx = 800; dx = 1f0/nx; xs = Float32[(i-0.5f0)*dx for i in 1:nx]
+    L = (1f0,   0f0,0f0,0f0, 1f0, 0.75f0,  1f0, 0f0, 0f0)
+    R = (0.125f0, 0f0,0f0,0f0, 0.1f0, 0.75f0, -1f0, 0f0, 0f0)
+    U0 = [prim2cons(s, x < 0.5f0 ? L : R) for x in xs]
+    g  = Grid1D(s, U0; dx=dx, bc=:outflow, recon=PLM(), rsol=LLF(), cfl=0.4f0)
+    m0 = sum(u[1] for u in U0) * dx
+    FV.evolve!(g, 0.1f0); W = FV.primitives(g)
+    @test all(w -> all(isfinite, w), W)                       # stable
+    @test all(w -> w[1] > 0 && w[5] > 0, W)                   # positivity
+    @test maximum(abs(w[6] - 0.75f0) for w in W) == 0f0       # normal field Bx exactly preserved
+    @test isapprox(sum(u[1] for u in g.U)*dx, m0; rtol = 1f-4)
+
+    # rotation isotropy with TWO vectors: one x-sweep ≡ one y-sweep (momentum + B swapped).
+    n = 96; d = 1f0/n; m = 4
+    xL = (1f0,0f0,0f0,0f0,1f0, 0.75f0, 1f0,0f0,0f0); xR = (0.125f0,0f0,0f0,0f0,0.1f0, 0.75f0,-1f0,0f0,0f0)
+    yL = (1f0,0f0,0f0,0f0,1f0, 1f0, 0.75f0,0f0,0f0); yR = (0.125f0,0f0,0f0,0f0,0.1f0, -1f0,0.75f0,0f0,0f0)
+    gx = Grid2D(s, [prim2cons(s, i<=n÷2 ? xL : xR) for i in 1:n, _ in 1:m];
+                dx=d, dy=d, bc=:periodic, recon=PLM(), rsol=LLF()); FV._sweep_x!(gx, 0.1f0*d)
+    gy = Grid2D(s, [prim2cons(s, j<=n÷2 ? yL : yR) for _ in 1:m, j in 1:n];
+                dx=d, dy=d, bc=:periodic, recon=PLM(), rsol=LLF()); FV._sweep_y!(gy, 0.1f0*d)
+    iso = maximum(begin
+              u = gy.U[b,a]
+              maximum(abs.(gx.U[a,b] .- (u[1],u[3],u[2],u[4],u[5],u[7],u[6],u[8],u[9])))
+          end for a in 1:n, b in 1:m)
+    @test iso == 0f0                                          # two-vector rotation, bit-exact
 end
 
 # ---------------------------------------------------------------------------

@@ -15,16 +15,15 @@
     ntuple(k -> (@inbounds(U[i, k] = v[k]); nothing), Val(N)); nothing
 end
 
-function _cuda_step_kernel!(Unew, U, s, r, rs, λ, nx, ::Val{N}, bc) where {N}
+function _cuda_step_kernel!(Unew, U, s, r, rs, λ, nx, ::Val{N}, bc, perm) where {N}
     i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     if i <= nx
-        z = Val(0)   # x-direction: no component rotation
         im2 = _readcell(U, _gidx(i-2, nx, bc), Val(N))
         im1 = _readcell(U, _gidx(i-1, nx, bc), Val(N))
         i0  = _readcell(U, _gidx(i,   nx, bc), Val(N))
         ip1 = _readcell(U, _gidx(i+1, nx, bc), Val(N))
         ip2 = _readcell(U, _gidx(i+2, nx, bc), Val(N))
-        _writecell!(Unew, i, _update_dir(s, r, rs, im2, im1, i0, ip1, ip2, λ, z, z))
+        _writecell!(Unew, i, _update_dir(s, r, rs, im2, im1, i0, ip1, ip2, λ, perm))
     end
     return nothing
 end
@@ -65,7 +64,8 @@ end
 function step!(g::Grid1DCU{N}, dt) where {N}
     thr, blk = _launch(g.nx)
     @cuda threads=thr blocks=blk _cuda_step_kernel!(g.Unew, g.U, g.sys, g.recon, g.rsol,
-                                                    Float32(dt) / g.dx, g.nx, Val(N), Val(g.bc))
+                                                    Float32(dt) / g.dx, g.nx, Val(N), Val(g.bc),
+                                                    identperm(Val(N)))
     g.U, g.Unew = g.Unew, g.U
     return g
 end
