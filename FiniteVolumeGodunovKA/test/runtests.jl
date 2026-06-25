@@ -186,6 +186,41 @@ end
 end
 
 # ---------------------------------------------------------------------------
+# 3D backend (Grid3D) — symmetric Strang x·y·z·y·x. The z-sweep uses dirperm(s,N,3); the
+# rotation machinery generalizes to all 3 axes with no new code.
+# ---------------------------------------------------------------------------
+@testset "3D backend + z-rotation" begin
+    se = Euler(γ = 1.4f0)
+    # z-rotation isotropy: x-sweep ≡ z-sweep on the transposed problem (u↔w), bit-exact.
+    n = 48; d = 1f0/n; m = 4
+    xp = [prim2cons(se, (i <= n÷2 ? 1f0 : 0.125f0, 0.3f0,0f0,0f0, i <= n÷2 ? 1f0 : 0.1f0)) for i in 1:n, _ in 1:m, _ in 1:m]
+    gx = Grid3D(se, xp; dx=d,dy=d,dz=d, bc=:periodic, recon=PLM(), rsol=HLLC()); FV._sweep_x3d!(gx, 0.1f0*d)
+    zp = [prim2cons(se, (k <= n÷2 ? 1f0 : 0.125f0, 0f0,0f0,0.3f0, k <= n÷2 ? 1f0 : 0.1f0)) for _ in 1:m, _ in 1:m, k in 1:n]
+    gz = Grid3D(se, zp; dx=d,dy=d,dz=d, bc=:periodic, recon=PLM(), rsol=HLLC()); FV._sweep_z3d!(gz, 0.1f0*d)
+    @test maximum(begin u = gz.U[b,c,a]; maximum(abs.(gx.U[a,b,c] .- (u[1],u[4],u[3],u[2],u[5]))) end for a in 1:n, b in 1:m, c in 1:m) == 0f0
+
+    # 3D diagonal entropy wave (Float64) → 2nd order.
+    ρ0(x,y,z) = 1.0 + 0.2*sinpi(2*(x+y+z))
+    err3d(nn) = begin
+        dx = 1.0/nn
+        U0 = [prim2cons(se, (ρ0((i-0.5)*dx,(j-0.5)*dx,(k-0.5)*dx), 1.0,1.0,1.0,1.0)) for i in 1:nn, j in 1:nn, k in 1:nn]
+        g = Grid3D(se, U0; dx=dx,dy=dx,dz=dx, bc=:periodic, recon=PLM(:none), rsol=HLL(), cfl=0.4)
+        FV.evolve3d!(g, 1.0); W = FV.primitives(g)
+        sum(abs(W[i,j,k][1] - ρ0((i-0.5)*dx,(j-0.5)*dx,(k-0.5)*dx)) for i in 1:nn, j in 1:nn, k in 1:nn) * dx^3
+    end
+    es = [err3d(nn) for nn in (12, 18, 24)]
+    @test es[3] < es[2] < es[1]
+    @test log(es[2]/es[3])/log(24/18) ≥ 1.85
+
+    # GLM-MHD in 3D with HLLD: stable + positive.
+    sm = GLMMHD(γ=5f0/3f0, ch=2f0); nn = 16; dd = 1f0/nn; B0 = 1f0/sqrt(4f0*Float32(π))
+    icW(x,y,z) = (0.5f0, -sinpi(2f0*y), sinpi(2f0*x), 0f0, 0.5f0, -B0*sinpi(2f0*y), B0*sinpi(4f0*x), 0f0, 0f0)
+    U0 = [prim2cons(sm, icW((i-0.5f0)*dd,(j-0.5f0)*dd,(k-0.5f0)*dd)) for i in 1:nn, j in 1:nn, k in 1:nn]
+    g = Grid3D(sm, U0; dx=dd,dy=dd,dz=dd, bc=:periodic, recon=PLM(), rsol=HLLD(), cfl=0.4f0); FV.evolve3d!(g, 0.03f0)
+    @test all(w -> all(isfinite, w) && w[1] > 0 && w[5] > 0, FV.primitives(g))
+end
+
+# ---------------------------------------------------------------------------
 # HLLD — the Miyoshi-Kusano MHD solver, keyed to GLMMHD. Consistency, Brio-Wu
 # stability/positivity/conservation, and bit-exact rotation.
 # ---------------------------------------------------------------------------

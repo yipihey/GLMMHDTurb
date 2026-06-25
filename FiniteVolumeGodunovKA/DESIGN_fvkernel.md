@@ -148,7 +148,11 @@ If profiling ever shows the dt sync mattering at scale, revisit with a *block-hi
 5. ~~**2D SIMD** backend~~ ✅ `Grid2DSoA`: SoA flat storage (x contiguous), vectorized along x for
    both sweeps (x-sweep shifted x-loads; y-sweep aligned x-blocks at rows j±1/j±2), reusing
    `_update_dir` + perm with `Vec{8}`. Bit-identical to scalar 2D (Euler/HLLC + GLM/HLLD), ~6.6× faster
-   single-core. Remaining: **3D**; **CPU threads + cache-blocking**; `Vec{16}` on AVX-512.
+   single-core.
+6. ~~**3D**~~ ✅ `Grid3D` (scalar): symmetric Strang x·y·z·y·x; the z-sweep uses `dirperm(s,N,3)` — the
+   rotation machinery generalized to all 3 axes with **no new code**. z-rotation isotropy bit-exact,
+   3D convergence 2nd order (2.19/2.14), GLM-MHD+HLLD runs stable+positive in 3D. Remaining: 3D
+   SIMD/CUDA (same `_update_dir` + sweeps); **CPU threads + cache-blocking**; `Vec{16}` on AVX-512.
 6. **Metal** — measure the Metal.jl gap vs its bandwidth roofline before deciding native-vs-MSL.
 7. **CT** through the reserved staggered/EMF seam (exact div·B, vs GLM's cleaning).
 8. **Packaging:** move CUDA to a weakdep + extension (CPU-only installs stay light).
