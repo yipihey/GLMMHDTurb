@@ -85,9 +85,15 @@ functions** (`transpile_selfcheck` → `0.0`). But that kernel is 1st-order in t
 sweep order the way a split solver does), so it's a *throughput demonstration*, not the science path.
 (2) The **science path is `evolve!`** — a genuinely 2nd-order MUSCL + SSP-RK2 solver with CFL-adaptive
 timestepping, **validated** (entropy-wave convergence order ≈ 2, conservation to machine precision). Two
-RK stages cost ~2×, landing it at ~38% of the reference — on par with the native 2nd-order CUDA backend.
-Closing *that* gap (the reference reaches 2nd order in a single pass via a transverse CTU predictor) is
-the next optimization. Either way you never hand-write a CUDA kernel, a march, or an f16 tile.
+RK stages cost ~2×, landing it at ~38–43% of the reference — on par with the native 2nd-order CUDA
+backend. Either way you never hand-write a CUDA kernel, a march, or an f16 tile.
+
+A **single-pass 2nd-order CTU kernel** (`run_ctu!`, unsplit MUSCL-Hancock with a transverse predictor) is
+also provided and validated 2nd-order — but *measured*, the naive single-pass is **compute-bound**
+(~2000 Mcell/s, slower than RK2): each cell recomputes its neighbors' transverse predictions, and that
+arithmetic outweighs the one global pass it saves. Recovering the throughput needs **shared-memory
+staging** (compute each prediction once) — the same hand-tuned technique the reference `.cu` uses, and
+the clear remaining lever for a *fast and* 2nd-order single-stencil kernel.
 
 **On the CPU**, the same source runs as a SIMD-vectorized, threaded solver: ~1 Mcell/s scalar (1 core,
 3D) → **~145 Mcell/s** at the threaded peak (2D, `JULIA_NUM_THREADS ≈ 8–16`). These kernels are
@@ -104,9 +110,9 @@ transpile_selfcheck(Euler(γ=1.4f0))            # 0.0 — emitted CUDA-C ≡ Jul
 **Honest caveats.** Comparisons are *scheme-matched* (PLM vs PLM); a cheaper pure-1st-order kernel runs
 ~10,800 Mcell/s but that's not a fair comparison. The `run!` single-pass demo is 1st-order *in time* —
 use `evolve!` (2nd-order, validated) for science. GLM-MHD transpiled uses LLF where the reference uses
-HLLD (a Riemann mismatch). The reference reaches 2nd order in one pass (transverse CTU predictor); the
-RK2 solver takes two — porting CTU is the route to a single-pass 2nd-order transpile kernel. Throughput
-varies ~±15% with GPU thermal state, so compare runs in one process.
+HLLD (a Riemann mismatch). A single-pass 2nd-order CTU kernel exists but is compute-bound without
+shared-memory staging (see above). Throughput varies ~±15% with GPU thermal state, so compare runs in
+one process.
 
 ## Design
 

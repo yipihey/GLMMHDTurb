@@ -172,6 +172,50 @@ extern "C" void fv_run_rk2(float* R,float* T,float* O,int nx,int ny,int nz,float
     k_rk2b<<<grp,thr>>>(curr,T,sc,nx,ny,nz,lam,PRM); float* t=curr; curr=sc; sc=t; }
   if(curr!=R) cudaMemcpy(R,curr,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
   cudaDeviceSynchronize(); }
+// ---- single-pass 2nd-order: unsplit MUSCL-Hancock with the TRANSVERSE predictor (CTU-style) ----
+// physical flux in direction dir (0=x,1=y,2=z) via component rotation; reuses physflux_x + swaps.
+__device__ void flux_dir(const float* W,int dir,const float* PRM,float* F){
+  float Wr[NV]; for(int c=0;c<NV;c++) Wr[c]=W[c]; if(dir==1) swap_y(Wr); else if(dir==2) swap_z(Wr);
+  physflux_x(Wr,F,PRM); if(dir==1) swap_y(F); else if(dir==2) swap_z(F); }
+__device__ void llf_dir(const float* WL,const float* WR,int dir,float* F,const float* PRM){
+  float L[NV],Rr[NV]; for(int c=0;c<NV;c++){ L[c]=WL[c]; Rr[c]=WR[c]; }
+  if(dir==1){ swap_y(L); swap_y(Rr);} else if(dir==2){ swap_z(L); swap_z(Rr);}
+  llf(L,Rr,F,PRM); if(dir==1) swap_y(F); else if(dir==2) swap_z(F); }
+// cell's 6 face states, PLM-reconstructed and evolved dt/2 by the FULL (all-direction) flux divergence.
+__device__ void predict_cell(const float* R,int i,int j,int k,int nx,int ny,int nz,float lam,const float* PRM,
+                             float* WxL,float* WxR,float* WyL,float* WyR,float* WzL,float* WzR){
+  long VOL=(long)nx*ny*nz;
+  LDP(W0,i,j,k)
+  LDP(Wxm,(i-1+nx)%nx,j,k) LDP(Wxp,(i+1)%nx,j,k)
+  LDP(Wym,i,(j-1+ny)%ny,k) LDP(Wyp,i,(j+1)%ny,k)
+  LDP(Wzm,i,j,(k-1+nz)%nz) LDP(Wzp,i,j,(k+1)%nz)
+  recon(Wxm,W0,Wxp,WxL,WxR); recon(Wym,W0,Wyp,WyL,WyR); recon(Wzm,W0,Wzp,WzL,WzR);
+  float Fa[NV],Fb[NV],dU[NV]; for(int c=0;c<NV;c++) dU[c]=0.f;
+  flux_dir(WxR,0,PRM,Fa); flux_dir(WxL,0,PRM,Fb); for(int c=0;c<NV;c++) dU[c]+=Fa[c]-Fb[c];
+  flux_dir(WyR,1,PRM,Fa); flux_dir(WyL,1,PRM,Fb); for(int c=0;c<NV;c++) dU[c]+=Fa[c]-Fb[c];
+  flux_dir(WzR,2,PRM,Fa); flux_dir(WzL,2,PRM,Fb); for(int c=0;c<NV;c++) dU[c]+=Fa[c]-Fb[c];
+  for(int c=0;c<NV;c++) dU[c]*=-0.5f*lam;
+  float* faces[6]={WxL,WxR,WyL,WyR,WzL,WzR};
+  for(int f=0;f<6;f++){ float U[NV]; prim2cons(faces[f],U,PRM); for(int c=0;c<NV;c++) U[c]+=dU[c]; cons2prim(U,faces[f],PRM); } }
+__global__ void k_ctu(const float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM){
+  int i=blockIdx.x*blockDim.x+threadIdx.x,j=blockIdx.y*blockDim.y+threadIdx.y,k=blockIdx.z*blockDim.z+threadIdx.z;
+  if(i>=nx||j>=ny||k>=nz) return; long VOL=(long)nx*ny*nz,q=IDX(i,j,k);
+  float sxL[NV],sxR[NV],syL[NV],syR[NV],szL[NV],szR[NV];     // this cell's 6 predicted faces
+  predict_cell(R,i,j,k,nx,ny,nz,lam,PRM,sxL,sxR,syL,syR,szL,szR);
+  float a[NV],b[NV],c[NV],d[NV],e[NV],g[NV];                 // neighbor scratch (only one face used each)
+  float Fxp[NV],Fxm[NV],Fyp[NV],Fym[NV],Fzp[NV],Fzm[NV];
+  predict_cell(R,(i+1)%nx,j,k,nx,ny,nz,lam,PRM,a,b,c,d,e,g);        llf_dir(sxR,a,0,Fxp,PRM); // i+1/2: self.WxR | xp.WxL
+  predict_cell(R,(i-1+nx)%nx,j,k,nx,ny,nz,lam,PRM,a,b,c,d,e,g);     llf_dir(b,sxL,0,Fxm,PRM); // i-1/2: xm.WxR | self.WxL
+  predict_cell(R,i,(j+1)%ny,k,nx,ny,nz,lam,PRM,a,b,c,d,e,g);        llf_dir(syR,c,1,Fyp,PRM);
+  predict_cell(R,i,(j-1+ny)%ny,k,nx,ny,nz,lam,PRM,a,b,c,d,e,g);     llf_dir(d,syL,1,Fym,PRM);
+  predict_cell(R,i,j,(k+1)%nz,nx,ny,nz,lam,PRM,a,b,c,d,e,g);        llf_dir(szR,e,2,Fzp,PRM);
+  predict_cell(R,i,j,(k-1+nz)%nz,nx,ny,nz,lam,PRM,a,b,c,d,e,g);     llf_dir(g,szL,2,Fzm,PRM);
+  for(int cc=0;cc<NV;cc++) O[(long)cc*VOL+q]=R[(long)cc*VOL+q]-lam*((Fxp[cc]-Fxm[cc])+(Fyp[cc]-Fym[cc])+(Fzp[cc]-Fzm[cc])); }
+extern "C" void fv_run_ctu(float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM,int nsteps){
+  dim3 thr(8,8,4),grp((nx+7)/8,(ny+7)/8,(nz+3)/4); float *a=R,*b=O;
+  for(int s=0;s<nsteps;s++){ k_ctu<<<grp,thr>>>(a,b,nx,ny,nz,lam,PRM); float* t=a; a=b; b=t; }
+  if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
+  cudaDeviceSynchronize(); }
 """, "NV" => string(NV))
     "#include <cuda_runtime.h>\n#include <math.h>\n#define NV $NV\n\n" *
     join(protos, "\n") * "\n\n" * join(defs, "\n") *
@@ -214,7 +258,7 @@ mutable struct Grid3DCuMarch{N,S<:FVSystem}
     R::CuVector{Float32}; O::CuVector{Float32}; T::CuVector{Float32}     # state + 2 scratch (var-major)
     prm::CuVector{Float32}
     spd::CuVector{Float32}                                               # scratch: per-cell CFL speed
-    frun::Ptr{Cvoid}; frun2::Ptr{Cvoid}; fspeed::Ptr{Cvoid}
+    frun::Ptr{Cvoid}; frun2::Ptr{Cvoid}; fctu::Ptr{Cvoid}; fspeed::Ptr{Cvoid}
     nx::Int; ny::Int; nz::Int; dx::Float32
 end
 
@@ -231,7 +275,8 @@ function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::St
     Grid3DCuMarch{N,typeof(sys)}(sys, R, CUDA.zeros(Float32, N*VOL), CUDA.zeros(Float32, N*VOL), prm,
                                  CUDA.zeros(Float32, VOL),
                                  Libdl.dlsym(lib, :fv_run), Libdl.dlsym(lib, :fv_run_rk2),
-                                 Libdl.dlsym(lib, :fv_speed), nx, ny, nz, Float32(dx))
+                                 Libdl.dlsym(lib, :fv_run_ctu), Libdl.dlsym(lib, :fv_speed),
+                                 nx, ny, nz, Float32(dx))
 end
 
 @inline _devptr(x) = reinterpret(Ptr{Float32}, UInt(UInt64(pointer(x))))
@@ -248,6 +293,13 @@ end
 function run_rk2!(g::Grid3DCuMarch, dt, nsteps::Integer)
     ccall(g.frun2, Cvoid, (Ptr{Float32}, Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Cfloat, Ptr{Float32}, Cint),
           _devptr(g.R), _devptr(g.T), _devptr(g.O), g.nx, g.ny, g.nz, Float32(dt)/g.dx, _devptr(g.prm), Int32(nsteps))
+    return g
+end
+
+"Run `nsteps` of the single-pass 2nd-order unsplit MUSCL-Hancock + transverse (CTU) scheme (result in `g.R`)."
+function run_ctu!(g::Grid3DCuMarch, dt, nsteps::Integer)
+    ccall(g.fctu, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Cfloat, Ptr{Float32}, Cint),
+          _devptr(g.R), _devptr(g.O), g.nx, g.ny, g.nz, Float32(dt)/g.dx, _devptr(g.prm), Int32(nsteps))
     return g
 end
 

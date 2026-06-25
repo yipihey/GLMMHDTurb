@@ -209,6 +209,24 @@ real scheme finding and a fix:
 Net: `run!` = the 1st-order-in-time single-pass **benchmark** (~85–90% of `.cu`); `evolve!` = the
 **validated 2nd-order science solver** (~38%, CFL-adaptive). Both from the same `@fvsystem` stencil.
 
+### Single-pass 2nd-order (CTU) — implemented, and the measurement that matters
+
+To recover single-pass speed *with* 2nd-order, added `run_ctu!`: the unsplit MUSCL-Hancock scheme with
+the **transverse predictor** (each cell's 6 PLM face states are evolved dt/2 by the *full* all-direction
+flux divergence — the transverse terms the fused kernel dropped). Generic over `@fvsystem`: `physflux_x`
+rotates to y/z via `swap_y`/`swap_z`, reconstruction is per-component (rotation-free). **Validated
+genuinely 2nd-order** (entropy-wave order 2.0–2.6, conservation machine-zero).
+
+**But the naive single-pass is a throughput dead-end, and measuring proved it.** It runs **~2000 Mcell/s
+— *slower* than RK2's ~2980**, not faster. The kernel is **compute-bound**: with no shared memory, each
+output cell recomputes the full transverse prediction of all 6 neighbors (~7× redundant arithmetic), and
+that outweighs the single global pass it saves. The hypothesis that the A6000 L2 would amortize the
+~25-cell stencil was wrong — the bottleneck is arithmetic, not bandwidth. **The only way to the win is
+shared-memory staging** (compute each cell's transverse correction `dU` *once* into shared, recompute
+only the cheap PLM reconstruction on the fly) — i.e. exactly the hand-tuned tiling the reference `.cu`
+uses. That is the real remaining lever (and a genuine GPU-kernel project, not a transpiler tweak). The
+correct `run_ctu!` is kept as the validated scheme and the foundation for that tiled kernel.
+
 ## Roadmap (priority order)
 
 1. ~~**SIMD-CPU backend**~~ ✅ done (single-core, ~5–7× over scalar, bit-identical). Next CPU
