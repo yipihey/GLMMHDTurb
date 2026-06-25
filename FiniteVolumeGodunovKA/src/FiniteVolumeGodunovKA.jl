@@ -19,6 +19,7 @@ module FiniteVolumeGodunovKA
 
 using SIMD
 using CUDA
+using Libdl
 
 # SIMD.jl deliberately leaves `Base.ifelse` on Vec masks to downstream packages, so
 # we provide it here. This is what makes the branch-free physics (ifelse/min/max)
@@ -34,6 +35,7 @@ export Grid1DCU, evolve_cuda!, primitives_cuda
 export Grid2D, evolve2d!, Grid2DCU, Grid2DSoA, evolve_simd2d!
 export Grid3D, evolve3d!, Grid3DCU, Grid3DSoA, evolve_simd3d!
 export Grid2DCT, evolve_ct!, divB_max
+export Grid3DCuMarch, gen_cuda_c, build_cuda, transpile_selfcheck
 
 # ---------------------------------------------------------------------------
 # The contract. A system is a `<: FVSystem` value; the per-cell physics are
@@ -95,5 +97,6 @@ include("backend_cuda_3d.jl")
 include("systems.jl")
 include("riemann_mhd.jl")
 include("backend_ct_2d.jl")
+include("transpile_cuda.jl")
 
 end # module

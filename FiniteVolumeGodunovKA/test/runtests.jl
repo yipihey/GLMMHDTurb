@@ -326,6 +326,21 @@ if CUDA.functional()
         Wc = FV.primitives(gc); Wg = FV.primitives(gg)
         @test maximum(maximum(abs.(Wc[i,j] .- Wg[i,j])) for i in 1:n, j in 1:n) == 0f0
     end
+
+    # transpile-to-CUDA-C performance backend (needs nvcc — skipped if absent)
+    if (try; FV._find_nvcc(); true; catch; false; end)
+        @testset "transpile-to-CUDA-C (Grid3DCuMarch)" begin
+            for s in (Euler(γ=1.4f0), GLMMHD(γ=5f0/3f0, ch=2f0))
+                @test transpile_selfcheck(s) == 0f0          # transpiled C physics ≡ Julia, bit-exact
+            end
+            s = Euler(γ=1.4f0); n = 32; d = 1f0/n
+            U0 = [prim2cons(s, (1f0+0.1f0*sinpi(2f0*Float32(i+j+k)/n), 0.2f0,0.1f0,0.1f0, 1f0)) for i in 1:n, j in 1:n, k in 1:n]
+            g = Grid3DCuMarch(s, U0; dx=d); FV.run!(g, 0.2f0*d, 20); W = FV.primitives(g)
+            @test all(w -> all(isfinite, w) && w[1] > 0 && w[5] > 0, W)
+        end
+    else
+        @info "nvcc not found — skipping transpile backend tests"
+    end
 else
     @info "CUDA not functional — skipping GPU backend tests"
 end
