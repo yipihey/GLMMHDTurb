@@ -27,7 +27,7 @@ using CUDA
 @inline Base.ifelse(m::Vec{N,Bool}, a::Vec{N,T}, b::Vec{N,T}) where {N,T} = vifelse(m, a, b)
 
 export @fvsystem, FVSystem
-export PLM, PCM, LLF, HLL, HLLC
+export PLM, PCM, LLF, HLL, HLLC, HLLD
 export Grid1D, step!, evolve!, primitives, conserved_total
 export Grid1DSoA, evolve_simd!, primitives_soa
 export Grid1DCU, evolve_cuda!, primitives_cuda
@@ -80,5 +80,6 @@ include("backend_cuda.jl")
 include("backend_cpu_2d.jl")
 include("backend_cuda_2d.jl")
 include("systems.jl")
+include("riemann_mhd.jl")
 
 end # module

@@ -164,6 +164,34 @@ end
 end
 
 # ---------------------------------------------------------------------------
+# HLLD — the Miyoshi-Kusano MHD solver, keyed to GLMMHD. Consistency, Brio-Wu
+# stability/positivity/conservation, and bit-exact rotation.
+# ---------------------------------------------------------------------------
+@testset "HLLD MHD Riemann solver" begin
+    s = GLMMHD(γ = 2f0, ch = 2f0)
+    W = (1f0, 0.3f0, -0.2f0, 0.1f0, 1f0, 0.75f0, 0.5f0, -0.4f0, 0f0)
+    @test maximum(abs.(FV.riemann(HLLD(), s, W, W) .- FV.physflux_x(s, W))) == 0f0   # L=R consistency
+
+    nx = 800; dx = 1f0/nx
+    bw(i) = i <= nx÷2 ? (1f0,0f0,0f0,0f0,1f0,0.75f0,1f0,0f0,0f0) : (0.125f0,0f0,0f0,0f0,0.1f0,0.75f0,-1f0,0f0,0f0)
+    U0 = [prim2cons(s, bw(i)) for i in 1:nx]; m0 = sum(u[1] for u in U0)*dx
+    g = Grid1D(s, U0; dx=dx, bc=:outflow, recon=PLM(), rsol=HLLD(), cfl=0.4f0)
+    FV.evolve!(g, 0.1f0); W2 = FV.primitives(g)
+    @test all(w -> all(isfinite, w), W2)                      # stable
+    @test all(w -> w[1] > 0 && w[5] > 0, W2)                  # positive
+    @test maximum(abs(w[6] - 0.75f0) for w in W2) == 0f0      # Bx preserved exactly
+    @test isapprox(sum(u[1] for u in g.U)*dx, m0; rtol = 1f-4)
+
+    n = 96; d = 1f0/n; m = 4                                  # rotation isotropy, bit-exact
+    xL=(1f0,0f0,0f0,0f0,1f0,0.75f0,1f0,0f0,0f0); xR=(0.125f0,0f0,0f0,0f0,0.1f0,0.75f0,-1f0,0f0,0f0)
+    yL=(1f0,0f0,0f0,0f0,1f0,1f0,0.75f0,0f0,0f0); yR=(0.125f0,0f0,0f0,0f0,0.1f0,-1f0,0.75f0,0f0,0f0)
+    gx = Grid2D(s, [prim2cons(s, i<=n÷2 ? xL : xR) for i in 1:n, _ in 1:m]; dx=d,dy=d,bc=:periodic,recon=PLM(),rsol=HLLD()); FV._sweep_x!(gx, 0.1f0*d)
+    gy = Grid2D(s, [prim2cons(s, j<=n÷2 ? yL : yR) for _ in 1:m, j in 1:n]; dx=d,dy=d,bc=:periodic,recon=PLM(),rsol=HLLD()); FV._sweep_y!(gy, 0.1f0*d)
+    iso = maximum(begin u = gy.U[b,a]; maximum(abs.(gx.U[a,b] .- (u[1],u[3],u[2],u[4],u[5],u[7],u[6],u[8],u[9]))) end for a in 1:n, b in 1:m)
+    @test iso == 0f0
+end
+
+# ---------------------------------------------------------------------------
 # CUDA backend — same physics, T = Float32 on a GPU thread. Must be bit-identical
 # to the scalar backend. Skipped automatically when no functional GPU is present.
 # ---------------------------------------------------------------------------

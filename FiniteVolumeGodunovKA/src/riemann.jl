@@ -10,6 +10,7 @@
 struct LLF  end
 struct HLL  end
 struct HLLC end
+struct HLLD end   # MHD 5-wave solver, keyed to GLMMHD (defined in riemann_mhd.jl)
 
 @inline function riemann(::LLF, s::FVSystem, WL::NTuple{N,T}, WR::NTuple{N,T}) where {N,T}
     FL = physflux_x(s, WL); FR = physflux_x(s, WR)
