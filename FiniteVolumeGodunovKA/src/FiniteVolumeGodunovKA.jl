@@ -71,6 +71,10 @@ function fastspeed_x end
 ch = cmax each step). Default: identity."
 function prestep end
 @inline prestep(s::FVSystem, cmax) = s
+"`s -> Bool`: whether `source` is non-trivial. When false the backends SKIP the operator-split
+source pass entirely (for Euler it would be a wasted full read/write). Default false."
+function has_source end
+@inline has_source(::FVSystem) = false
 
 include("macro.jl")
 include("reconstruct.jl")

@@ -49,14 +49,19 @@ function _sweep_y!(g::Grid2D{N,T}, dt) where {N,T}
     g.U, g.Ut = g.Ut, g.U
 end
 
-# Strang step: x(dt/2) · y(dt) · x(dt/2) → 2nd order in time, then the operator-split source.
-function step!(g::Grid2D, dt)
-    _sweep_x!(g, dt / 2)
-    _sweep_y!(g, dt)
-    _sweep_x!(g, dt / 2)
-    s = g.sys
-    @inbounds for j in 1:g.ny, i in 1:g.nx
-        g.U[i, j] = source(s, g.U[i, j], dt)
+# 2 full-dt sweeps + alternating order across steps (x·y then y·x → 2nd-order pair over 2 steps),
+# then the source (skipped when the system has none). 3 passes → 2.
+function step!(g::Grid2D, dt; rev::Bool = false)
+    if rev
+        _sweep_y!(g, dt); _sweep_x!(g, dt)
+    else
+        _sweep_x!(g, dt); _sweep_y!(g, dt)
+    end
+    if has_source(g.sys)
+        s = g.sys
+        @inbounds for j in 1:g.ny, i in 1:g.nx
+            g.U[i, j] = source(s, g.U[i, j], dt)
+        end
     end
     return g
 end
@@ -76,7 +81,7 @@ function evolve2d!(g::Grid2D, tend; maxsteps::Int = 10^7)
         c = max_wavespeed(g)
         g.sys = prestep(g.sys, c)                          # dynamic cleaning speed
         dt = min(g.cfl * min(g.dx, g.dy) / c, tend - t)    # exact for dx=dy
-        step!(g, dt)
+        step!(g, dt; rev = isodd(n))
         t += dt; n += 1
     end
     return g

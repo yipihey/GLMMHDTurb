@@ -83,7 +83,7 @@ function step!(g::Grid3DCU{N}, dt; rev::Bool = false) where {N}
     else
         sweep(_sweepx3d_kernel!, Float32(dt)/g.dx, px); sweep(_sweepy3d_kernel!, Float32(dt)/g.dy, py); sweep(_sweepz3d_kernel!, Float32(dt)/g.dz, pz)
     end
-    @cuda threads=thr blocks=blk _source3d_kernel!(g.U, g.sys, Float32(dt), g.nx, g.ny, g.nz, Val(N))
+    has_source(g.sys) && @cuda threads=thr blocks=blk _source3d_kernel!(g.U, g.sys, Float32(dt), g.nx, g.ny, g.nz, Val(N))
     return g
 end
 

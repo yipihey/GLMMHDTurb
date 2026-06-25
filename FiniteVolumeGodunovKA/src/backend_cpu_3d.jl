@@ -61,9 +61,11 @@ function step!(g::Grid3D, dt; rev::Bool = false)
     else
         _sweep_x3d!(g, dt); _sweep_y3d!(g, dt); _sweep_z3d!(g, dt)
     end
-    s = g.sys
-    @inbounds for k in 1:g.nz, j in 1:g.ny, i in 1:g.nx
-        g.U[i,j,k] = source(s, g.U[i,j,k], dt)
+    if has_source(g.sys)
+        s = g.sys
+        @inbounds for k in 1:g.nz, j in 1:g.ny, i in 1:g.nx
+            g.U[i,j,k] = source(s, g.U[i,j,k], dt)
+        end
     end
     return g
 end

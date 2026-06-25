@@ -79,16 +79,16 @@ end
 
 @inline _cfg2d(nx, ny) = ((16, 16), (cld(nx, 16), cld(ny, 16)))
 
-function step!(g::Grid2DCU{N}, dt) where {N}
+# 2 full-dt sweeps + alternating order across steps (rev); source skipped when none. 3 passes → 2.
+function step!(g::Grid2DCU{N}, dt; rev::Bool = false) where {N}
     thr, blk = _cfg2d(g.nx, g.ny); bc = Val(g.bc)
     px = identperm(Val(N)); py = dirperm(g.sys, N, 2)
-    @cuda threads=thr blocks=blk _sweepx2d_kernel!(g.Unew, g.U, g.sys, g.recon, g.rsol,
-        Float32(dt/2)/g.dx, g.nx, g.ny, Val(N), bc, px); g.U, g.Unew = g.Unew, g.U
-    @cuda threads=thr blocks=blk _sweepy2d_kernel!(g.Unew, g.U, g.sys, g.recon, g.rsol,
-        Float32(dt)/g.dy, g.nx, g.ny, Val(N), bc, py);   g.U, g.Unew = g.Unew, g.U
-    @cuda threads=thr blocks=blk _sweepx2d_kernel!(g.Unew, g.U, g.sys, g.recon, g.rsol,
-        Float32(dt/2)/g.dx, g.nx, g.ny, Val(N), bc, px); g.U, g.Unew = g.Unew, g.U
-    @cuda threads=thr blocks=blk _source2d_kernel!(g.U, g.sys, Float32(dt), g.nx, g.ny, Val(N))
+    swx() = (@cuda threads=thr blocks=blk _sweepx2d_kernel!(g.Unew, g.U, g.sys, g.recon, g.rsol,
+        Float32(dt)/g.dx, g.nx, g.ny, Val(N), bc, px); (g.U, g.Unew) = (g.Unew, g.U))
+    swy() = (@cuda threads=thr blocks=blk _sweepy2d_kernel!(g.Unew, g.U, g.sys, g.recon, g.rsol,
+        Float32(dt)/g.dy, g.nx, g.ny, Val(N), bc, py); (g.U, g.Unew) = (g.Unew, g.U))
+    rev ? (swy(); swx()) : (swx(); swy())
+    has_source(g.sys) && @cuda threads=thr blocks=blk _source2d_kernel!(g.U, g.sys, Float32(dt), g.nx, g.ny, Val(N))
     return g
 end
 
@@ -105,7 +105,7 @@ function evolve2d!(g::Grid2DCU, tend; maxsteps::Int = 10^7)
         c = max_wavespeed(g)
         g.sys = prestep(g.sys, c)                          # dynamic cleaning speed
         dt = min(g.cfl * min(g.dx, g.dy) / c, tend - t)    # exact for dx=dy
-        step!(g, dt)
+        step!(g, dt; rev = isodd(n))
         t += dt; n += 1
     end
     return g

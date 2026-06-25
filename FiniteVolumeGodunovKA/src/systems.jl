@@ -110,3 +110,4 @@ export Euler, GLMMHD
 
 # Dynamic cleaning speed: each step the driver sets ch to the global max fast speed (Dedner).
 prestep(s::GLMMHD, cmax) = GLMMHD(s.γ, cmax, s.cr)
+has_source(::GLMMHD) = true                  # ψ-damping; Euler keeps the default (false → skipped)

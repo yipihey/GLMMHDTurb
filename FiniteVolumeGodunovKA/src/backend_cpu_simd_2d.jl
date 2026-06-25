@@ -74,15 +74,21 @@ function _sweep_simd!(g::Grid2DSoA{N}, dt, d, stride, perm) where {N}
     g.U, g.Ut = g.Ut, g.U
 end
 
-function step!(g::Grid2DSoA{N}, dt) where {N}
+function step!(g::Grid2DSoA{N}, dt; rev::Bool = false) where {N}
     px = identperm(Val(N)); py = dirperm(g.sys, N, 2)
-    _fillghosts2d!(g); _sweep_simd!(g, dt/2, g.dx, 1, px)
-    _fillghosts2d!(g); _sweep_simd!(g, dt,   g.dy, g.nxp, py)
-    _fillghosts2d!(g); _sweep_simd!(g, dt/2, g.dx, 1, px)
-    s = g.sys; ng, nxp = _NG, g.nxp; nc = _nchunks(g.ny)   # operator-split source
-    Threads.@threads for c in 1:nc
-        @inbounds for jj in _chunkrange(g.ny, nc, c), ii in 1:g.nx
-            b = (jj-1+ng)*nxp + (ii+ng); stores!(g.U, source(s, loads(g.U, b), Float32(dt)), b)
+    if rev
+        _fillghosts2d!(g); _sweep_simd!(g, dt, g.dy, g.nxp, py)
+        _fillghosts2d!(g); _sweep_simd!(g, dt, g.dx, 1, px)
+    else
+        _fillghosts2d!(g); _sweep_simd!(g, dt, g.dx, 1, px)
+        _fillghosts2d!(g); _sweep_simd!(g, dt, g.dy, g.nxp, py)
+    end
+    if has_source(g.sys)
+        s = g.sys; ng, nxp = _NG, g.nxp; nc = _nchunks(g.ny)
+        Threads.@threads for c in 1:nc
+            @inbounds for jj in _chunkrange(g.ny, nc, c), ii in 1:g.nx
+                b = (jj-1+ng)*nxp + (ii+ng); stores!(g.U, source(s, loads(g.U, b), Float32(dt)), b)
+            end
         end
     end
     return g
@@ -106,7 +112,7 @@ function evolve_simd2d!(g::Grid2DSoA, tend; maxsteps::Int = 10^7)
     while t < tend && n < maxsteps
         c = max_wavespeed(g); g.sys = prestep(g.sys, c)
         dt = min(g.cfl * min(g.dx, g.dy) / c, tend - t)
-        step!(g, dt); t += dt; n += 1
+        step!(g, dt; rev = isodd(n)); t += dt; n += 1
     end
     return g
 end

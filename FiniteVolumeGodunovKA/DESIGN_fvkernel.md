@@ -134,12 +134,20 @@ the CUDA.jl codegen residual (~60–67% of nvcc) is a smaller factor on top. Thi
 Euler/GLM/CT. The path to full `.cu` speed from one Julia source is the transpile-to-C escape hatch or
 `march_bridge`, **not** the native backend (the `.cu` structures don't codegen well in CUDA.jl).
 
-**Win banked — 3-pass alternating Strang (3D).** Replaced the symmetric 5-sweep step (x·y·z·y·x, 6
-passes) with **3 full-dt sweeps + alternating order** across steps (x·y·z then z·y·x → a symmetric,
-2nd-order pair over 4 passes). Same-process A/B (controls for GPU thermal throttling — which made naive
-cross-run numbers misleading): **1.64–1.68× faster**, moving 3D Euler from ~24% → ~36% of the `.cu`,
-with 2nd-order convergence preserved (alternation) and the backends still bit-identical (a single step!
-is x·y·z on every backend).
+**Wins banked — pass reduction (all backends, 2D + 3D).**
+- **Alternating Strang**: 3D x·y·z·y·x (5 sweeps) → 3 full-dt sweeps with order alternating per step
+  (x·y·z / z·y·x); 2D x·y·x (3 sweeps) → 2 (x·y / y·x). Consecutive steps form a symmetric, 2nd-order
+  pair. Same-process A/B (controls for GPU thermal throttling — which made naive cross-run numbers
+  misleading): 3D step is **1.66× faster**.
+- **Skip the source pass** when `has_source(s)` is false (Euler). Marginal for 3D (the source kernel is
+  cheap/bandwidth-bound while the sweeps are compute-bound — removing it saves little wall-time), but
+  it's free and helps relatively more in 2D; the real lever is the sweep-count reduction.
+
+Net (3D CUDA, gradient IC, cool GPU): **Euler ~37–39%** (2541–2652 vs 6865) and **GLM-MHD ~40–42%**
+(1263–1332 vs 3175) of the `.cu` — up from ~24–25%. 2nd-order convergence and backend bit-identity both
+preserved (a single `step!` is x·y·z on every backend; `evolve` alternates).
+The remaining gap to the `.cu` is the fused single-pass march + shared-memory staging + f16 — structures
+that don't codegen well in CUDA.jl — so closing it needs the transpile-to-C / `march_bridge` path.
 
 ## Roadmap (priority order)
 

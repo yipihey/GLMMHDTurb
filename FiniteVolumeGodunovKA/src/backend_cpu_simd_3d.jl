@@ -79,10 +79,12 @@ function step!(g::Grid3DSoA{N}, dt; rev::Bool = false) where {N}
         _fillghosts3d!(g); _sweep_simd3d!(g, dt, g.dy, g.nxp, py)
         _fillghosts3d!(g); _sweep_simd3d!(g, dt, g.dz, sxy, pz)
     end
-    s = g.sys; ng, nxp, nyp = _NG, g.nxp, g.nyp; nc = _nchunks(g.nz)
-    Threads.@threads for c in 1:nc
-        @inbounds for kk in _chunkrange(g.nz, nc, c), jj in 1:g.ny, ii in 1:g.nx
-            b = ((kk-1+ng)*nyp + (jj-1+ng))*nxp + (ii+ng); stores!(g.U, source(s, loads(g.U, b), Float32(dt)), b)
+    if has_source(g.sys)
+        s = g.sys; ng, nxp, nyp = _NG, g.nxp, g.nyp; nc = _nchunks(g.nz)
+        Threads.@threads for c in 1:nc
+            @inbounds for kk in _chunkrange(g.nz, nc, c), jj in 1:g.ny, ii in 1:g.nx
+                b = ((kk-1+ng)*nyp + (jj-1+ng))*nxp + (ii+ng); stores!(g.U, source(s, loads(g.U, b), Float32(dt)), b)
+            end
         end
     end
     return g
