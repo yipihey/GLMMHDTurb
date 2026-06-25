@@ -124,6 +124,23 @@ OT t=0.5: 0.06 s exact vs 0.53 s lagged). Two lessons:
 If profiling ever shows the dt sync mattering at scale, revisit with a *block-hierarchical* reduction
 (one atomic per block), never per-cell atomics. For now `:exact` is the right design.
 
+## vs the hand-written `.cu` (the honest gap)
+
+3D CUDA, gradient IC, matched grid sizes: **Euler ~36%, GLM ~25–40% of the `.cu` peak** (hydro 6865,
+GLM 3175 Mcell/s). The gap is **mostly algorithm, not language**: dimensional splitting does several
+global-memory passes/step vs the `.cu`'s fused single-pass march + shared-memory staging + f16 tiles;
+the CUDA.jl codegen residual (~60–67% of nvcc) is a smaller factor on top. This is the deliberate trade —
+~25–36% from *one* branch-free source that runs bit-identically across scalar/SIMD/CUDA × 1D/2D/3D ×
+Euler/GLM/CT. The path to full `.cu` speed from one Julia source is the transpile-to-C escape hatch or
+`march_bridge`, **not** the native backend (the `.cu` structures don't codegen well in CUDA.jl).
+
+**Win banked — 3-pass alternating Strang (3D).** Replaced the symmetric 5-sweep step (x·y·z·y·x, 6
+passes) with **3 full-dt sweeps + alternating order** across steps (x·y·z then z·y·x → a symmetric,
+2nd-order pair over 4 passes). Same-process A/B (controls for GPU thermal throttling — which made naive
+cross-run numbers misleading): **1.64–1.68× faster**, moving 3D Euler from ~24% → ~36% of the `.cu`,
+with 2nd-order convergence preserved (alternation) and the backends still bit-identical (a single step!
+is x·y·z on every backend).
+
 ## Roadmap (priority order)
 
 1. ~~**SIMD-CPU backend**~~ ✅ done (single-core, ~5–7× over scalar, bit-identical). Next CPU

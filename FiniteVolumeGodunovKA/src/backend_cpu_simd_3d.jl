@@ -68,13 +68,17 @@ function _sweep_simd3d!(g::Grid3DSoA{N}, dt, d, stride, perm) where {N}
     g.U, g.Ut = g.Ut, g.U
 end
 
-function step!(g::Grid3DSoA{N}, dt) where {N}
+function step!(g::Grid3DSoA{N}, dt; rev::Bool = false) where {N}
     px = identperm(Val(N)); py = dirperm(g.sys, N, 2); pz = dirperm(g.sys, N, 3); sxy = g.nxp*g.nyp
-    _fillghosts3d!(g); _sweep_simd3d!(g, dt/2, g.dx, 1, px)
-    _fillghosts3d!(g); _sweep_simd3d!(g, dt/2, g.dy, g.nxp, py)
-    _fillghosts3d!(g); _sweep_simd3d!(g, dt,   g.dz, sxy, pz)
-    _fillghosts3d!(g); _sweep_simd3d!(g, dt/2, g.dy, g.nxp, py)
-    _fillghosts3d!(g); _sweep_simd3d!(g, dt/2, g.dx, 1, px)
+    if rev
+        _fillghosts3d!(g); _sweep_simd3d!(g, dt, g.dz, sxy, pz)
+        _fillghosts3d!(g); _sweep_simd3d!(g, dt, g.dy, g.nxp, py)
+        _fillghosts3d!(g); _sweep_simd3d!(g, dt, g.dx, 1, px)
+    else
+        _fillghosts3d!(g); _sweep_simd3d!(g, dt, g.dx, 1, px)
+        _fillghosts3d!(g); _sweep_simd3d!(g, dt, g.dy, g.nxp, py)
+        _fillghosts3d!(g); _sweep_simd3d!(g, dt, g.dz, sxy, pz)
+    end
     s = g.sys; ng, nxp, nyp = _NG, g.nxp, g.nyp; nc = _nchunks(g.nz)
     Threads.@threads for c in 1:nc
         @inbounds for kk in _chunkrange(g.nz, nc, c), jj in 1:g.ny, ii in 1:g.nx
@@ -103,7 +107,7 @@ function evolve_simd3d!(g::Grid3DSoA, tend; maxsteps::Int = 10^7)
     while t < tend && n < maxsteps
         c = max_wavespeed(g); g.sys = prestep(g.sys, c)
         dt = min(g.cfl * min(g.dx, g.dy, g.dz) / c, tend - t)
-        step!(g, dt); t += dt; n += 1
+        step!(g, dt; rev = isodd(n)); t += dt; n += 1
     end
     return g
 end

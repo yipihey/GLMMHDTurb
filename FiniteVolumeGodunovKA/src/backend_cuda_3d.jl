@@ -73,14 +73,16 @@ end
 
 @inline _cfg3d(nx, ny, nz) = ((8,8,4), (cld(nx,8), cld(ny,8), cld(nz,4)))
 
-function step!(g::Grid3DCU{N}, dt) where {N}
+function step!(g::Grid3DCU{N}, dt; rev::Bool = false) where {N}
     thr, blk = _cfg3d(g.nx, g.ny, g.nz); bc = Val(g.bc)
     px = identperm(Val(N)); py = dirperm(g.sys, N, 2); pz = dirperm(g.sys, N, 3)
     sweep(kern, λ, perm) = (@cuda threads=thr blocks=blk kern(g.Unew, g.U, g.sys, g.recon, g.rsol,
         λ, g.nx, g.ny, g.nz, Val(N), bc, perm); (g.U, g.Unew) = (g.Unew, g.U))
-    sweep(_sweepx3d_kernel!, Float32(dt/2)/g.dx, px); sweep(_sweepy3d_kernel!, Float32(dt/2)/g.dy, py)
-    sweep(_sweepz3d_kernel!, Float32(dt)/g.dz, pz)
-    sweep(_sweepy3d_kernel!, Float32(dt/2)/g.dy, py); sweep(_sweepx3d_kernel!, Float32(dt/2)/g.dx, px)
+    if rev
+        sweep(_sweepz3d_kernel!, Float32(dt)/g.dz, pz); sweep(_sweepy3d_kernel!, Float32(dt)/g.dy, py); sweep(_sweepx3d_kernel!, Float32(dt)/g.dx, px)
+    else
+        sweep(_sweepx3d_kernel!, Float32(dt)/g.dx, px); sweep(_sweepy3d_kernel!, Float32(dt)/g.dy, py); sweep(_sweepz3d_kernel!, Float32(dt)/g.dz, pz)
+    end
     @cuda threads=thr blocks=blk _source3d_kernel!(g.U, g.sys, Float32(dt), g.nx, g.ny, g.nz, Val(N))
     return g
 end
@@ -97,7 +99,7 @@ function evolve3d!(g::Grid3DCU, tend; maxsteps::Int = 10^7)
     while t < tend && n < maxsteps
         c = max_wavespeed(g); g.sys = prestep(g.sys, c)
         dt = min(g.cfl * min(g.dx, g.dy, g.dz) / c, tend - t)
-        step!(g, dt); t += dt; n += 1
+        step!(g, dt; rev = isodd(n)); t += dt; n += 1
     end
     return g
 end

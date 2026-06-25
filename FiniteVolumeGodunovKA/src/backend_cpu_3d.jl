@@ -52,9 +52,15 @@ function _sweep_z3d!(g::Grid3D{N,T}, dt) where {N,T}
     g.U, g.Ut = g.Ut, g.U
 end
 
-# Symmetric Strang (2nd order): x(dt/2)·y(dt/2)·z(dt)·y(dt/2)·x(dt/2), then the source.
-function step!(g::Grid3D, dt)
-    _sweep_x3d!(g, dt/2); _sweep_y3d!(g, dt/2); _sweep_z3d!(g, dt); _sweep_y3d!(g, dt/2); _sweep_x3d!(g, dt/2)
+# 3 full-dt sweeps + source. A single step is Lie (1st-order-in-time) splitting; `evolve3d!`
+# ALTERNATES the order (x·y·z then z·y·x) so consecutive steps form a symmetric, 2nd-order pair —
+# at 3 sweeps/step (4 passes) instead of the symmetric 5-sweep form (6 passes).
+function step!(g::Grid3D, dt; rev::Bool = false)
+    if rev
+        _sweep_z3d!(g, dt); _sweep_y3d!(g, dt); _sweep_x3d!(g, dt)
+    else
+        _sweep_x3d!(g, dt); _sweep_y3d!(g, dt); _sweep_z3d!(g, dt)
+    end
     s = g.sys
     @inbounds for k in 1:g.nz, j in 1:g.ny, i in 1:g.nx
         g.U[i,j,k] = source(s, g.U[i,j,k], dt)
@@ -76,7 +82,7 @@ function evolve3d!(g::Grid3D, tend; maxsteps::Int = 10^7)
     while t < tend && n < maxsteps
         c = max_wavespeed(g); g.sys = prestep(g.sys, c)
         dt = min(g.cfl * min(g.dx, g.dy, g.dz) / c, tend - t)
-        step!(g, dt); t += dt; n += 1
+        step!(g, dt; rev = isodd(n)); t += dt; n += 1   # alternate order → 2nd order over pairs
     end
     return g
 end
