@@ -149,6 +149,26 @@ preserved (a single `step!` is x·y·z on every backend; `evolve` alternates).
 The remaining gap to the `.cu` is the fused single-pass march + shared-memory staging + f16 — structures
 that don't codegen well in CUDA.jl — so closing it needs the transpile-to-C / `march_bridge` path.
 
+## The performance backend — transpile-to-CUDA-C (v0 PROVEN)
+
+The point of the project: full `.cu`-class speed from ONE `@fvsystem` stencil. `transpile/transpile.jl`
+is a working v0 for `Euler`:
+- A small **Julia-Expr → CUDA-C transpiler** walks the `@fvsystem` physics Exprs (cons2prim, prim2cons,
+  physflux_x, maxspeed_x) and emits `__host__ __device__` C (handles +,-,*,/, inv/sqrt/abs/min/max/
+  ifelse, tuple destructuring/return, param access, unicode→ascii names).
+- nvcc `--use_fast_math` → `.so`, run over `CuArray`s via the `march_bridge` `ccall` mechanism.
+- **The transpiled C physics is BIT-IDENTICAL to the Julia functions** (max|Δ| = 0 over 2000 random
+  states) — the part that proves the transpiler.
+- A fused single-pass nvcc kernel reaches **~10,800 Mcell/s** (256–480³) vs the native CUDA.jl
+  backend's ~2550 (37% of `.cu`) — **~4× faster, `.cu`-class**.
+
+Honest caveat: the fused kernel is **1st-order LLF**; the `.cu` 6865 is **2nd-order PLM** (heavier per
+cell), so "157% of 6865" is not scheme-matched — a PLM transpiled kernel would land *near* 6865. The
+result that matters: **the transpile path delivers ~4× over native and reaches the `.cu` tier, from the
+same branch-free source.** Next: transpile the reconstruction+Riemann (currently fixed C) so any
+`@fvsystem` system works; emit PLM for the apples-to-apples 6865 comparison; wire `_fvexprs` capture
+into `@fvsystem` (v0 reads the Euler Exprs directly); package as a `CuMarch` backend.
+
 ## Roadmap (priority order)
 
 1. ~~**SIMD-CPU backend**~~ ✅ done (single-core, ~5–7× over scalar, bit-identical). Next CPU
