@@ -70,3 +70,26 @@ end
     @test all(diff(errs) .< 0)        # errors decrease with resolution
     @test ord[end] ≥ 1.85             # 2nd-order at the finest pair
 end
+
+# ---------------------------------------------------------------------------
+# SIMD CPU backend — must be BIT-IDENTICAL to the scalar backend (same physics,
+# same Float32 ops, just Vec{8} lanes + a scalar tail). Bit-identity is the
+# strongest possible proof the vectorized path runs the same code.
+# ---------------------------------------------------------------------------
+@testset "SIMD backend ≡ scalar (bit-identical)" begin
+    s = Euler(γ = 1.4f0)
+    cmp(U0, dx, bc; kw...) = begin
+        gsc = Grid1D(s, copy(U0); dx = dx, bc = bc, kw...)
+        gsi = Grid1DSoA(s, copy(U0); dx = dx, bc = bc, kw...)
+        FV.evolve!(gsc, 0.2f0); FV.evolve_simd!(gsi, 0.2f0)
+        Wsc, Wsi = FV.primitives(gsc), FV.primitives_soa(gsi)
+        maximum(maximum(abs.(Wsc[i] .- Wsi[i])) for i in 1:length(U0))
+    end
+    nx = 437; dx = 1f0 / nx                       # deliberately not a multiple of 8 → tail
+    xs = Float32[(i - 0.5f0) * dx for i in 1:nx]
+    sod  = [prim2cons(s, (x < 0.5f0 ? 1f0 : 0.125f0, 0f0,0f0,0f0, x < 0.5f0 ? 1f0 : 0.1f0)) for x in xs]
+    wave = [prim2cons(s, (1f0 + 0.2f0*sinpi(2f0*x), 1f0, 0f0, 0f0, 1f0)) for x in xs]
+    @test cmp(sod,  dx, :outflow;  recon = PLM(),     rsol = HLLC()) == 0f0
+    @test cmp(wave, dx, :periodic; recon = PLM(),     rsol = HLL())  == 0f0
+    @test cmp(wave, dx, :periodic; recon = PLM(:none), rsol = LLF()) == 0f0
+end

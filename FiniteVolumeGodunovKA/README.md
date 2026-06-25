@@ -19,10 +19,12 @@ g  = Grid1D(s, U0; dx = 1f0/400, bc = :outflow, recon = PLM(), rsol = HLLC())
 evolve!(g, 0.2f0)        # same call on every backend
 ```
 
-**Status: v0 scaffold.** The `@fvsystem` contract, library PLM + LLF/HLL/HLLC, and a reference
-CPU (scalar, 1D) backend, with the `Euler` system defined through the contract. Sod shock tube
-and 2nd-order entropy-wave convergence pass; the latter runs in Float64 from the same
-Float32-authored physics, proving the element-type genericity the SIMD/CUDA backends build on.
+**Status: v0.** The `@fvsystem` contract, library PLM + LLF/HLL/HLLC, a reference CPU (scalar, 1D)
+backend, and a **SIMD CPU backend** (`Grid1DSoA`, vectorized along the grid, `Vec{8,Float32}`
+lanes) — with the `Euler` system defined through the contract. Sod and 2nd-order entropy-wave
+convergence pass; convergence runs in Float64 from the same Float32-authored physics (element-type
+genericity). The SIMD backend is **bit-identical** to the scalar one and runs **~5–7× faster**
+single-core. See the roadmap in `DESIGN_fvkernel.md` (next: threads/cache-blocking, then CUDA).
 
 See `DESIGN_fvkernel.md` for the contract, the rotation/Riemann design wins, the three locked
 decisions, and the roadmap. Run the tests with `julia --project=. -e 'using Pkg; Pkg.test()'`.

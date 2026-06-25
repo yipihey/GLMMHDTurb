@@ -15,8 +15,7 @@ struct HLLC end
     FL = physflux_x(s, WL); FR = physflux_x(s, WR)
     UL = prim2cons(s, WL);  UR = prim2cons(s, WR)
     a  = max(maxspeed_x(s, WL), maxspeed_x(s, WR))
-    half = T(0.5)
-    return map((fl, fr, ul, ur) -> half * (fl + fr) - half * a * (ur - ul), FL, FR, UL, UR)
+    return map((fl, fr, ul, ur) -> 0.5f0 * (fl + fr) - 0.5f0 * a * (ur - ul), FL, FR, UL, UR)
 end
 
 @inline function riemann(::HLL, s::FVSystem, WL::NTuple{N,T}, WR::NTuple{N,T}) where {N,T}
@@ -24,10 +23,10 @@ end
     SL = min(uL - cL, uR - cR);  SR = max(uL + cL, uR + cR)
     FL = physflux_x(s, WL); FR = physflux_x(s, WR)
     UL = prim2cons(s, WL);  UR = prim2cons(s, WR)
-    inv = one(T) / (SR - SL)
+    invd = inv(SR - SL);  z = zero(SL)
     return map(FL, FR, UL, UR) do fl, fr, ul, ur
-        fhll = (SR * fl - SL * fr + SL * SR * (ur - ul)) * inv
-        ifelse(SL >= zero(T), fl, ifelse(SR <= zero(T), fr, fhll))
+        fhll = (SR * fl - SL * fr + SL * SR * (ur - ul)) * invd
+        ifelse(SL >= z, fl, ifelse(SR <= z, fr, fhll))
     end
 end
 
@@ -51,7 +50,7 @@ end
     eR = ER / ρR + (Sstar - uR) * (Sstar + pR / mR)
     UsR = (qR, qR * Sstar, qR * vR, qR * wR, qR * eR)
 
-    z = zero(T)
+    z = zero(SL)
     return map(FL, FR, UL, UR, UsL, UsR) do fl, fr, ul, ur, usl, usr
         fsl = fl + SL * (usl - ul)
         fsr = fr + SR * (usr - ur)

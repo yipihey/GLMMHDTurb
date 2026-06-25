@@ -1,11 +1,13 @@
 name = "FiniteVolumeGodunovKA"
 uuid = "f5d0b1a2-3c4e-4b6a-9d8f-0a1b2c3d4e5f"
-authors = ["Tom Abel <tabel@stanford.edu>"]
 version = "0.0.1"
+authors = ["Tom Abel <tabel@stanford.edu>"]
 
-# v0 has NO dependencies — pure Base Julia, element-type-generic physics.
-# SIMD.jl (CPU lanes) and CUDA.jl (GPU) arrive with their respective backends.
+[deps]
+SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
+
 [compat]
+SIMD = "3.7.2"
 julia = "1.10"
 
 [extras]
