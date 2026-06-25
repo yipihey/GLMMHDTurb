@@ -57,19 +57,76 @@
 
 __constant__ float GAMMA=1.6666667f, DTDX=0.02f, SMALLR=1e-6f, SMALLP=1e-6f;
 
+#ifndef NSP
+#define NSP 0                  // number of passive species (CMA: ride the mass flux). 0 = no species.
+#endif
+// -DPPM selects parabolic-edge reconstruction (lean PPM) instead of PLM(MonCen). Both + 1D-Hancock.
+
 __device__ __forceinline__ int wrap(int i,int N){ int m=i%N; return m<0?m+N:m; }
 __device__ __forceinline__ size_t gidx(int i,int j,int k){ return (size_t)i+(size_t)NX*((size_t)j+(size_t)NY*k); }
 
-struct P { float r,u,v,w,p,bx,by,bz; };   // primitive; bx,by,bz = cell-centered (Bcc) unless overridden
+struct P { float r,u,v,w,p,bx,by,bz;      // primitive; bx,by,bz = cell-centered (Bcc) unless overridden
+#if NSP>0
+    float s[NSP];                          // passive species FRACTIONS (Sum<=1)
+#endif
+};
 __device__ __forceinline__ float mc(float a,float b,float c){
     float dl=b-a,dr=c-b,dc=0.5f*(c-a);
     if(dl*dr<=0.f) return 0.f;
     float s=dl>0.f?1.f:-1.f; return s*fminf(fabsf(dc),fminf(2.f*fabsf(dl),2.f*fabsf(dr)));
 }
-__device__ __forceinline__ P psub(P q,P s,float a){ return {q.r+a*s.r,q.u+a*s.u,q.v+a*s.v,q.w+a*s.w,q.p+a*s.p,q.bx+a*s.bx,q.by+a*s.by,q.bz+a*s.bz}; }
-__device__ __forceinline__ P slope(P a,P b,P c){ return {mc(a.r,b.r,c.r),mc(a.u,b.u,c.u),mc(a.v,b.v,c.v),mc(a.w,b.w,c.w),mc(a.p,b.p,c.p),mc(a.bx,b.bx,c.bx),mc(a.by,b.by,c.by),mc(a.bz,b.bz,c.bz)}; }
-// ideal-MHD flux comp in dir d (0=x,1=y,2=z); returns the 8 components (Bn flux=0)
-struct F8 { float r,mx,my,mz,E,bx,by,bz; };
+__device__ __forceinline__ P psub(P q,P s,float a){
+    P e={q.r+a*s.r,q.u+a*s.u,q.v+a*s.v,q.w+a*s.w,q.p+a*s.p,q.bx+a*s.bx,q.by+a*s.by,q.bz+a*s.bz};
+#if NSP>0
+    #pragma unroll
+    for(int i=0;i<NSP;i++) e.s[i]=q.s[i]+a*s.s[i];
+#endif
+    return e;
+}
+__device__ __forceinline__ P slope(P a,P b,P c){
+    P s={mc(a.r,b.r,c.r),mc(a.u,b.u,c.u),mc(a.v,b.v,c.v),mc(a.w,b.w,c.w),mc(a.p,b.p,c.p),mc(a.bx,b.bx,c.bx),mc(a.by,b.by,c.by),mc(a.bz,b.bz,c.bz)};
+#if NSP>0
+    #pragma unroll
+    for(int i=0;i<NSP;i++) s.s[i]=mc(a.s[i],b.s[i],c.s[i]);
+#endif
+    return s;
+}
+#ifdef PPM
+// monotonized 3-pt parabolic face value (CW84); sgn>0 -> +face, sgn<0 -> -face.
+__device__ __forceinline__ float ppm1(float qm,float q0,float qp,float sgn){
+    float d=0.25f*(qp-qm), cu=(qm-2.f*q0+qp)*(1.f/6.f);
+    float qr=q0+d-cu, ql=q0-d-cu;
+    if((qr-q0)*(q0-ql)<=0.f){ qr=q0; ql=q0; }
+    else { float dqe=qr-ql, d6=6.f*(q0-0.5f*(ql+qr));
+        if(dqe*d6 >  dqe*dqe) ql=3.f*q0-2.f*qr;
+        if(dqe*d6 < -dqe*dqe) qr=3.f*q0-2.f*ql; }
+    return sgn>0.f?qr:ql;
+}
+__device__ __forceinline__ P ppm_edge(P a,P b,P c,float sgn){
+    P e={ppm1(a.r,b.r,c.r,sgn),ppm1(a.u,b.u,c.u,sgn),ppm1(a.v,b.v,c.v,sgn),ppm1(a.w,b.w,c.w,sgn),
+          ppm1(a.p,b.p,c.p,sgn),ppm1(a.bx,b.bx,c.bx,sgn),ppm1(a.by,b.by,c.by,sgn),ppm1(a.bz,b.bz,c.bz,sgn)};
+#if NSP>0
+    #pragma unroll
+    for(int i=0;i<NSP;i++) e.s[i]=ppm1(a.s[i],b.s[i],c.s[i],sgn);
+#endif
+    return e;
+}
+// PPM edge + 1D-Hancock predictor shift: (ppm_face) + (mh - cell)
+__device__ __forceinline__ P padd_pred(P e,P mh,P c){
+    P o={e.r+mh.r-c.r,e.u+mh.u-c.u,e.v+mh.v-c.v,e.w+mh.w-c.w,e.p+mh.p-c.p,e.bx+mh.bx-c.bx,e.by+mh.by-c.by,e.bz+mh.bz-c.bz};
+#if NSP>0
+    #pragma unroll
+    for(int i=0;i<NSP;i++) o.s[i]=e.s[i]+mh.s[i]-c.s[i];
+#endif
+    return o;
+}
+#endif
+// ideal-MHD flux comp in dir d (0=x,1=y,2=z); returns the 8 components (Bn flux=0) + CMA species flux
+struct F8 { float r,mx,my,mz,E,bx,by,bz;
+#if NSP>0
+    float s[NSP];                          // species flux = mass_flux * X_upwind (CMA)
+#endif
+};
 __device__ __forceinline__ F8 dflux(P q,int d){
     float b2=q.bx*q.bx+q.by*q.by+q.bz*q.bz, ptot=q.p+0.5f*b2;
     float E=q.p/(GAMMA-1.f)+0.5f*q.r*(q.u*q.u+q.v*q.v+q.w*q.w)+0.5f*b2;
@@ -117,11 +174,21 @@ __device__ __forceinline__ P hanc1d(P q,P s,int d){
     float bx=U.bx-h*(FR.bx-FL.bx),by=U.by-h*(FR.by-FL.by),bz=U.bz-h*(FR.bz-FL.bz);
     float vx=mx*ir,vy=my*ir,vz=mz*ir;
     float p=fmaxf((GAMMA-1.f)*(E-0.5f*r*(vx*vx+vy*vy+vz*vz)-0.5f*(bx*bx+by*by+bz*bz)),SMALLP);
-    return {r,vx,vy,vz,p,bx,by,bz};
+    P mh={r,vx,vy,vz,p,bx,by,bz};
+#if NSP>0
+    float un=d==0?q.u:d==1?q.v:q.w;        // passive advection predictor: X_half = X - h*un*dX/dx
+    #pragma unroll
+    for(int i=0;i<NSP;i++) mh.s[i]=q.s[i]-h*un*s.s[i];
+#endif
+    return mh;
 }
 
 // ---- precompute Bcc (cell-centered) from face B ----
-struct Ptrs { float* U[5]; float* bx; float* by; float* bz; float* cx; float* cy; float* cz; };
+struct Ptrs { float* U[5]; float* bx; float* by; float* bz; float* cx; float* cy; float* cz;
+#if NSP>0
+    float* sp[NSP];                        // global passive species, stored CONSERVED (rho*X)
+#endif
+};
 __global__ void bcc_kernel(Ptrs q){
     size_t n=(size_t)NX*NY*NZ,i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
     int k=i/((size_t)NX*NY), j=(i/NX)%NY, ii=i%NX;
@@ -135,6 +202,7 @@ __global__ void bcc_kernel(Ptrs q){
 #undef THREADS
 #define THREADS (OX*OY)
 #define PT (TX*TY)
+#define NPV (8+NSP)             // prim-ring vars: 5 cons + 3 Bcc + NSP species fractions
 #define R5(p) (((p)%5+5)%5)
 #define R3(p) (((p)%3+3)%3)
 #define PRV(PR,v,s,lx,ly) ((float)(PR)[(v)*5*PT + (s)*PT + (lx)+TX*(ly)])
@@ -145,7 +213,12 @@ __device__ __forceinline__ P cpm(__half*PR,int s,int lx,int ly){
     float bx=PRV(PR,5,s,lx,ly),by=PRV(PR,6,s,lx,ly),bz=PRV(PR,7,s,lx,ly);
     float vx=mx*ir,vy=my*ir,vz=mz*ir;
     float p=fmaxf((GAMMA-1.f)*(E-0.5f*r*(vx*vx+vy*vy+vz*vz)-0.5f*(bx*bx+by*by+bz*bz)),SMALLP);
-    return {r,vx,vy,vz,p,bx,by,bz};
+    P q={r,vx,vy,vz,p,bx,by,bz};
+#if NSP>0
+    #pragma unroll
+    for(int i=0;i<NSP;i++) q.s[i]=PRV(PR,8+i,s,lx,ly);   // species fraction X from the tile
+#endif
+    return q;
 }
 __device__ __forceinline__ F8 fflm(__half*PR,Ptrs q,int d,int kp,int lx,int ly,int x0,int y0){
     P m2,m1,c0,p1;
@@ -153,12 +226,22 @@ __device__ __forceinline__ F8 fflm(__half*PR,Ptrs q,int d,int kp,int lx,int ly,i
         m2=cpm(PR,s,lx-2*ox,ly-2*oy);m1=cpm(PR,s,lx-ox,ly-oy);c0=cpm(PR,s,lx,ly);p1=cpm(PR,s,lx+ox,ly+oy);
     } else { m2=cpm(PR,R5(kp-2),lx,ly);m1=cpm(PR,R5(kp-1),lx,ly);c0=cpm(PR,R5(kp),lx,ly);p1=cpm(PR,R5(kp+1),lx,ly); }
     P sL=slope(m2,m1,c0),sR=slope(m1,c0,p1);
+#ifdef PPM
+    P L=padd_pred(ppm_edge(m2,m1,c0, 1.f), hanc1d(m1,sL,d), m1);   // parabolic +face of m1 + predictor
+    P R=padd_pred(ppm_edge(m1,c0,p1,-1.f), hanc1d(c0,sR,d), c0);   // parabolic -face of c0 + predictor
+#else
     P L=psub(hanc1d(m1,sL,d),sL,0.5f),R=psub(hanc1d(c0,sR,d),sR,-0.5f);
+#endif
     size_t gb=gidx(wrap(x0-NG+lx,NX),wrap(y0-NG+ly,NY),wrap(kp,NZ));
     float bn=d==0?q.bx[gb]:d==1?q.by[gb]:q.bz[gb];
     L.r=fmaxf(L.r,SMALLR);L.p=fmaxf(L.p,SMALLP);R.r=fmaxf(R.r,SMALLR);R.p=fmaxf(R.p,SMALLP);
     if(d==0){L.bx=bn;R.bx=bn;}else if(d==1){L.by=bn;R.by=bn;}else{L.bz=bn;R.bz=bn;}
-    return hll(L,R,d);
+    F8 f=hll(L,R,d);
+#if NSP>0
+    #pragma unroll
+    for(int i=0;i<NSP;i++) f.s[i] = f.r>=0.f ? f.r*L.s[i] : f.r*R.s[i];   // CMA: species ride mass flux
+#endif
+    return f;
 }
 #define EZ(MR,a,b,kp) (0.25f*( MRV(MR,2,kp,a,b)+MRV(MR,2,kp,(a)-1,b) - MRV(MR,0,kp,a,b)-MRV(MR,0,kp,a,(b)-1) ))
 #define EX(MR,a,b,kp) (0.25f*( MRV(MR,5,kp,a,b)+MRV(MR,5,kp,a,(b)-1) - MRV(MR,3,kp,a,b)-MRV(MR,3,(kp)-1,a,b) ))
@@ -166,14 +249,20 @@ __device__ __forceinline__ F8 fflm(__half*PR,Ptrs q,int d,int kp,int lx,int ly,i
 
 __global__ void __launch_bounds__(THREADS) ct_march(Ptrs q, Ptrs o){
     extern __shared__ __half sm[];
-    __half* PR=sm; __half* MR=sm + 8*5*PT;
+    __half* PR=sm; __half* MR=sm + NPV*5*PT;
     int tid=threadIdx.x, tx=tid%OX, ty=tid/OX, x0=blockIdx.x*OX, y0=blockIdx.y*OY, li=tx+NG, lj=ty+NG;
     auto loadp=[&](int kp){ int s=R5(kp);     // load prim plane kp (periodic wrap) into ring slot
         for(int c=tid;c<PT;c+=THREADS){ int lx=c%TX,ly=c/TX;
             size_t g=gidx(wrap(x0-NG+lx,NX),wrap(y0-NG+ly,NY),wrap(kp,NZ));
             PR[0*5*PT+s*PT+c]=(__half)q.U[0][g];PR[1*5*PT+s*PT+c]=(__half)q.U[1][g];PR[2*5*PT+s*PT+c]=(__half)q.U[2][g];
             PR[3*5*PT+s*PT+c]=(__half)q.U[3][g];PR[4*5*PT+s*PT+c]=(__half)q.U[4][g];
-            PR[5*5*PT+s*PT+c]=(__half)q.cx[g];PR[6*5*PT+s*PT+c]=(__half)q.cy[g];PR[7*5*PT+s*PT+c]=(__half)q.cz[g]; } };
+            PR[5*5*PT+s*PT+c]=(__half)q.cx[g];PR[6*5*PT+s*PT+c]=(__half)q.cy[g];PR[7*5*PT+s*PT+c]=(__half)q.cz[g];
+#if NSP>0
+            float ir=1.f/fmaxf(q.U[0][g],SMALLR);
+            #pragma unroll
+            for(int i=0;i<NSP;i++) PR[(8+i)*5*PT+s*PT+c]=(__half)(q.sp[i][g]*ir);   // store fraction X=rho*X/rho
+#endif
+        } };
     // PRIME: pre-load the periodic wrap planes -3,-2,-1 (= NZ-3..NZ-1) so the first magflux's z-stencil
     // and plane-0's update see real periodic data — converts the wrap-dependency to a linear sweep.
     loadp(-3); loadp(-2); loadp(-1); __syncthreads();
@@ -197,6 +286,10 @@ __global__ void __launch_bounds__(THREADS) ct_march(Ptrs q, Ptrs o){
             o.U[2][g]=q.U[2][g]+DTDX*((fxl.my-fxh.my)+(fyl.my-fyh.my)+(fzl.my-fzh.my));
             o.U[3][g]=q.U[3][g]+DTDX*((fxl.mz-fxh.mz)+(fyl.mz-fyh.mz)+(fzl.mz-fzh.mz));
             o.U[4][g]=q.U[4][g]+DTDX*((fxl.E-fxh.E)+(fyl.E-fyh.E)+(fzl.E-fzh.E));
+#if NSP>0
+            #pragma unroll
+            for(int i=0;i<NSP;i++) o.sp[i][g]=q.sp[i][g]+DTDX*((fxl.s[i]-fxh.s[i])+(fyl.s[i]-fyh.s[i])+(fzl.s[i]-fzh.s[i]));
+#endif
             o.bx[g]=q.bx[g]-DTDX*((EZ(MR,li,lj+1,k)-EZ(MR,li,lj,k))-(EY(MR,li,lj,k+1)-EY(MR,li,lj,k)));
             o.by[g]=q.by[g]-DTDX*((EX(MR,li,lj,k+1)-EX(MR,li,lj,k))-(EZ(MR,li+1,lj,k)-EZ(MR,li,lj,k)));
             o.bz[g]=q.bz[g]-DTDX*((EY(MR,li+1,lj,k)-EY(MR,li,lj,k))-(EX(MR,li,lj+1,k)-EX(MR,li,lj,k))); }
@@ -205,25 +298,33 @@ __global__ void __launch_bounds__(THREADS) ct_march(Ptrs q, Ptrs o){
 }
 #ifdef AS_LIB
 extern "C" {
-int march_nv(){return 8;} int march_nx(){return NX;}
+int march_nv(){return 8+NSP;} int march_nx(){return NX;} int march_nsp(){return NSP;}
 void march_set_dtdx(float v){cudaMemcpyToSymbol(DTDX,&v,sizeof(float));}
 void march_set_gamma(float g){cudaMemcpyToSymbol(GAMMA,&g,sizeof(float));}
+// qv/ov: 8 planes [U0..U4,bxf,byf,bzf] then NSP species planes (conserved rho*X); cc: 3 Bcc scratch
 double ct_run(float* const* qv,float* const* ov,float* const* cc,int nsteps){
     size_t n=(size_t)NX*NY*NZ; Ptrs Q,O;
     for(int v=0;v<5;v++){Q.U[v]=qv[v];O.U[v]=ov[v];}
     Q.bx=qv[5];Q.by=qv[6];Q.bz=qv[7];O.bx=ov[5];O.by=ov[6];O.bz=ov[7];
     Q.cx=cc[0];Q.cy=cc[1];Q.cz=cc[2];O.cx=cc[0];O.cy=cc[1];O.cz=cc[2];
-    dim3 grid(NX/OX,NY/OY,1); size_t shmem=sizeof(__half)*(8*5*PT+6*3*PT);
+#if NSP>0
+    for(int i=0;i<NSP;i++){Q.sp[i]=qv[8+i];O.sp[i]=ov[8+i];}
+#endif
+    dim3 grid(NX/OX,NY/OY,1); size_t shmem=sizeof(__half)*(NPV*5*PT+6*3*PT);
     cudaFuncSetAttribute(ct_march,cudaFuncAttributeMaxDynamicSharedMemorySize,shmem);
     cudaEvent_t t0,t1;cudaEventCreate(&t0);cudaEventCreate(&t1);cudaEventRecord(t0);
     for(int s=0;s<nsteps;s++){ bcc_kernel<<<(n+255)/256,256>>>(Q); ct_march<<<grid,THREADS,shmem>>>(Q,O); Ptrs t=Q;Q=O;O=t; }
     cudaEventRecord(t1);cudaEventSynchronize(t1); float ms=0;cudaEventElapsedTime(&ms,t0,t1);
     if(Q.U[0]!=qv[0]){for(int v=0;v<5;v++)cudaMemcpy(qv[v],Q.U[v],n*4,cudaMemcpyDeviceToDevice);
-        cudaMemcpy(qv[5],Q.bx,n*4,cudaMemcpyDeviceToDevice);cudaMemcpy(qv[6],Q.by,n*4,cudaMemcpyDeviceToDevice);cudaMemcpy(qv[7],Q.bz,n*4,cudaMemcpyDeviceToDevice);}
+        cudaMemcpy(qv[5],Q.bx,n*4,cudaMemcpyDeviceToDevice);cudaMemcpy(qv[6],Q.by,n*4,cudaMemcpyDeviceToDevice);cudaMemcpy(qv[7],Q.bz,n*4,cudaMemcpyDeviceToDevice);
+#if NSP>0
+        for(int i=0;i<NSP;i++) cudaMemcpy(qv[8+i],Q.sp[i],n*4,cudaMemcpyDeviceToDevice);
+#endif
+    }
     return (double)ms;
 }
 int ct_regs(){cudaFuncAttributes fa;cudaFuncGetAttributes(&fa,ct_march);return fa.numRegs;}
-int ct_shmem(){return (int)(sizeof(__half)*(8*5*PT+6*3*PT));}
+int ct_shmem(){return (int)(sizeof(__half)*(NPV*5*PT+6*3*PT));}
 }
 #endif
 #ifndef AS_LIB

@@ -133,7 +133,26 @@ Tile sweep @480 (all 64–133 regs, div·B 7.6e-5 = Julia, validated tile-indepe
 | 16×16 | 54 KB | 1 | 1377 |
 | 8×8 | 22 KB | 4* | 1115 (only 64 threads) |
 
-**Final hand-tuned CT: ~1560 Mcell/s @480 (2.5D march)** — **9.75× the production CT (160)**,
+### CT march — full PLM/PPM × ±species matrix (`spike_ctm.cu` flags `-DPPM`, `-DNSP=2`)
+
+All measured @480³, best 2-block tile, validated (div·B 7–8e-5 machine-zero, species mass conserved
+to 1e-7, **Σ X_i = 1 exact**, no overshoot):
+
+| CT @480 (best 2-block tile) | PLM | PPM (lean parabolic-edge) |
+|---|---:|---:|
+| **no species** | **1575** (16×12) | **757** (24×8) |
+| **+2 species (CMA)** | **1213** (16×10) | **565** (16×10) |
+
+Findings: (1) species via CMA (ride the mass flux, store fraction in the f16 tile, conserved rho*X
+global) cost −23% PLM (1575→1213) — entirely the +2-var tile crossing 50 KB → 1 block, *recovered* to
+2 blocks with a compact 16×10 tile (`__launch_bounds__` at 160 threads also caps regs 168→128). Σ X_i
+stays exactly 1 (both species ride the same mass flux). (2) The **lean parabolic-edge PPM stays at 2
+blocks** (only +3–6 regs: 133→136) and is ~2× slower purely on *compute* (the parabola+monotonize per
+var in the inline recompute) — it does NOT hit the GLM-PPM 1-block cliff (669), validating the
+playbook's "parabolic-edge PPM is the viable MHD PPM". Further species compaction (uint16-log / f16
+global, as in `spike_25d.cu -DU16SP`) would shrink the −23% further.
+
+**Final hand-tuned CT: ~1575 Mcell/s @480 (2.5D march, PLM, no species)** — **9.75× the production CT (160)**,
 **~81% of the GLM cube (1923)**, **~50% of the GLM march (3100)** — with **exact (machine-zero)
 div·B** where GLM only cleans it. **Verdict: the production CT's ~10× deficit was entirely layout +
 orchestration; a hand-tuned f16 CT is GLM-cube-class with a hard div·B=0. The streaming structure

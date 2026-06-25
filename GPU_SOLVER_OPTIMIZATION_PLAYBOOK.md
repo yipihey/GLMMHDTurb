@@ -169,7 +169,7 @@ Target matrix, @480³ A6000, Mcell/s. **✓ = measured this work; ~ = projected*
 |---|---:|---:|---:|---:|
 | **Hydro** | **6800 ✓** | ~5300 ✓(U16SP) | ~2900 ✓(cube-PPM) | ~2400 ~ |
 | **GLM-MHD** | **3100 ✓** | ~2300 ~ | 669 ✓ | ~550 ~ |
-| **CT-MHD** | **1560 ✓** | ~1300 ~ | ~700 ~ | ~600 ~ |
+| **CT-MHD** | **1575 ✓** | **1213 ✓** | **757 ✓** | **565 ✓** |
 
 **Hydro — near its ceiling; smallest headroom.** At 4 blocks / 64 regs / 89% of memfloor it is
 structurally optimal for PLM. The only PLM lever is compact global storage (f16 state measured +11% →
@@ -191,9 +191,12 @@ untried levers: (a) a **full-flux ring** (store hydro+mag flux per plane → the
 the current lag-recompute of lower-face fluxes; trades shared for compute — worth measuring at OX≈12–16
 to stay at 2 blocks); (b) **register reduction to 3 blocks** (≤85 regs) by splitting the EMF into a
 second light pass or shrinking live state. **Best realistic A6000 PLM CT ~1800–2000.** PPM and species
-for CT are **not yet built** — both will be register-heavy (the lean parabolic-PPM is the only viable
-PPM; species attach to the existing hydro update via CMA). These four matrix cells are the highest-value
-remaining work items.
+for CT are now **built and measured** (`-DPPM`, `-DNSP=2` on `spike_ctm.cu`): species via CMA cost −23%
+(1575→1213, the +2-var tile; recovered to 2 blocks with a compact 16×10 tile — Σ X_i=1 *exact*, div·B
+unaffected, species mass conserved to 1e-7); the **lean parabolic-edge PPM stays at 2 blocks** (only
++3–6 regs) and is ~2× slower purely on *compute* (757), NOT an occupancy cliff — confirming the playbook
+prediction that a parabolic-edge PPM avoids the GLM-PPM 1-block collapse. Further species compaction
+(uint16-log / f16 global) would shrink the tile cost below the −23%.
 
 **Cross-cutting:** all three live on the same cliff. Hydro is light enough for 4 blocks (so it is
 near-BW); GLM and CT are heavy enough to be stuck at 2 (so they are register-bound). The species and
