@@ -75,23 +75,28 @@ Implemented and **passing** (`test/runtests.jl`):
 - A reference **CPU scalar 1D** backend (`Grid1D`, MUSCL-Hancock, periodic/outflow BCs).
 - A **SIMD CPU 1D** backend (`Grid1DSoA`): SoA state, vectorized along the grid with shifted
   vector loads, `T = Vec{8,Float32}` lanes + a scalar tail — reusing the per-cell physics verbatim.
+- A **CUDA 1D** backend (`Grid1DCU`): one GPU thread per cell, fused per-cell recompute, `T =
+  Float32`, in-kernel BC (mod1/clamp), double-buffered device state — the same physics verbatim.
 - **Sod shock tube (Float32, HLLC):** post-shock ρ=0.2655 / P=0.3031 vs exact 0.2656 / 0.3031;
   positivity + mass conservation hold.
 - **Entropy-wave convergence (Float64):** L1 order 2.34 → 2.15 → 2.05 → **2.01** (nx 16→256).
   Run in Float64 from the *same* Float32-authored physics — the element-type genericity that every
   backend depends on, demonstrated end-to-end.
-- **SIMD ≡ scalar:** the SIMD backend is **bit-identical** to the scalar one (max |Δ| = 0) on Sod and
-  the smooth wave, across HLLC/HLL/LLF and a non-multiple-of-8 grid (exercises the tail). Same code,
-  proven. Throughput (A6000 host, single core, gradient/smooth IC): **~60 Mcell/s vs scalar ~9–14,
-  i.e. 4.7×–6.8×** (the win grows with grid size as the scalar AoS path loses cache).
+- **One source, three backends, all bit-identical.** SIMD ≡ scalar AND CUDA ≡ scalar — max |Δ| = 0
+  on Sod and the smooth wave, across HLLC/HLL/LLF (SIMD also on a non-multiple-of-8 grid, exercising
+  the tail). The element-generic physics is provably the same code on a CPU thread, a SIMD lane, and
+  a GPU thread. Throughput (A6000): **CPU scalar ~9–14, CPU SIMD ~60 (4.7×–6.8×, single core), CUDA
+  ~11,400 Mcell/s** (≥1M cells; ~190× the single-core SIMD).
 
 ## Roadmap (priority order)
 
 1. ~~**SIMD-CPU backend**~~ ✅ done (single-core, ~5–7× over scalar, bit-identical). Next CPU
    increments: **threads + cache-blocking** (toward the `cpu_simd.jl` ~120 Mcell/s with NUMA), and
    `Vec{16}` on AVX-512 hosts.
-2. **CUDA backend** — the staged cube with `T = Float32`, validated against the CPU backend on Sod
-   (same answer to ~1%). Then the transpile-to-CUDA-C escape hatch where the cube plateaus.
+2. ~~**CUDA backend**~~ ✅ done (1D, fused per-cell, bit-identical to CPU, ~11,400 Mcell/s). Open
+   items: the staged shared-memory **cube** in multi-D; whether CUDA.jl plateaus below the `.cu`
+   here (it didn't for this register-light fused 1D kernel) → the transpile-to-CUDA-C escape hatch
+   only where needed; move CUDA to a **weakdep + package extension** so CPU-only installs stay light.
 3. **Multi-D + rotation** exercised (2D Sod/Kelvin-Helmholtz), then **GLM-MHD** via the same contract.
 4. **Metal** — measure the Metal.jl gap vs its bandwidth roofline before deciding native-vs-MSL.
 5. **CT** through the reserved staggered/EMF seam.

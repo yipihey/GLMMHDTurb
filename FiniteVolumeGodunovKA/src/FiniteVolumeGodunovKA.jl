@@ -18,6 +18,7 @@ See `DESIGN_fvkernel.md` for the contract rationale and the three locked design 
 module FiniteVolumeGodunovKA
 
 using SIMD
+using CUDA
 
 # SIMD.jl deliberately leaves `Base.ifelse` on Vec masks to downstream packages, so
 # we provide it here. This is what makes the branch-free physics (ifelse/min/max)
@@ -29,6 +30,7 @@ export @fvsystem, FVSystem
 export PLM, PCM, LLF, HLL, HLLC
 export Grid1D, step!, evolve!, primitives, conserved_total
 export Grid1DSoA, evolve_simd!, primitives_soa
+export Grid1DCU, evolve_cuda!, primitives_cuda
 
 # ---------------------------------------------------------------------------
 # The contract. A system is a `<: FVSystem` value; the per-cell physics are
@@ -61,6 +63,7 @@ include("reconstruct.jl")
 include("riemann.jl")
 include("backend_cpu.jl")
 include("backend_cpu_simd.jl")
+include("backend_cuda.jl")
 include("systems.jl")
 
 end # module

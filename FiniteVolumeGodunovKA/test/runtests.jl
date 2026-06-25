@@ -93,3 +93,29 @@ end
     @test cmp(wave, dx, :periodic; recon = PLM(),     rsol = HLL())  == 0f0
     @test cmp(wave, dx, :periodic; recon = PLM(:none), rsol = LLF()) == 0f0
 end
+
+# ---------------------------------------------------------------------------
+# CUDA backend — same physics, T = Float32 on a GPU thread. Must be bit-identical
+# to the scalar backend. Skipped automatically when no functional GPU is present.
+# ---------------------------------------------------------------------------
+using CUDA
+if CUDA.functional()
+    @testset "CUDA backend ≡ scalar (bit-identical)" begin
+        s = Euler(γ = 1.4f0)
+        cmp(U0, dx, bc; kw...) = begin
+            gsc = Grid1D(s, copy(U0); dx = dx, bc = bc, kw...)
+            gcu = Grid1DCU(s, copy(U0); dx = dx, bc = bc, kw...)
+            FV.evolve!(gsc, 0.2f0); FV.evolve_cuda!(gcu, 0.2f0)
+            Wsc, Wcu = FV.primitives(gsc), FV.primitives_cuda(gcu)
+            maximum(maximum(abs.(Wsc[i] .- Wcu[i])) for i in 1:length(U0))
+        end
+        nx = 4001; dx = 1f0 / nx
+        xs = Float32[(i - 0.5f0) * dx for i in 1:nx]
+        sod  = [prim2cons(s, (x < 0.5f0 ? 1f0 : 0.125f0, 0f0,0f0,0f0, x < 0.5f0 ? 1f0 : 0.1f0)) for x in xs]
+        wave = [prim2cons(s, (1f0 + 0.2f0*sinpi(2f0*x), 1f0, 0f0, 0f0, 1f0)) for x in xs]
+        @test cmp(sod,  dx, :outflow;  recon = PLM(), rsol = HLLC()) == 0f0
+        @test cmp(wave, dx, :periodic; recon = PLM(), rsol = HLL())  == 0f0
+    end
+else
+    @info "CUDA not functional — skipping GPU backend tests"
+end
