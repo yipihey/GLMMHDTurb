@@ -45,20 +45,60 @@ untested **Metal** backend (`metal/metal_2d.jl`, for Apple hardware). Riemann so
 Every fast path is **bit-identical** to its scalar reference (max |Δ| = 0) on Sod/Brio-Wu/smooth-wave
 across the solvers; rotation (1, 2, or 3 axes; momentum + B) is exact; schemes are 2nd order in 1D/2D/3D.
 
-## Performance (A6000, gradient IC, vs the hand-tuned reference `.cu`)
+## Performance
 
-- **CPU SIMD**: ~145 Mcell/s with `JULIA_NUM_THREADS ≈ 8–16` (bandwidth-bound — don't over-subscribe).
-- **CUDA (native)**: ~37–42% of the `.cu` (dimensional split + CUDA.jl codegen).
-- **Transpile-to-nvcc** (`Grid3DCuMarch`): emits the `@fvsystem` stencil as CUDA-C, compiles with nvcc
-  `--use_fast_math`. The transpiled physics is **bit-identical to the Julia functions**; the
-  scheme-matched PLM kernel reaches **~85–90% of the hand-tuned `.cu`** — `.cu`-class speed from the same
-  branch-free source. (Needs nvcc at construction time; the package loads fine without it.)
+All numbers are on one **NVIDIA RTX A6000** (sm_86), a 3D gradient initial condition, in **Mcell/s** —
+millions of cell-updates per second (one full timestep per update; higher is faster).
+
+### The hand-tuned `.cu` reference — what we measure against
+
+The yardstick is a set of **hand-written CUDA-C kernels** (the `mini-ramses-metal` / `march_bridge`
+reference), tuned for this exact GPU over a long campaign. They represent roughly the *practical
+throughput ceiling* on an A6000, and they get there with techniques the user of this library never
+writes: a **fused 2.5D z-streaming march** (the whole timestep in ~one global-memory pass),
+**shared-memory staging**, **f16 tiles** for the reconstruction, `--use_fast_math`, and hand-picked tile
+sizes / occupancy. The reference matrix (gradient IC @480³):
+
+| scheme (2nd order) | Euler (hydro) | GLM-MHD | CT |
+|---|---:|---:|---:|
+| **PLM**            | **6865** | **3175** | 1255 |
+| PLM + 2 species    | 5082 | 2733 | 1011 |
+| PPM                | 3995 | 2064 |  752 |
+| PPM + 2 species    | 3822 | 1410 |  558 |
+
+Think of these as "as fast as a human expert hand-coded it for this card." The whole point of this
+library is to get *close to that* — for **any** system — while you write only branch-free Julia.
+
+### What this library delivers from one `@fvsystem` stencil
+
+GPU, 3D Euler PLM, vs the hand-tuned reference (6865):
+
+| backend | what it is | Euler 3D | vs `.cu` 6865 |
+|---|---|---:|---:|
+| `Grid3DCU` (native CUDA) | dimensional split, CUDA.jl codegen | ~2550 Mcell/s | **~37–42%** |
+| **`Grid3DCuMarch`** (transpile→nvcc) | emits the stencil as CUDA-C, nvcc | **~6000 Mcell/s** | **~85–90%** |
+
+The headline: the **native CUDA** path is fully portable (bit-identical on every backend, needs no nvcc)
+at ~40% of the hand-tuned ceiling; the **transpile path** reaches **~85–90% of the hand-tuned `.cu`** —
+and the transpiled physics is **bit-identical to your Julia functions** (`transpile_selfcheck` → `0.0`).
+You never hand-write a CUDA kernel, a march, or an f16 tile.
+
+**On the CPU**, the same source runs as a SIMD-vectorized, threaded solver: ~1 Mcell/s scalar (1 core,
+3D) → **~145 Mcell/s** at the threaded peak (2D, `JULIA_NUM_THREADS ≈ 8–16`). These kernels are
+memory-bandwidth bound, so they peak at ~8–16 threads — **don't over-subscribe** (`-t auto` on a
+128-core box is the *worst* setting).
 
 ```julia
-g = Grid3DCuMarch(Euler(γ=1.4f0), U0; dx=dx)   # transpiles + nvcc-compiles + loads
+g = Grid3DCuMarch(Euler(γ=1.4f0), U0; dx=dx)   # transpiles the stencil + nvcc-compiles + loads
 run!(g, dt, 1000)                              # ~.cu-class throughput
-transpile_selfcheck(Euler(γ=1.4f0))            # 0.0 — transpiled C ≡ Julia physics
+transpile_selfcheck(Euler(γ=1.4f0))            # 0.0 — emitted CUDA-C ≡ Julia physics, bit-exact
 ```
+
+**Honest caveats.** The `.cu` 6865 is 2nd-order PLM; comparisons are *scheme-matched* (PLM vs PLM) — a
+cheaper 1st-order kernel runs ~10,800 Mcell/s (157%) but that's not a fair comparison. GLM-MHD transpiled
+hits ~`.cu`-class but currently uses LLF where the reference uses HLLD (a Riemann mismatch). The last
+~10% to the reference is its hand-tuned march/f16 — a fixed, system-agnostic C-template optimization not
+yet ported. Throughput also varies ~±15% with GPU thermal state, so compare runs in one process.
 
 ## Design
 
