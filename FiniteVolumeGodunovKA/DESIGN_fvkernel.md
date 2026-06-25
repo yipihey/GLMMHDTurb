@@ -217,15 +217,26 @@ flux divergence — the transverse terms the fused kernel dropped). Generic over
 rotates to y/z via `swap_y`/`swap_z`, reconstruction is per-component (rotation-free). **Validated
 genuinely 2nd-order** (entropy-wave order 2.0–2.6, conservation machine-zero).
 
-**But the naive single-pass is a throughput dead-end, and measuring proved it.** It runs **~2000 Mcell/s
-— *slower* than RK2's ~2980**, not faster. The kernel is **compute-bound**: with no shared memory, each
-output cell recomputes the full transverse prediction of all 6 neighbors (~7× redundant arithmetic), and
-that outweighs the single global pass it saves. The hypothesis that the A6000 L2 would amortize the
-~25-cell stencil was wrong — the bottleneck is arithmetic, not bandwidth. **The only way to the win is
-shared-memory staging** (compute each cell's transverse correction `dU` *once* into shared, recompute
-only the cheap PLM reconstruction on the fly) — i.e. exactly the hand-tuned tiling the reference `.cu`
-uses. That is the real remaining lever (and a genuine GPU-kernel project, not a transpiler tweak). The
-correct `run_ctu!` is kept as the validated scheme and the foundation for that tiled kernel.
+**The naive single-pass is compute-bound — measuring proved it.** `run_ctu!` runs **~2000 Mcell/s —
+*slower* than RK2's ~2980**: with no shared memory, each output cell recomputes the full transverse
+prediction of all 6 neighbors (~7× redundant arithmetic, 168 registers per ptxas), outweighing the one
+global pass it saves. The hypothesis that the A6000 L2 would amortize the ~25-cell stencil was wrong —
+the bottleneck is arithmetic, not bandwidth.
+
+**The fix — shared-memory tiling + f16, the reference's own technique (`run_ctus!`).** Three phases per
+block: (0) load the primitive tile + 2-cell halo into shared; (1) compute each cell's transverse `dU`
+**once** into a shared `dU` tile (+1 halo); (2) each output cell builds its 6 predicted faces from the
+shared tiles (cheap PLM recon on the fly + the stored `dU`), Riemann, update. ptxas: 72 regs, no spill,
+but 35 KB shared → only **2 blocks/SM = 33% occupancy**. So tile in **f16** (the `.cu`'s f16-tile trick),
+halving shared to ~18 KB → 3 blocks/SM (50%); regs rise to 80, still no spill. Conservation stays
+*exact* — the interface flux is computed identically from both sides (same shared f16 values) and the
+update is f32. Validated 2nd-order (order 2.0–2.6, `Δmass`~1e-7, matches the naive scheme to the f16
+floor ~2e-4). Result: **~3300 Mcell/s = ~48% of the `.cu`, 1.6× over naive and 1.17× over pure-f32 RK2**
+— now `evolve!`'s default (`scheme=:ctu`; `:rk2` keeps the pure-f32 path). `__launch_bounds__(256,4)` to
+force 64 regs / 4 blocks made it *worse* (spills) — the "reduce structurally, never cap registers" lesson
+re-confirmed. The gap from 48% to the 91% of the 1st-order demo is the reference's deeper hand-tuning (a
+leaner flux phase to kill the double-Riemann, register discipline, its specific z-march) — diminishing
+returns from here.
 
 ## Roadmap (priority order)
 

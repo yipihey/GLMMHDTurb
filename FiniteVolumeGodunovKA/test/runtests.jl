@@ -351,12 +351,13 @@ if CUDA.functional()
             @test abs(c1[1]-c0[1]) ≤ 1f-5*abs(c0[1])   # mass conserved to machine precision
             @test abs(c1[5]-c0[5]) ≤ 1f-5*abs(c0[5])   # energy conserved
 
-            # single-pass CTU scheme: also 2nd-order, and agrees with RK2 (both 2nd-order, same problem)
-            ct(m) = (g3=Grid3DCuMarch(s, ent(m); dx=1f0/m); t=0f0;
-                     while t<0.1f0; dt=min(dt_cfl(g3), 0.1f0-t); run_ctu!(g3,dt,1); t+=dt; end;
+            # single-pass CTU schemes (naive + shared-memory-tiled f16): both genuinely 2nd-order too
+            ctconv(stepper, m) = (g3=Grid3DCuMarch(s, ent(m); dx=1f0/m); t=0f0;
+                     while t<0.1f0; dt=min(dt_cfl(g3), 0.1f0-t); stepper(g3,dt,1); t+=dt; end;
                      ρ=[w[1] for w in primitives(g3)];
                      sum(abs(ρ[i,j,k]-ρe((i-.5f0)/m,(j-.5f0)/m,(k-.5f0)/m,0.1f0)) for i in 1:m,j in 1:m,k in 1:m)/m^3)
-            @test log(ct(16)/ct(32))/log(2) > 1.7      # CTU is genuinely 2nd-order too
+            @test log(ctconv(run_ctu!,16)/ctconv(run_ctu!,32))/log(2) > 1.7     # naive CTU 2nd-order
+            @test log(ctconv(run_ctus!,16)/ctconv(run_ctus!,32))/log(2) > 1.7   # tiled f16 CTU 2nd-order
         end
     else
         @info "nvcc not found — skipping transpile backend tests"

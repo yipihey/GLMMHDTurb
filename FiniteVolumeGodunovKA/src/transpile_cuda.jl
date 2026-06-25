@@ -216,8 +216,80 @@ extern "C" void fv_run_ctu(float* R,float* O,int nx,int ny,int nz,float lam,cons
   for(int s=0;s<nsteps;s++){ k_ctu<<<grp,thr>>>(a,b,nx,ny,nz,lam,PRM); float* t=a; a=b; b=t; }
   if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
   cudaDeviceSynchronize(); }
+// ---- shared-memory-TILED single-pass CTU: compute each cell's transverse dU ONCE into shared ----
+#define TBX 8
+#define TBY 8
+#define TBZ 4
+#define WSX (TBX+4)
+#define WSY (TBY+4)
+#define WSZ (TBZ+4)
+#define DSX (TBX+2)
+#define DSY (TBY+2)
+#define DSZ (TBZ+2)
+#define WSI(lx,ly,lz) ((((lz)*WSY+(ly))*WSX+(lx))*NV)
+#define DSI(lx,ly,lz) ((((lz)*DSY+(ly))*DSX+(lx))*NV)
+__device__ inline void ldh(const __half* p,float* w){ for(int c=0;c<NV;c++) w[c]=__half2float(p[c]); }
+// transverse correction dU = -0.5*lam*div(F of reconstructed faces), for Ws-local cell (lx,ly,lz). f16 tile.
+__device__ void compute_dU(const __half* Ws,int lx,int ly,int lz,float lam,const float* PRM,__half* dU){
+  float W0[NV],Wxm[NV],Wxp[NV],Wym[NV],Wyp[NV],Wzm[NV],Wzp[NV];
+  ldh(Ws+WSI(lx,ly,lz),W0);
+  ldh(Ws+WSI(lx-1,ly,lz),Wxm); ldh(Ws+WSI(lx+1,ly,lz),Wxp);
+  ldh(Ws+WSI(lx,ly-1,lz),Wym); ldh(Ws+WSI(lx,ly+1,lz),Wyp);
+  ldh(Ws+WSI(lx,ly,lz-1),Wzm); ldh(Ws+WSI(lx,ly,lz+1),Wzp);
+  float WxL[NV],WxR[NV],WyL[NV],WyR[NV],WzL[NV],WzR[NV];
+  recon(Wxm,W0,Wxp,WxL,WxR); recon(Wym,W0,Wyp,WyL,WyR); recon(Wzm,W0,Wzp,WzL,WzR);
+  float Fa[NV],Fb[NV],d[NV]; for(int c=0;c<NV;c++) d[c]=0.f;
+  flux_dir(WxR,0,PRM,Fa); flux_dir(WxL,0,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
+  flux_dir(WyR,1,PRM,Fa); flux_dir(WyL,1,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
+  flux_dir(WzR,2,PRM,Fa); flux_dir(WzL,2,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
+  for(int c=0;c<NV;c++) dU[c]=__float2half(d[c]*-0.5f*lam); }
+// predicted face state of Ws-local cell (lx,ly,lz): PLM recon along dir, evolved by stored dUcell. side 0=L,1=R.
+__device__ void predicted_face(const __half* Ws,int lx,int ly,int lz,int dir,int side,const __half* dUcell,const float* PRM,float* out){
+  int ex=(dir==0),ey=(dir==1),ez=(dir==2);
+  float Wm[NV],W0[NV],Wp[NV],dU[NV];
+  ldh(Ws+WSI(lx-ex,ly-ey,lz-ez),Wm); ldh(Ws+WSI(lx,ly,lz),W0); ldh(Ws+WSI(lx+ex,ly+ey,lz+ez),Wp); ldh(dUcell,dU);
+  float WL[NV],WR[NV]; recon(Wm,W0,Wp,WL,WR);
+  float* Wf=(side==0)?WL:WR; float U[NV]; prim2cons(Wf,U,PRM);
+  for(int c=0;c<NV;c++) U[c]+=dU[c]; cons2prim(U,out,PRM); }
+extern __shared__ __half smem[];
+__global__ void k_ctus(const float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM){
+  __half* Ws=smem; __half* dUs=smem+WSX*WSY*WSZ*NV;
+  int ox=blockIdx.x*TBX-2, oy=blockIdx.y*TBY-2, oz=blockIdx.z*TBZ-2;
+  int tid=(threadIdx.z*TBY+threadIdx.y)*TBX+threadIdx.x; const int NT=TBX*TBY*TBZ;
+  long VOL=(long)nx*ny*nz;
+  for(int t=tid;t<WSX*WSY*WSZ;t+=NT){                         // phase 0: load W halo tile (store f16)
+    int lx=t%WSX, ly=(t/WSX)%WSY, lz=t/(WSX*WSY);
+    int gx=((ox+lx)%nx+nx)%nx, gy=((oy+ly)%ny+ny)%ny, gz=((oz+lz)%nz+nz)%nz;
+    long q=((long)gz*ny+gy)*nx+gx; float U[NV],W[NV]; for(int c=0;c<NV;c++) U[c]=R[(long)c*VOL+q];
+    cons2prim(U,W,PRM); for(int c=0;c<NV;c++) Ws[WSI(lx,ly,lz)+c]=__float2half(W[c]); }
+  __syncthreads();
+  for(int t=tid;t<DSX*DSY*DSZ;t+=NT){                         // phase 1: dU once per cell (dUs-local d ↔ Ws-local d+1)
+    int dx=t%DSX, dy=(t/DSX)%DSY, dz=t/(DSX*DSY);
+    compute_dU(Ws,dx+1,dy+1,dz+1,lam,PRM,dUs+DSI(dx,dy,dz)); }
+  __syncthreads();
+  int i=blockIdx.x*TBX+threadIdx.x, j=blockIdx.y*TBY+threadIdx.y, k=blockIdx.z*TBZ+threadIdx.z;
+  if(i>=nx||j>=ny||k>=nz) return;
+  int sx=threadIdx.x+2, sy=threadIdx.y+2, sz=threadIdx.z+2;   // this cell's Ws-local
+  int ax=threadIdx.x+1, ay=threadIdx.y+1, az=threadIdx.z+1;   // this cell's dUs-local
+  const __half* dUc=dUs+DSI(ax,ay,az);
+  float A[NV],B[NV],Fxp[NV],Fxm[NV],Fyp[NV],Fym[NV],Fzp[NV],Fzm[NV];
+  predicted_face(Ws,sx,sy,sz,0,1,dUc,PRM,A);     predicted_face(Ws,sx+1,sy,sz,0,0,dUs+DSI(ax+1,ay,az),PRM,B); llf_dir(A,B,0,Fxp,PRM);
+  predicted_face(Ws,sx-1,sy,sz,0,1,dUs+DSI(ax-1,ay,az),PRM,A); predicted_face(Ws,sx,sy,sz,0,0,dUc,PRM,B);      llf_dir(A,B,0,Fxm,PRM);
+  predicted_face(Ws,sx,sy,sz,1,1,dUc,PRM,A);     predicted_face(Ws,sx,sy+1,sz,1,0,dUs+DSI(ax,ay+1,az),PRM,B); llf_dir(A,B,1,Fyp,PRM);
+  predicted_face(Ws,sx,sy-1,sz,1,1,dUs+DSI(ax,ay-1,az),PRM,A); predicted_face(Ws,sx,sy,sz,1,0,dUc,PRM,B);      llf_dir(A,B,1,Fym,PRM);
+  predicted_face(Ws,sx,sy,sz,2,1,dUc,PRM,A);     predicted_face(Ws,sx,sy,sz+1,2,0,dUs+DSI(ax,ay,az+1),PRM,B); llf_dir(A,B,2,Fzp,PRM);
+  predicted_face(Ws,sx,sy,sz-1,2,1,dUs+DSI(ax,ay,az-1),PRM,A); predicted_face(Ws,sx,sy,sz,2,0,dUc,PRM,B);      llf_dir(A,B,2,Fzm,PRM);
+  long q=IDX(i,j,k); for(int c=0;c<NV;c++) O[(long)c*VOL+q]=R[(long)c*VOL+q]-lam*((Fxp[c]-Fxm[c])+(Fyp[c]-Fym[c])+(Fzp[c]-Fzm[c])); }
+extern "C" void fv_run_ctus(float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM,int nsteps){
+  dim3 thr(TBX,TBY,TBZ), grp((nx+TBX-1)/TBX,(ny+TBY-1)/TBY,(nz+TBZ-1)/TBZ);
+  int shbytes=(int)((WSX*WSY*WSZ+DSX*DSY*DSZ)*NV*sizeof(__half));
+  cudaFuncSetAttribute(k_ctus, cudaFuncAttributeMaxDynamicSharedMemorySize, shbytes);
+  float *a=R,*b=O;
+  for(int s=0;s<nsteps;s++){ k_ctus<<<grp,thr,shbytes>>>(a,b,nx,ny,nz,lam,PRM); float* t=a; a=b; b=t; }
+  if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
+  cudaDeviceSynchronize(); }
 """, "NV" => string(NV))
-    "#include <cuda_runtime.h>\n#include <math.h>\n#define NV $NV\n\n" *
+    "#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n#define NV $NV\n\n" *
     join(protos, "\n") * "\n\n" * join(defs, "\n") *
     _genswap("swap_y", m.vidx, 2) * _genswap("swap_z", m.vidx, 3) * "\n" * tests * fixed
 end
@@ -258,7 +330,7 @@ mutable struct Grid3DCuMarch{N,S<:FVSystem}
     R::CuVector{Float32}; O::CuVector{Float32}; T::CuVector{Float32}     # state + 2 scratch (var-major)
     prm::CuVector{Float32}
     spd::CuVector{Float32}                                               # scratch: per-cell CFL speed
-    frun::Ptr{Cvoid}; frun2::Ptr{Cvoid}; fctu::Ptr{Cvoid}; fspeed::Ptr{Cvoid}
+    frun::Ptr{Cvoid}; frun2::Ptr{Cvoid}; fctu::Ptr{Cvoid}; fctus::Ptr{Cvoid}; fspeed::Ptr{Cvoid}
     nx::Int; ny::Int; nz::Int; dx::Float32
 end
 
@@ -275,8 +347,8 @@ function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::St
     Grid3DCuMarch{N,typeof(sys)}(sys, R, CUDA.zeros(Float32, N*VOL), CUDA.zeros(Float32, N*VOL), prm,
                                  CUDA.zeros(Float32, VOL),
                                  Libdl.dlsym(lib, :fv_run), Libdl.dlsym(lib, :fv_run_rk2),
-                                 Libdl.dlsym(lib, :fv_run_ctu), Libdl.dlsym(lib, :fv_speed),
-                                 nx, ny, nz, Float32(dx))
+                                 Libdl.dlsym(lib, :fv_run_ctu), Libdl.dlsym(lib, :fv_run_ctus),
+                                 Libdl.dlsym(lib, :fv_speed), nx, ny, nz, Float32(dx))
 end
 
 @inline _devptr(x) = reinterpret(Ptr{Float32}, UInt(UInt64(pointer(x))))
@@ -303,6 +375,13 @@ function run_ctu!(g::Grid3DCuMarch, dt, nsteps::Integer)
     return g
 end
 
+"Run `nsteps` of the shared-memory-TILED single-pass CTU kernel (dU computed once/cell in shared; result in `g.R`)."
+function run_ctus!(g::Grid3DCuMarch, dt, nsteps::Integer)
+    ccall(g.fctus, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Cfloat, Ptr{Float32}, Cint),
+          _devptr(g.R), _devptr(g.O), g.nx, g.ny, g.nz, Float32(dt)/g.dx, _devptr(g.prm), Int32(nsteps))
+    return g
+end
+
 "Max over cells of the per-cell summed directional signal speed (the unsplit-CFL quantity, on device)."
 function maxspeed_sum(g::Grid3DCuMarch)
     ccall(g.fspeed, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Ptr{Float32}),
@@ -314,17 +393,21 @@ end
 dt_cfl(g::Grid3DCuMarch; cfl = 0.4f0) = Float32(cfl) * g.dx / maxspeed_sum(g)
 
 """
-    evolve!(g::Grid3DCuMarch, tend; cfl=0.4f0, dtevery=4, maxsteps=10^7) -> g
+    evolve!(g::Grid3DCuMarch, tend; cfl=0.4f0, dtevery=4, scheme=:ctu, maxsteps=10^7) -> g
 
 Integrate to physical time `tend` with adaptive CFL timesteps (recomputed every `dtevery` steps, with
-a `cfl` margin to cover speed growth between recomputes). Result is left in `g.R`.
+a `cfl` margin to cover speed growth between recomputes). Result is left in `g.R`. `scheme`:
+`:ctu` — the shared-memory-tiled single-pass 2nd-order kernel (f16 tile, fastest; default);
+`:rk2` — pure-f32 MUSCL + SSP-RK2 (two stages). Both validated 2nd-order and conservative.
 """
-function evolve!(g::Grid3DCuMarch, tend; cfl = 0.4f0, dtevery::Integer = 4, maxsteps::Integer = 10^7)
+function evolve!(g::Grid3DCuMarch, tend; cfl = 0.4f0, dtevery::Integer = 4, scheme::Symbol = :ctu,
+                 maxsteps::Integer = 10^7)
+    stepper = scheme === :rk2 ? run_rk2! : run_ctus!
     t = 0.0f0; tend = Float32(tend); n = 0; dt = 0.0f0
     while t < tend && n < maxsteps
         (n % dtevery == 0) && (dt = dt_cfl(g; cfl = cfl))
         dts = min(dt, tend - t)
-        run_rk2!(g, dts, 1)            # genuinely 2nd-order in space & time
+        stepper(g, dts, 1)            # 2nd-order in space & time
         t += dts; n += 1
     end
     return (g = g, t = t, nsteps = n)

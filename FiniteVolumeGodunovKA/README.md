@@ -76,24 +76,23 @@ GPU, 3D Euler, vs the hand-tuned reference (6865):
 | backend / scheme | what it is | Euler 3D | vs `.cu` 6865 |
 |---|---|---:|---:|
 | `Grid3DCU` (native CUDA) | dimensional-split **2nd-order**, CUDA.jl codegen | ~2550 Mcell/s | ~37–42% |
-| `Grid3DCuMarch` · **`evolve!`** | **validated 2nd-order solver** (MUSCL + SSP-RK2), CFL-adaptive | ~2580 Mcell/s | ~38% |
-| `Grid3DCuMarch` · `run!` | 1st-order-in-time fused **single-pass throughput demo** | **~6000 Mcell/s** | **~85–90%** |
+| `evolve!` `scheme=:rk2` | 2nd-order MUSCL + SSP-RK2 (pure f32, two stages) | ~2900 Mcell/s | ~42% |
+| `evolve!` `scheme=:ctu` (**default**) | **single-pass 2nd-order**, shared-mem-tiled f16 CTU | ~3300 Mcell/s | ~48% |
+| `Grid3DCuMarch` · `run!` | 1st-order-in-time fused **single-pass throughput demo** | **~6300 Mcell/s** | **~91%** |
 
 Two honest readings. (1) The **transpiler emits `.cu`-class code**: its fused single-pass kernel hits
 **~85–90% of the hand-tuned reference** — and the transpiled physics is **bit-identical to your Julia
 functions** (`transpile_selfcheck` → `0.0`). But that kernel is 1st-order in time (it can't alternate
 sweep order the way a split solver does), so it's a *throughput demonstration*, not the science path.
-(2) The **science path is `evolve!`** — a genuinely 2nd-order MUSCL + SSP-RK2 solver with CFL-adaptive
-timestepping, **validated** (entropy-wave convergence order ≈ 2, conservation to machine precision). Two
-RK stages cost ~2×, landing it at ~38–43% of the reference — on par with the native 2nd-order CUDA
-backend. Either way you never hand-write a CUDA kernel, a march, or an f16 tile.
-
-A **single-pass 2nd-order CTU kernel** (`run_ctu!`, unsplit MUSCL-Hancock with a transverse predictor) is
-also provided and validated 2nd-order — but *measured*, the naive single-pass is **compute-bound**
-(~2000 Mcell/s, slower than RK2): each cell recomputes its neighbors' transverse predictions, and that
-arithmetic outweighs the one global pass it saves. Recovering the throughput needs **shared-memory
-staging** (compute each prediction once) — the same hand-tuned technique the reference `.cu` uses, and
-the clear remaining lever for a *fast and* 2nd-order single-stencil kernel.
+(2) The **science path is `evolve!`** — CFL-adaptive and genuinely 2nd-order (entropy-wave convergence
+order ≈ 2, conservation to machine precision, validated as CUDA tests). Its default `:ctu` scheme is the
+**shared-memory-tiled, f16-tiled single-pass CTU** kernel — the reference `.cu`'s own technique,
+reproduced from the transpiler: each cell's transverse correction is computed *once* into a half-precision
+shared tile (the f32 update keeps conservation exact). That lands it at **~48% of the reference**,
+**1.6× over the naive single-pass and 1.17× over pure-f32 RK2** (`scheme=:rk2`, available for full f32).
+The gap from there to the 91% of the 1st-order demo is the reference's deeper hand-tuning (a leaner flux
+phase, register discipline, its specific z-march) — diminishing returns. Either way you never hand-write
+a CUDA kernel, a march, or an f16 tile.
 
 **On the CPU**, the same source runs as a SIMD-vectorized, threaded solver: ~1 Mcell/s scalar (1 core,
 3D) → **~145 Mcell/s** at the threaded peak (2D, `JULIA_NUM_THREADS ≈ 8–16`). These kernels are
@@ -110,9 +109,9 @@ transpile_selfcheck(Euler(γ=1.4f0))            # 0.0 — emitted CUDA-C ≡ Jul
 **Honest caveats.** Comparisons are *scheme-matched* (PLM vs PLM); a cheaper pure-1st-order kernel runs
 ~10,800 Mcell/s but that's not a fair comparison. The `run!` single-pass demo is 1st-order *in time* —
 use `evolve!` (2nd-order, validated) for science. GLM-MHD transpiled uses LLF where the reference uses
-HLLD (a Riemann mismatch). A single-pass 2nd-order CTU kernel exists but is compute-bound without
-shared-memory staging (see above). Throughput varies ~±15% with GPU thermal state, so compare runs in
-one process.
+HLLD (a Riemann mismatch). The default `:ctu` scheme uses an f16 shared tile for reconstruction (the
+f32 update keeps conservation exact); `scheme=:rk2` is the pure-f32 path. Throughput varies ~±15% with
+GPU thermal state, so compare runs in one process.
 
 ## Design
 
