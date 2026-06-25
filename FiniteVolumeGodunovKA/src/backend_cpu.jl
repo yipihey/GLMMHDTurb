@@ -37,9 +37,9 @@ end
 
 function max_wavespeed(g::Grid1D)
     s = g.sys
-    a = maxspeed_x(s, cons2prim(s, g.U[1]))
+    a = fastspeed_x(s, cons2prim(s, g.U[1]))
     @inbounds for i in 2:g.nx
-        a = max(a, maxspeed_x(s, cons2prim(s, g.U[i])))
+        a = max(a, fastspeed_x(s, cons2prim(s, g.U[i])))
     end
     return a
 end
@@ -107,8 +107,9 @@ Advance to `tend` with CFL-limited steps. Returns the grid (state in `g.U`).
 function evolve!(g::Grid1D{N,T}, tend; maxsteps::Int = 10^7) where {N,T}
     t = zero(T); tend = T(tend); n = 0
     while t < tend && n < maxsteps
-        dt = g.cfl * g.dx / max_wavespeed(g)
-        dt = min(dt, tend - t)
+        c = max_wavespeed(g)
+        g.sys = prestep(g.sys, c)          # dynamic cleaning speed (no-op unless GLM)
+        dt = min(g.cfl * g.dx / c, tend - t)
         step!(g, dt)
         t += dt; n += 1
     end

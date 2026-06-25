@@ -65,15 +65,17 @@ function max_wavespeed(g::Grid2D{N}) where {N}
     s = g.sys; a = zero(g.dx); py = dirperm(s, N, 2)
     @inbounds for j in 1:g.ny, i in 1:g.nx
         W = cons2prim(s, g.U[i, j])
-        a = max(a, maxspeed_x(s, W) / g.dx, maxspeed_x(s, _swap(W, py)) / g.dy)
+        a = max(a, fastspeed_x(s, W), fastspeed_x(s, _swap(W, py)))
     end
-    return a   # already per-length; dt = cfl / a
+    return a   # max fast SPEED over cells & directions
 end
 
 function evolve2d!(g::Grid2D, tend; maxsteps::Int = 10^7)
     t = 0f0; tend = Float32(tend); n = 0
     while t < tend && n < maxsteps
-        dt = min(g.cfl / max_wavespeed(g), tend - t)
+        c = max_wavespeed(g)
+        g.sys = prestep(g.sys, c)                          # dynamic cleaning speed
+        dt = min(g.cfl * min(g.dx, g.dy) / c, tend - t)    # exact for dx=dy
         step!(g, dt)
         t += dt; n += 1
     end

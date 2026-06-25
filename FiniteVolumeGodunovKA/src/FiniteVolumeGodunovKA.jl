@@ -61,6 +61,14 @@ function eig_x end
 "`(U, dt) -> U`: optional operator-split source (e.g. GLM ψ-damping). Default: identity."
 function source end
 @inline source(::FVSystem, U, dt) = U
+"`W -> |u_x| + c`: physical fast signal speed, WITHOUT any cleaning floor — used to set a global
+cleaning speed. Default = `maxspeed_x` (correct for systems with no cleaning wave)."
+function fastspeed_x end
+@inline fastspeed_x(s::FVSystem, W) = maxspeed_x(s, W)
+"`(s, cmax) -> s`: optional per-step system update given the global max fast speed (e.g. GLM sets
+ch = cmax each step). Default: identity."
+function prestep end
+@inline prestep(s::FVSystem, cmax) = s
 
 include("macro.jl")
 include("reconstruct.jl")

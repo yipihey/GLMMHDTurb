@@ -32,8 +32,10 @@ components and calling the same `physflux_x` the user wrote — is **bit-identic
 **GLM-MHD lives in the same contract.** Going from `Euler` (5 vars, momentum) to `GLMMHD` (9 vars,
 momentum *and* B) was: add variables, add the `ch` param, write `physflux_x`, and declare `vidx` as two
 vector triples — the library's rotation handled y/z automatically. Brio-Wu shock tube is stable and
-preserves the normal field exactly; the two-vector rotation isotropy is bit-exact. See
-`DESIGN_fvkernel.md` for the contract and roadmap (next: 2D SIMD/CUDA, ψ-source + HLLD, Metal/CT).
+preserves the normal field exactly; the two-vector rotation isotropy is bit-exact. GLM-MHD also has
+a ψ-damping `source`, runs on the GPU (Orszag-Tang, `Grid2DCU`), and sets the cleaning speed `ch`
+dynamically to the global max fast speed each step (via the `fastspeed_x`/`prestep` hooks). See
+`DESIGN_fvkernel.md` for the contract and roadmap (next: 2D SIMD, HLLD, Metal/CT).
 
 See `DESIGN_fvkernel.md` for the contract, the rotation/Riemann design wins, the three locked
 decisions, and the roadmap. Run the tests with `julia --project=. -e 'using Pkg; Pkg.test()'`.

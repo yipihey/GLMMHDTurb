@@ -22,11 +22,7 @@ function orszag_tang(n)
     ρ = 25f0/(36f0*Float32(π)); P = 5f0/(12f0*Float32(π))
     xs = Float32[(i-0.5f0)*d for i in 1:n]
     icW(x, y) = (ρ, -sinpi(2f0*y), sinpi(2f0*x), 0f0, P, -B0*sinpi(2f0*y), B0*sinpi(4f0*x), 0f0, 0f0)
-    ch = 0f0
-    let s0 = GLMMHD(γ=γ, ch=0f0)
-        for i in 1:n, j in 1:n; ch = max(ch, maxspeed_x(s0, icW(xs[i], xs[j]))); end
-    end
-    s = GLMMHD(γ=γ, ch=ch)
+    s = GLMMHD(γ=γ, ch=1f0)            # ch is set dynamically each step (= global max fast speed)
     U0 = [prim2cons(s, icW(xs[i], xs[j])) for i in 1:n, j in 1:n]
     g = Grid2DCU(s, U0; dx=d, dy=d, bc=:periodic, recon=PLM(), rsol=LLF(), cfl=0.4f0)
     FV.step!(g, 1f-6)                              # warmup/compile
@@ -38,7 +34,7 @@ function orszag_tang(n)
         db = abs((W[gp(i+1),j][6]-W[gp(i-1),j][6])/(2d) + (W[i,gp(j+1)][7]-W[i,gp(j-1)][7])/(2d))
         maxdiv = max(maxdiv, db); r = W[i,j][1]; rmin = min(rmin, r); rmax = max(rmax, r)
     end
-    println("OT $(n)² : ch=$(round(ch,digits=2)) wall=$(round(el,digits=2))s finite=",
+    println("OT $(n)² : ch(final,dynamic)=$(round(g.sys.ch,digits=2)) wall=$(round(el,digits=2))s finite=",
             all(all(isfinite, W[i,j]) for i in 1:n, j in 1:n),
             " ρ∈($(round(rmin,digits=3)),$(round(rmax,digits=3))) max|divB|=$(round(maxdiv,digits=3))")
     dens = Float32[W[i,j][1] for i in 1:n, j in 1:n]

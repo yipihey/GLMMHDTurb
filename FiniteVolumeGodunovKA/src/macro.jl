@@ -20,7 +20,7 @@
 # them to THIS module's generic functions — the user's methods extend ours
 # regardless of what they imported. Only user fragments (the system name, params,
 # arg names, bodies) are esc'd into the caller's scope.
-const _CONTRACT_FNS = (:cons2prim, :prim2cons, :physflux_x, :maxspeed_x, :eig_x, :source)
+const _CONTRACT_FNS = (:cons2prim, :prim2cons, :physflux_x, :maxspeed_x, :eig_x, :source, :fastspeed_x)
 _check_contract(sym::Symbol) = sym in _CONTRACT_FNS ? sym :
     error("@fvsystem: `$sym` is not a contract function $(_CONTRACT_FNS)")
 

@@ -87,12 +87,17 @@ end
          ch2*Bx)                             # F[ψ]  = ch²·Bx
     end
 
-    maxspeed_x(W, p) = begin
+    # Physical fast magnetosonic speed (no cleaning floor) — the driver maxes this over the
+    # domain to set ch each step (dynamic cleaning speed).
+    fastspeed_x(W, p) = begin
         ρ, u, v, w, P, Bx, By, Bz, ψ = W
         a2 = p.γ*P/ρ; b2 = (Bx*Bx + By*By + Bz*Bz)/ρ; bx2 = Bx*Bx/ρ
         cf = sqrt(0.5f0*(a2 + b2 + sqrt(max(0f0, (a2 + b2)*(a2 + b2) - 4f0*a2*bx2))))
-        max(abs(u) + cf, p.ch)              # fast magnetosonic, floored by the cleaning speed
+        abs(u) + cf
     end
+
+    # CFL + LLF dissipation: must cover the ψ-wave (speed ch), so floor by ch.
+    maxspeed_x(W, p) = max(fastspeed_x(p, W), p.ch)
 
     # Parabolic GLM source (operator-split): ψ decays at rate ch/cr (Dedner divergence cleaning).
     source(U, dt, p) = begin
@@ -102,3 +107,6 @@ end
 end
 
 export Euler, GLMMHD
+
+# Dynamic cleaning speed: each step the driver sets ch to the global max fast speed (Dedner).
+prestep(s::GLMMHD, cmax) = GLMMHD(s.γ, cmax, s.cr)

@@ -40,12 +40,12 @@ function _source2d_kernel!(U, s, dt, nx, ny, ::Val{N}) where {N}
     return nothing
 end
 
-function _speed2d_kernel!(spd, U, s, nx, ny, ::Val{N}, dx, dy, py) where {N}
+function _speed2d_kernel!(spd, U, s, nx, ny, ::Val{N}, py) where {N}
     i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
     if i <= nx && j <= ny
         W = cons2prim(s, _readcell2d(U, i, j, Val(N)))
-        @inbounds spd[i, j] = max(maxspeed_x(s, W) / dx, maxspeed_x(s, _swap(W, py)) / dy)
+        @inbounds spd[i, j] = max(fastspeed_x(s, W), fastspeed_x(s, _swap(W, py)))
     end
     return nothing
 end
@@ -95,14 +95,16 @@ end
 function max_wavespeed(g::Grid2DCU{N}) where {N}
     thr, blk = _cfg2d(g.nx, g.ny)
     @cuda threads=thr blocks=blk _speed2d_kernel!(g.spd, g.U, g.sys, g.nx, g.ny, Val(N),
-                                                  g.dx, g.dy, dirperm(g.sys, N, 2))
-    return maximum(g.spd)
+                                                  dirperm(g.sys, N, 2))
+    return maximum(g.spd)   # max fast SPEED over cells & directions
 end
 
 function evolve2d!(g::Grid2DCU, tend; maxsteps::Int = 10^7)
     t = 0f0; tend = Float32(tend); n = 0
     while t < tend && n < maxsteps
-        dt = min(g.cfl / max_wavespeed(g), tend - t)
+        c = max_wavespeed(g)
+        g.sys = prestep(g.sys, c)                          # dynamic cleaning speed
+        dt = min(g.cfl * min(g.dx, g.dy) / c, tend - t)    # exact for dx=dy
         step!(g, dt)
         t += dt; n += 1
     end

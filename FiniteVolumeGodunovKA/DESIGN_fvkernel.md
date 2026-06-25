@@ -136,8 +136,9 @@ If profiling ever shows the dt sync mattering at scale, revisit with a *block-hi
 3. ~~**Multi-D + rotation**~~ ✅ 2D CPU (`Grid2D`) via Strang splitting; rotation bit-exact, 2nd order.
 4. ~~**GLM-MHD via the contract**~~ ✅ 9 vars, two-vector rotation, Brio-Wu validated, ψ-damping
    `source` hook, **2D CUDA** backend (`Grid2DCU`, bit-identical to CPU), Orszag-Tang on GPU (256² to
-   t=0.5 in **0.06 s** post-warmup; 512² in 0.34 s; stable, controlled div·B). Open MHD items: dynamic
-   `ch` = global max fast speed each step; an HLLD built-in (v0 uses LLF); CT for exact div·B.
+   t=0.5 in **0.06 s** post-warmup; 512² in 0.34 s; stable, controlled div·B), and **dynamic `ch`** =
+   global max fast speed each step (the `fastspeed_x` + `prestep` contract hooks; OT div·B 2.34 → 2.06).
+   Open MHD items: an HLLD built-in (v0 uses LLF); CT for exact div·B.
 5. **2D SIMD** backend + **3D**; **CPU threads + cache-blocking**; `Vec{16}` on AVX-512.
 6. **Metal** — measure the Metal.jl gap vs its bandwidth roofline before deciding native-vs-MSL.
 7. **CT** through the reserved staggered/EMF seam (exact div·B, vs GLM's cleaning).
