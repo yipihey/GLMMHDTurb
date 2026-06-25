@@ -112,6 +112,17 @@ the update/EMF. Each phase has tiny live state → **64 regs**. This single chan
 **61 → 1206 Mcell/s**. *When:* any kernel with cross-thread flux reuse. The staged "cube" structure is
 register-optimal for *heavy* kernels; the fused march only wins for *light* kernels (S1).
 
+> **Two-sweep / staging caveat (measured negative):** staging to *remove PPM register inflation* via a
+> separate reconstruction sweep is tempting, but on a 3D tile it BACKFIRES: tested a staged two-sweep
+> hydro (each face flux once → shared, then update) — it kept registers low (PPM 56–62 vs fused) and
+> conserved exactly, but was SLOWER than the fused 2.5D march at every tile (PLM 4967 vs 6865, PPM 3745
+> vs 3995). The 3D-tile halo redundancy (~70% halo flux recompute per block) costs more than the 2×
+> face-recompute it removes; the fused march's z-streaming (zero z-halo) wins. **Staging only wins when
+> the fused kernel is genuinely register-bound to 1 block** (full-characteristic PPM at 201 regs) — for
+> the *lean parabolic* PPM, which is already register-fine fused (GLM PPM = 128 regs = PLM), staging just
+> adds halo overhead. The one structure that might still win (untried): a staged *march* (z-stream + flux
+> ring → no halo AND each face once). See `cu/spike_hys.cu` (documented negative).
+
 **S4. `--use_fast_math` (free register relief).** Approximate reciprocal/sqrt in the HLL wave-speed and
 `1/ρ` paths free ~16 registers — enough to cross a whole occupancy tier (hydro **80 regs/3 blocks/5300
 → 64/4/6800**). This is **not** a driver or compiler-version effect (we confirmed identical register
