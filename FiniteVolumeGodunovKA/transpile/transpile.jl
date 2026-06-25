@@ -122,36 +122,54 @@ extern "C" {
   float fv_maxspeed(const float* W, float gam)           { return maxspeed_x(W, gam); }
 }
 
-// LLF (Rusanov) flux in a direction obtained by swapping momentum components (a,b)
-__device__ void llf(const float* WL, const float* WR, float* F, float gam, int a, int b) {
-  float wl[5], wr[5];
-  for (int c=0;c<5;c++){ wl[c]=WL[c]; wr[c]=WR[c]; }
-  { float t=wl[a]; wl[a]=wl[b]; wl[b]=t; t=wr[a]; wr[a]=wr[b]; wr[b]=t; }
-  float UL[5], UR[5], FL[5], FR[5];
-  prim2cons(wl,UL,gam); prim2cons(wr,UR,gam);
-  physflux_x(wl,FL,gam); physflux_x(wr,FR,gam);
-  float s = fmaxf(maxspeed_x(wl,gam), maxspeed_x(wr,gam));
+// --- PLM MUSCL-Hancock (system-agnostic fixed C, calls the transpiled physics) ---
+__device__ float mc(float a, float b) {                 // monotonized-central limiter
+  if (a*b <= 0.f) return 0.f;
+  float s = (a > 0.f) ? 1.f : -1.f;
+  return s * fminf(0.5f*fabsf(a+b), fminf(2.f*fabsf(a), 2.f*fabsf(b)));
+}
+__device__ void halfstep(const float* Wm,const float* W0,const float* Wp, float lam, float gam,
+                         float* WLh, float* WRh) {        // limited faces + Hancock dt/2 predictor
+  float WL[5], WR[5];
+  for (int c=0;c<5;c++){ float d=mc(W0[c]-Wm[c], Wp[c]-W0[c]); WL[c]=W0[c]-0.5f*d; WR[c]=W0[c]+0.5f*d; }
+  float UL[5],UR[5],FL[5],FR[5]; prim2cons(WL,UL,gam); prim2cons(WR,UR,gam); physflux_x(WL,FL,gam); physflux_x(WR,FR,gam);
+  float Ul[5],Ur[5]; for (int c=0;c<5;c++){ float dh=0.5f*lam*(FR[c]-FL[c]); Ul[c]=UL[c]-dh; Ur[c]=UR[c]-dh; }
+  cons2prim(Ul,WLh,gam); cons2prim(Ur,WRh,gam);
+}
+__device__ void llf(const float* WL,const float* WR, float* F, float gam) {  // Rusanov (normal frame)
+  float UL[5],UR[5],FL[5],FR[5]; prim2cons(WL,UL,gam); prim2cons(WR,UR,gam); physflux_x(WL,FL,gam); physflux_x(WR,FR,gam);
+  float s = fmaxf(maxspeed_x(WL,gam), maxspeed_x(WR,gam));
   for (int c=0;c<5;c++) F[c] = 0.5f*(FL[c]+FR[c]) - 0.5f*s*(UR[c]-UL[c]);
-  { float t=F[a]; F[a]=F[b]; F[b]=t; }                 // un-swap the flux
+}
+// directional flux divergence (Fr-Fl) over a 5-cell stencil; (a,b)=swap into the normal frame (1,1 = x)
+__device__ void fluxdiff(const float* const W[5], float lam, float gam, int a, int b, float* out) {
+  float s[5][5];
+  for (int m=0;m<5;m++){ for (int c=0;c<5;c++) s[m][c]=W[m][c]; if(a!=b){ float t=s[m][a]; s[m][a]=s[m][b]; s[m][b]=t; } }
+  float WRm[5],WL0[5],WR0[5],WLp[5],dump[5];
+  halfstep(s[0],s[1],s[2],lam,gam,dump,WRm);
+  halfstep(s[1],s[2],s[3],lam,gam,WL0,WR0);
+  halfstep(s[2],s[3],s[4],lam,gam,WLp,dump);
+  float Fl[5],Fr[5]; llf(WRm,WL0,Fl,gam); llf(WR0,WLp,Fr,gam);
+  for (int c=0;c<5;c++) out[c]=Fr[c]-Fl[c];
+  if(a!=b){ float t=out[a]; out[a]=out[b]; out[b]=t; }
 }
 
 #define IDX(ii,jj,kk) ((((kk)*NY+(jj))*NX)+(ii))
-// fused 1st-order unsplit step: read center + 6 neighbours once, all 3 flux divergences, write once.
+// fused PLM (2nd-order) unsplit step: read the 13-cell star once, all 3 flux divergences, write once.
 __global__ void k_step(const float* r0,const float* r1,const float* r2,const float* r3,const float* r4,
                        float* o0,float* o1,float* o2,float* o3,float* o4, float lam, float gam) {
   int i=blockIdx.x*blockDim.x+threadIdx.x, j=blockIdx.y*blockDim.y+threadIdx.y, k=blockIdx.z*blockDim.z+threadIdx.z;
   if (i>=NX||j>=NY||k>=NZ) return;
-  int im=(i-1+NX)%NX, ip=(i+1)%NX, jm=(j-1+NY)%NY, jp=(j+1)%NY, km=(k-1+NZ)%NZ, kp=(k+1)%NZ;
-  #define LD(W, ii,jj,kk) { int q=IDX(ii,jj,kk); float U[5]={r0[q],r1[q],r2[q],r3[q],r4[q]}; cons2prim(U,W,gam); }
-  float Wc[5],Wxm[5],Wxp[5],Wym[5],Wyp[5],Wzm[5],Wzp[5];
-  LD(Wc,i,j,k) LD(Wxm,im,j,k) LD(Wxp,ip,j,k) LD(Wym,i,jm,k) LD(Wyp,i,jp,k) LD(Wzm,i,j,km) LD(Wzp,i,j,kp)
-  float Fxl[5],Fxr[5],Fyl[5],Fyr[5],Fzl[5],Fzr[5];
-  llf(Wxm,Wc,Fxl,gam,1,1); llf(Wc,Wxp,Fxr,gam,1,1);   // x: no swap
-  llf(Wym,Wc,Fyl,gam,1,2); llf(Wc,Wyp,Fyr,gam,1,2);   // y: swap u,v
-  llf(Wzm,Wc,Fzl,gam,1,3); llf(Wc,Wzp,Fzr,gam,1,3);   // z: swap u,w
+  #define LDP(W, ii,jj,kk) float W[5]; { int q=IDX(ii,jj,kk); float U[5]={r0[q],r1[q],r2[q],r3[q],r4[q]}; cons2prim(U,W,gam); }
+  LDP(Wc,i,j,k)
+  LDP(Xm2,(i-2+NX)%NX,j,k) LDP(Xm1,(i-1+NX)%NX,j,k) LDP(Xp1,(i+1)%NX,j,k) LDP(Xp2,(i+2)%NX,j,k)
+  LDP(Ym2,i,(j-2+NY)%NY,k) LDP(Ym1,i,(j-1+NY)%NY,k) LDP(Yp1,i,(j+1)%NY,k) LDP(Yp2,i,(j+2)%NY,k)
+  LDP(Zm2,i,j,(k-2+NZ)%NZ) LDP(Zm1,i,j,(k-1+NZ)%NZ) LDP(Zp1,i,j,(k+1)%NZ) LDP(Zp2,i,j,(k+2)%NZ)
+  const float* xl[5]={Xm2,Xm1,Wc,Xp1,Xp2}; const float* yl[5]={Ym2,Ym1,Wc,Yp1,Yp2}; const float* zl[5]={Zm2,Zm1,Wc,Zp1,Zp2};
+  float fx[5],fy[5],fz[5];
+  fluxdiff(xl,lam,gam,1,1,fx); fluxdiff(yl,lam,gam,1,2,fy); fluxdiff(zl,lam,gam,1,3,fz);
   int q=IDX(i,j,k); const float* rr[5]={r0,r1,r2,r3,r4}; float* oo[5]={o0,o1,o2,o3,o4};
-  for (int c=0;c<5;c++)
-    oo[c][q] = rr[c][q] - lam*((Fxr[c]-Fxl[c])+(Fyr[c]-Fyl[c])+(Fzr[c]-Fzl[c]));
+  for (int c=0;c<5;c++) oo[c][q] = rr[c][q] - lam*(fx[c]+fy[c]+fz[c]);
 }
 
 extern "C" double fv_run(float** q, float** o, float lam, float gam, int nsteps) {
