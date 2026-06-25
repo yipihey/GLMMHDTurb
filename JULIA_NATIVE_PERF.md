@@ -39,27 +39,41 @@ Correctness unchanged (Orszag-Tang vrms 0.7903, div·B cleaned). **NOT** applied
 is structural register reduction (Lever 2). Note: unlike nvcc (where fast-math crossed an occupancy tier,
 80→64 regs), in CUDA.jl it's a modest per-instruction win that does **not** cross tiers.
 
-## Next steps (prioritized)
+## Final Julia-native matrix (gradient IC @480, all levers applied)
 
-1. **CT structural port (done — DOCUMENTED NEGATIVE).** Ported the `.cu` fused staged f16 CT tile
-   (`spike_ct2.cu`) to a CUDA.jl `@cuda` kernel (`ct_mhd.jl ct_fused!`), f16 tile + f32 update base,
-   double-buffered, reusing the NTuple helpers. CORRECT: div·B 7.2e-5 = the 7-kernel (machine-zero),
-   fields match to ~2e-4. But **SLOWER**: best 194 (6×6×6, 1 block) vs the 7-kernel's 206. Unlike the
-   `.cu` (where the fused tile *won*, 1206 vs the multi-kernel), in CUDA.jl it loses — the shared tile
-   caps occupancy at **1 block** (the 7-kernel runs many blocks), the NG=3 halo wastes ~80–94% of the
-   tile, and Julia's 1-block codegen can't overcome it the way nvcc's does. **The Julia CT 3D-tile
-   family ceilings at ~206 (16% of the .cu 1255) — a fundamental CUDA.jl occupancy+codegen limit, not
-   fixable by this restructure.** Kept as a validated-correct negative. The only higher-headroom Julia
-   path is a z-march (no halo, full occupancy) — high codegen risk, future work.
-2. **GLM PPM register reduction (203→toward 128, 1→2 blocks).** @fastmath-coverage audit on `ppm9`/
-   `ppm_edges`/`spj`; reduce live state; the goal is 2 blocks.
-3. **Hydro structural** — the `.cu` hydro is a *march* (4 blocks); the Julia cube is 3 blocks. Either
-   lever the cube further or fix the Julia light march (`integrator_hydro_lmarch!`, 1153, warp
-   under-fill) toward a full z-stream.
-4. **Fill the matrix** — species (CMA) + PPM for each solver; KA best-effort.
+| solver | PLM | PLM + 2 species | PPM | structure |
+|---|---:|---:|---:|---|
+| **Hydro** | **4166 (61%)** | 912 (18%, lmarch) | **2663 (67%)** | cube (4-stage shared tile) |
+| **GLM-MHD** | **2094 (66%)** | — | 656 (32%) | cube |
+| **CT** | 206 (16%) | — | — | 7-kernel (fused tile = negative, 194) |
 
-## Honest expectation
+(% of the `.cu` reference: hydro 6865/5082/3995, GLM 3175/—/2064, CT 1255.)
 
-CUDA.jl register allocation is structurally ~1.3–1.5× nvcc's and fast-math is a smaller lever in Julia,
-so exact parity is unlikely. Realistic landing: hydro/GLM PLM ~65% → ~75–85%; CT the big mover
-(structural) from 16% toward ~50–70%.
+## What was tried, and the verdict
+
+- **Lever 1 — `fastmath=true`** (the `--use_fast_math` equivalent, CUDA.jl 5.11): the only broadly
+  useful lever. GLM PLM 58→66%, hydro 58→61%, applied to all production launches; OT correctness
+  unchanged. A per-instruction win that does **not** cross occupancy tiers (unlike nvcc's 80→64). Made
+  GLM PPM *worse* (SFU vs the 1-block PPM) — reverted there.
+- **Lever 2 — register reduction:** the PPM helpers (`ppm9`/`ppm_edges`/`spj`/…) were **already**
+  `@fastmath`-tagged; GLM PPM's 203 regs / 1 block is inherent codegen (vs the `.cu` lean PPM's 128 / 2),
+  no easy reduction. Stays at 32%.
+- **Lever 3 — CT fused-tile port:** CORRECT (div·B machine-zero, matches the 7-kernel to ~2e-4) but a
+  **NEGATIVE** — 194 < the 7-kernel's 206. The shared tile caps Julia at 1 block where the `.cu` ran
+  efficiently; opposite verdict to nvcc. CT ceilings at ~206 (16%).
+- **Structure does not transfer:** the `.cu`'s fastest kernels are *marches* (hydro 6800, CT 1255). In
+  Julia the march is **far slower than the cube** (hydro lmarch 1170 vs cube 4166) — warp under-fill +
+  heavier codegen. So Julia's best is the **cube**, and the cube tops at ~61–67%.
+
+## Bottom line
+
+**Pure Julia-native (CUDA.jl) tops out at ~60–67% of the `.cu` for the cube-friendly PLM/PPM cells, and
+16–37% for the cells that need a structure Julia cannot codegen efficiently (march, fused-tile, HLLD,
+the slow lmarch species path).** The gap is the irreducible CUDA.jl-vs-nvcc codegen+occupancy residual:
+CUDA.jl emits ~1.3–1.5× the registers, fast-math is a smaller lever, and the shared-tile structures that
+win for nvcc cap Julia at 1 block. This is precisely why `march_bridge` exists — driving the `.cu` from
+CUDA.jl over shared device memory is the only way to get full `.cu` throughput from a Julia workflow.
+
+KA (portable) path: `@fastmath` is in the kernel bodies; the KA launch can't take `fastmath=true`, so it
+trails CUDA.jl-native further (best-effort, as scoped). Missing matrix cells (GLM/CT species, CT PPM)
+would each need a new kernel and are capped by the same wall — low value, left as documented follow-on.

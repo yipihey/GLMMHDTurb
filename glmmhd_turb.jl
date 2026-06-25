@@ -755,11 +755,11 @@ function step_tiled!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
     # branch so each @cuda sees a CONCRETE Val (a Union{Val{true},Val{false}} confuses the launch
     # and segfaults host LLVM); the Val(true) specialization elides HLLD from the call tree.
     if lean
-        @cuda threads=nthreads blocks=(nb,nb,nb) integrator_tiled!(
+        @cuda threads=nthreads blocks=(nb,nb,nb) fastmath=true integrator_tiled!(
             Val(true), unew, uold, afield, p.gamma, p.smallr, pfl, p.smallc, dt, dx, ch, glm_fac,
             p.switch_llf_dmin, p.switch_llf_pmin, use_hlld, N, p.boxlen, ramp, p.turb_min_rho, do_turb)
     else
-        @cuda threads=nthreads blocks=(nb,nb,nb) integrator_tiled!(
+        @cuda threads=nthreads blocks=(nb,nb,nb) fastmath=true integrator_tiled!(
             Val(false), unew, uold, afield, p.gamma, p.smallr, pfl, p.smallc, dt, dx, ch, glm_fac,
             p.switch_llf_dmin, p.switch_llf_pmin, use_hlld, N, p.boxlen, ramp, p.turb_min_rho, do_turb)
     end
@@ -1247,7 +1247,7 @@ function integrator_hydro_march!(::Val{OX},::Val{OY},::Val{RIEM}, unew,uold,afie
 end
 
 @inline function _hydro_march_launch(::Val{OX},::Val{OY},rv::Val,unew,uold,afield,p::Params,pfl,dt,dx,ramp,do_turb) where {OX,OY}
-    @cuda threads=(OX*OY) blocks=(p.N÷OX,p.N÷OY,1) integrator_hydro_march!(
+    @cuda threads=(OX*OY) blocks=(p.N÷OX,p.N÷OY,1) fastmath=true integrator_hydro_march!(
         Val(OX),Val(OY),rv,unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,p.N,p.boxlen,ramp,p.turb_min_rho,do_turb)
 end
 
@@ -1518,7 +1518,7 @@ function integrator_hydro_lmarch!(::Val{OX},::Val{OY},::Val{GH},::Val{RIEM}, une
     return nothing
 end
 @inline function _lmarch_launch(::Val{OX},::Val{OY},::Val{GH},rv::Val,unew,uold,afield,p::Params,pfl,dt,dx,ramp,do_turb) where {OX,OY,GH}
-    @cuda threads=(OX*OY) blocks=(p.N÷OX,p.N÷OY,1) integrator_hydro_lmarch!(
+    @cuda threads=(OX*OY) blocks=(p.N÷OX,p.N÷OY,1) fastmath=true integrator_hydro_lmarch!(
         Val(OX),Val(OY),Val(GH),rv,unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,p.N,p.boxlen,ramp,p.turb_min_rho,do_turb)
 end
 function step_hydro_lmarch!(uold,unew,afield,p::Params,dt::Float32,t::Float32; do_turb::Bool=false, ox::Int=32, oy::Int=8, gh::Int=2, riemann::Symbol=:hll)
@@ -1624,9 +1624,9 @@ end
 function step_hydro_lmarch_sp!(uold,unew,afield,p::Params,dt::Float32,t::Float32; do_turb::Bool=false, ox::Int=32, oy::Int=8)
     dx=dxof(p); pfl=pfloor(p); ramp=min(t/p.turb_T,1f0); N=p.N
     if ox==32&&oy==8
-        @cuda threads=256 blocks=(N÷32,N÷8,1) integrator_hydro_lmarch_sp!(Val(32),Val(8),Val(:hll),unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,N,p.boxlen,ramp,p.turb_min_rho,do_turb)
+        @cuda threads=256 blocks=(N÷32,N÷8,1) fastmath=true integrator_hydro_lmarch_sp!(Val(32),Val(8),Val(:hll),unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,N,p.boxlen,ramp,p.turb_min_rho,do_turb)
     elseif ox==16&&oy==16
-        @cuda threads=256 blocks=(N÷16,N÷16,1) integrator_hydro_lmarch_sp!(Val(16),Val(16),Val(:hll),unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,N,p.boxlen,ramp,p.turb_min_rho,do_turb)
+        @cuda threads=256 blocks=(N÷16,N÷16,1) fastmath=true integrator_hydro_lmarch_sp!(Val(16),Val(16),Val(:hll),unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,N,p.boxlen,ramp,p.turb_min_rho,do_turb)
     else; error("ox=$ox oy=$oy: add a literal-Val branch"); end
     return nothing
 end
