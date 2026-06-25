@@ -110,17 +110,36 @@ read normal-B from global in the flux routine → shared 66→48 KB at OZ=3 → 
 | `spike_ct4.cu` mag-only + recompute hydro | 492 | 128 | 2 | recompute blows regs — negative |
 
 The mag-only/recompute path is a trap (the cube>march lesson once more: 6 live recomputed fluxes →
-128 regs). **Final hand-tuned CT: 1501 Mcell/s @480** — **9.4× the production CT (160)**, **~78% of
-the GLM cube (1923)**, **~48% of the GLM march (3100)** — with **exact (machine-zero) div·B** where
-GLM only cleans it. **Verdict: the production CT's ~9× deficit was layout + orchestration, NOT the
-scheme; a hand-tuned f16 staged CT is GLM-cube-class with a hard div·B=0.** Remaining lever: the 2.5D z-streaming march (kills the z-halo → more blocks) — **attempted
-(`spike_ctm.cu`), does NOT transfer.** Unlike the GLM march (no cross-plane flux coupling), CT's
-edge-EMF couples planes, so the periodic z-wrap breaks the forward pipeline: plane 0's face-B needs
-plane NZ−1's magnetic flux (computed last), and plane NZ−1 needs plane 0's (already evicted from the
-3-plane mag ring) — both boundary planes have wrap dependencies the small ring can't hold (needs
-persistent boundary storage or a 2nd sweep). The lag also splits mag/hydro flux computation across
-steps (recompute redundancy), and 256-thread tiles fall back to ~1 block. **Conclusion: ct3's 1501
-is the hand-tuned A6000 ceiling for staged f16 CT; the streaming win is GLM-specific.**
+128 regs). Staged 3D-tile CT (`spike_ct3.cu`) = 1501 Mcell/s @480.
+
+### ★★ 2.5D z-STREAMING CT MARCH (`spike_ctm.cu`) — the NEW BEST: ~1560 Mcell/s @480
+
+The streaming win *does* transfer to CT after all — once the periodic-z pipeline is solved.
+**Each block owns a full z-column (no z block-seam), streaming z through a 5-plane prim ring +
+3-plane mag-flux ring (f16); inline hydro, face-B updated with lag 2.** The blocker — plane 0's
+EMF needs plane NZ−1's magnetic flux (computed last in a forward sweep) — is solved by **priming
+the ring with the wrap planes** before the sweep (`loadp(-3..-1)` + computing `magflux(-1)`). That
+priming *is* the "permanent periodic-copy buffer" idea: it converts the wrap-dependency into a
+clean linear sweep, no extra global memory. (Two bugs found en route: missing priming → garbage
+z-stencil; and the `magflux` loop guarded `L≥1` so it never computed the wrap plane's flux →
+EX/EY read uninitialized → NaN. Both fixed.)
+
+Tile sweep @480 (all 64–133 regs, div·B 7.6e-5 = Julia, validated tile-independent):
+
+| tile (z-streamed) | shmem | blocks | Mcell/s |
+|---|---|---|---:|
+| 16×12 / 24×8 | 44–47 KB | 2 | **~1560** |
+| 32×8 | 60 KB | 1 | 1398 |
+| 16×16 | 54 KB | 1 | 1377 |
+| 8×8 | 22 KB | 4* | 1115 (only 64 threads) |
+
+**Final hand-tuned CT: ~1560 Mcell/s @480 (2.5D march)** — **9.75× the production CT (160)**,
+**~81% of the GLM cube (1923)**, **~50% of the GLM march (3100)** — with **exact (machine-zero)
+div·B** where GLM only cleans it. **Verdict: the production CT's ~10× deficit was entirely layout +
+orchestration; a hand-tuned f16 CT is GLM-cube-class with a hard div·B=0. The streaming structure
+DOES carry to CT** (the periodic-wrap pipeline just needs ring priming — credit: user's
+ghost-buffer insight). Ceiling now set by 128–133 regs + dual-ring shared (2 blocks); H200 (more
+regs/shared) is the next lever.
 
 ## Production solver throughput (prior sessions, for context)
 

@@ -168,15 +168,20 @@ __global__ void __launch_bounds__(THREADS) ct_march(Ptrs q, Ptrs o){
     extern __shared__ __half sm[];
     __half* PR=sm; __half* MR=sm + 8*5*PT;
     int tid=threadIdx.x, tx=tid%OX, ty=tid/OX, x0=blockIdx.x*OX, y0=blockIdx.y*OY, li=tx+NG, lj=ty+NG;
+    auto loadp=[&](int kp){ int s=R5(kp);     // load prim plane kp (periodic wrap) into ring slot
+        for(int c=tid;c<PT;c+=THREADS){ int lx=c%TX,ly=c/TX;
+            size_t g=gidx(wrap(x0-NG+lx,NX),wrap(y0-NG+ly,NY),wrap(kp,NZ));
+            PR[0*5*PT+s*PT+c]=(__half)q.U[0][g];PR[1*5*PT+s*PT+c]=(__half)q.U[1][g];PR[2*5*PT+s*PT+c]=(__half)q.U[2][g];
+            PR[3*5*PT+s*PT+c]=(__half)q.U[3][g];PR[4*5*PT+s*PT+c]=(__half)q.U[4][g];
+            PR[5*5*PT+s*PT+c]=(__half)q.cx[g];PR[6*5*PT+s*PT+c]=(__half)q.cy[g];PR[7*5*PT+s*PT+c]=(__half)q.cz[g]; } };
+    // PRIME: pre-load the periodic wrap planes -3,-2,-1 (= NZ-3..NZ-1) so the first magflux's z-stencil
+    // and plane-0's update see real periodic data — converts the wrap-dependency to a linear sweep.
+    loadp(-3); loadp(-2); loadp(-1); __syncthreads();
     for(int L=0; L<NZ+2; L++){
-        if(L<NZ+0){ int s=R5(L);              // load prim plane L (periodic wrap)
-            for(int c=tid;c<PT;c+=THREADS){ int lx=c%TX,ly=c/TX;
-                size_t g=gidx(wrap(x0-NG+lx,NX),wrap(y0-NG+ly,NY),wrap(L,NZ));
-                PR[0*5*PT+s*PT+c]=(__half)q.U[0][g];PR[1*5*PT+s*PT+c]=(__half)q.U[1][g];PR[2*5*PT+s*PT+c]=(__half)q.U[2][g];
-                PR[3*5*PT+s*PT+c]=(__half)q.U[3][g];PR[4*5*PT+s*PT+c]=(__half)q.U[4][g];
-                PR[5*5*PT+s*PT+c]=(__half)q.cx[g];PR[6*5*PT+s*PT+c]=(__half)q.cy[g];PR[7*5*PT+s*PT+c]=(__half)q.cz[g]; } }
+        if(L<NZ) loadp(L);
         __syncthreads();
-        if(L>=1){ int m=L-1, s=R3(m);          // mag fluxes of plane m over owned±1 halo
+        { int m=L-1, s=R3(m);                  // mag fluxes of plane m (m=-1 at L=0: the wrap plane,
+                                               // valid thanks to priming) over the owned±1 halo
             for(int c=tid;c<(OX+2)*(OY+2);c+=THREADS){ int lx=c%(OX+2)+NG-1, ly=c/(OX+2)+NG-1; int idx=lx+TX*ly;
                 F8 fx=fflm(PR,q,0,m,lx,ly,x0,y0),fy=fflm(PR,q,1,m,lx,ly,x0,y0),fz=fflm(PR,q,2,m,lx,ly,x0,y0);
                 MR[0*3*PT+s*PT+idx]=(__half)fx.by;MR[1*3*PT+s*PT+idx]=(__half)fx.bz;
