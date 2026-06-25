@@ -867,7 +867,7 @@ end
 # Val(tb)/Val(riemann) is type-unstable and crashes the host LLVM), so step_plm! branches below.
 @inline function _plm_launch(tv::Val, hv::Val, rv::Val, nthreads, nb, unew, uold, afield, p::Params,
                              pfl, dt, dx, ch, glm_fac, ramp, do_turb)
-    @cuda threads=nthreads blocks=(nb,nb,nb) integrator_plm!(
+    @cuda threads=nthreads blocks=(nb,nb,nb) fastmath=true integrator_plm!(
         tv, hv, rv, unew, uold, afield, p.gamma, p.smallr, pfl, p.smallc, dt, dx, ch, glm_fac,
         p.switch_llf_dmin, p.switch_llf_pmin, p.N, p.boxlen, ramp, p.turb_min_rho, do_turb)
 end
@@ -1136,7 +1136,7 @@ function integrator_hydro!(::Val{TB},::Val{HALF},::Val{RIEM}, unew, uold, afield
 end
 
 @inline function _hydro_launch(tv::Val,hv::Val,rv::Val,nthreads,nb,unew,uold,afield,p::Params,pfl,dt,dx,ramp,do_turb)
-    @cuda threads=nthreads blocks=(nb,nb,nb) integrator_hydro!(
+    @cuda threads=nthreads blocks=(nb,nb,nb) fastmath=true integrator_hydro!(
         tv,hv,rv,unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,p.N,p.boxlen,ramp,p.turb_min_rho,do_turb)
 end
 # Pure-hydro PLM step. Default = MonCen-PLM + Hancock + HLL, f16, TB auto (6 if N%6==0 else 4).
@@ -1731,7 +1731,7 @@ function integrator_hydro_ppm!(::Val{TB},::Val{HALF},::Val{RIEM}, unew, uold, af
 end
 
 @inline function _hydro_ppm_launch(tv::Val,hv::Val,rv::Val,nthreads,nb,unew,uold,afield,p::Params,pfl,dt,dx,ramp,do_turb)
-    @cuda threads=nthreads blocks=(nb,nb,nb) integrator_hydro_ppm!(
+    @cuda threads=nthreads blocks=(nb,nb,nb) fastmath=true integrator_hydro_ppm!(
         tv,hv,rv,unew,uold,afield,p.gamma,p.smallr,pfl,p.smallc,dt,dx,p.N,p.boxlen,ramp,p.turb_min_rho,do_turb)
 end
 
