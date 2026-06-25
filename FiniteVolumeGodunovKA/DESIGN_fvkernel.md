@@ -105,6 +105,25 @@ Implemented and **passing** (`test/runtests.jl`):
   over all triples) handled the rest. Brio-Wu shock tube: stable, positive, mass-conserving, and the
   normal field Bx is preserved to **max |Bx − 0.75| = 0** — exactly.
 
+## Documented negative — device-resident "lagged" dt (don't re-attempt naively)
+
+Hypothesis: the per-step `dt` (a wavespeed reduction read back to the host) serializes the GPU, so
+fold the wavespeed into the sweep (free — it already evaluates `maxspeed_x`) to set the *next* step's
+`dt`, keep `dt`/`t` on the device, and sync only every K steps. Built it, validated it **correct**
+(agrees with `:exact` to max |Δρ| ≈ 5e-4, identical div·B), and measured: it ran **~8× slower** (256²
+OT t=0.5: 0.06 s exact vs 0.53 s lagged). Two lessons:
+
+1. **The per-step host sync was never the bottleneck.** `:exact` runs 256² OT in **0.06 s** (~85 µs/step
+   incl. the speed kernel + `maximum` reduction + sync). An earlier "2.6 s" figure was *compilation*,
+   not runtime — always warm up before timing.
+2. **Don't replace a parallel reduction with a single-address atomic.** Folding the wavespeed in via
+   `CUDA.@atomic amax[1] = max(...)` makes all 65536 cells atomic-max into *one* scalar → fully
+   serialized (~700 steps × 65536 atomics ≈ the 0.5 s observed). `maximum(spd)` is a proper
+   hierarchical reduction and wins decisively.
+
+If profiling ever shows the dt sync mattering at scale, revisit with a *block-hierarchical* reduction
+(one atomic per block), never per-cell atomics. For now `:exact` is the right design.
+
 ## Roadmap (priority order)
 
 1. ~~**SIMD-CPU backend**~~ ✅ done (single-core, ~5–7× over scalar, bit-identical). Next CPU
@@ -116,9 +135,9 @@ Implemented and **passing** (`test/runtests.jl`):
    only where needed; move CUDA to a **weakdep + package extension** so CPU-only installs stay light.
 3. ~~**Multi-D + rotation**~~ ✅ 2D CPU (`Grid2D`) via Strang splitting; rotation bit-exact, 2nd order.
 4. ~~**GLM-MHD via the contract**~~ ✅ 9 vars, two-vector rotation, Brio-Wu validated, ψ-damping
-   `source` hook, **2D CUDA** backend (`Grid2DCU`, bit-identical to CPU), Orszag-Tang on GPU (256², 2.6 s,
-   stable, controlled div·B). Open MHD items: dynamic `ch` = global max fast speed each step; an HLLD
-   built-in (v0 uses LLF); CT for exact div·B.
+   `source` hook, **2D CUDA** backend (`Grid2DCU`, bit-identical to CPU), Orszag-Tang on GPU (256² to
+   t=0.5 in **0.06 s** post-warmup; 512² in 0.34 s; stable, controlled div·B). Open MHD items: dynamic
+   `ch` = global max fast speed each step; an HLLD built-in (v0 uses LLF); CT for exact div·B.
 5. **2D SIMD** backend + **3D**; **CPU threads + cache-blocking**; `Vec{16}` on AVX-512.
 6. **Metal** — measure the Metal.jl gap vs its bandwidth roofline before deciding native-vs-MSL.
 7. **CT** through the reserved staggered/EMF seam (exact div·B, vs GLM's cleaning).
