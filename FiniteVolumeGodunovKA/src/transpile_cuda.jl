@@ -123,10 +123,54 @@ __global__ void k_step(const float* R, float* O, int nx,int ny,int nz, float lam
   SWC(za,Zm2,swap_z) SWC(zb,Zm1,swap_z) SWC(zc,Wc,swap_z) SWC(zd,Zp1,swap_z) SWC(ze,Zp2,swap_z)
   const float* zl[5]={za,zb,zc,zd,ze}; float fz[NV]; fluxdiff(zl,lam,PRM,fz); swap_z(fz);
   long q=IDX(i,j,k); for(int c=0;c<NV;c++) O[(long)c*VOL+q] = R[(long)c*VOL+q] - lam*(fx[c]+fy[c]+fz[c]); }
+// per-cell sum of the three directional signal speeds (the unsplit-CFL quantity); host reduces the max.
+__global__ void k_speed(const float* R, float* spd, int nx,int ny,int nz, const float* PRM){
+  int i=blockIdx.x*blockDim.x+threadIdx.x, j=blockIdx.y*blockDim.y+threadIdx.y, k=blockIdx.z*blockDim.z+threadIdx.z;
+  if(i>=nx||j>=ny||k>=nz) return; long VOL=(long)nx*ny*nz;
+  LDP(W,i,j,k) SWC(wy,W,swap_y) SWC(wz,W,swap_z)
+  spd[IDX(i,j,k)] = maxspeed_x(W,PRM)+maxspeed_x(wy,PRM)+maxspeed_x(wz,PRM); }
+extern "C" void fv_speed(float* R, float* spd, int nx,int ny,int nz, const float* PRM){
+  dim3 thr(8,8,4), grp((nx+7)/8,(ny+7)/8,(nz+3)/4); k_speed<<<grp,thr>>>(R,spd,nx,ny,nz,PRM); cudaDeviceSynchronize(); }
 extern "C" void fv_run(float* R, float* O, int nx,int ny,int nz, float lam, const float* PRM, int nsteps){
   dim3 thr(8,8,4), grp((nx+7)/8,(ny+7)/8,(nz+3)/4); float *a=R,*b=O;
   for(int s=0;s<nsteps;s++){ k_step<<<grp,thr>>>(a,b,nx,ny,nz,lam,PRM); float* t=a; a=b; b=t; }
   if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);   // result always in R
+  cudaDeviceSynchronize(); }
+// ---- genuinely 2nd-order path (MUSCL + SSP-RK2): Hancock-free PLM reconstruction + LLF, RK2 in time ----
+__device__ void recon(const float* Wm,const float* W0,const float* Wp,float* WL,float* WR){
+  for(int c=0;c<NV;c++){ float d=mc(W0[c]-Wm[c],Wp[c]-W0[c]); WL[c]=W0[c]-0.5f*d; WR[c]=W0[c]+0.5f*d; } }
+__device__ void fluxdiff_rk(const float* const W[5],const float* PRM,float* out){
+  float WLm[NV],WRm[NV],WL0[NV],WR0[NV],WLp[NV],WRp[NV];
+  recon(W[0],W[1],W[2],WLm,WRm); recon(W[1],W[2],W[3],WL0,WR0); recon(W[2],W[3],W[4],WLp,WRp);
+  float Fl[NV],Fr[NV]; llf(WRm,WL0,Fl,PRM); llf(WR0,WLp,Fr,PRM); for(int c=0;c<NV;c++) out[c]=Fr[c]-Fl[c]; }
+#define LDPS(W,src,ii,jj,kk) float W[NV]; { long q=IDX(ii,jj,kk); float U[NV]; for(int c=0;c<NV;c++) U[c]=src[(long)c*VOL+q]; cons2prim(U,W,PRM); }
+// D = lam*(div F) for the conservative state in S at cell (i,j,k); the per-stage RK increment.
+__device__ void compute_D(const float* S,int i,int j,int k,int nx,int ny,int nz,float lam,const float* PRM,float* D){
+  long VOL=(long)nx*ny*nz;
+  LDPS(Wc,S,i,j,k)
+  LDPS(Xm2,S,(i-2+nx)%nx,j,k) LDPS(Xm1,S,(i-1+nx)%nx,j,k) LDPS(Xp1,S,(i+1)%nx,j,k) LDPS(Xp2,S,(i+2)%nx,j,k)
+  const float* xl[5]={Xm2,Xm1,Wc,Xp1,Xp2}; float fx[NV]; fluxdiff_rk(xl,PRM,fx);
+  LDPS(Ym2,S,i,(j-2+ny)%ny,k) LDPS(Ym1,S,i,(j-1+ny)%ny,k) LDPS(Yp1,S,i,(j+1)%ny,k) LDPS(Yp2,S,i,(j+2)%ny,k)
+  SWC(ya,Ym2,swap_y) SWC(yb,Ym1,swap_y) SWC(yc,Wc,swap_y) SWC(yd,Yp1,swap_y) SWC(ye,Yp2,swap_y)
+  const float* yl[5]={ya,yb,yc,yd,ye}; float fy[NV]; fluxdiff_rk(yl,PRM,fy); swap_y(fy);
+  LDPS(Zm2,S,i,j,(k-2+nz)%nz) LDPS(Zm1,S,i,j,(k-1+nz)%nz) LDPS(Zp1,S,i,j,(k+1)%nz) LDPS(Zp2,S,i,j,(k+2)%nz)
+  SWC(za,Zm2,swap_z) SWC(zb,Zm1,swap_z) SWC(zc,Wc,swap_z) SWC(zd,Zp1,swap_z) SWC(ze,Zp2,swap_z)
+  const float* zl[5]={za,zb,zc,zd,ze}; float fz[NV]; fluxdiff_rk(zl,PRM,fz); swap_z(fz);
+  for(int c=0;c<NV;c++) D[c]=lam*(fx[c]+fy[c]+fz[c]); }
+__global__ void k_euler(const float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM){
+  int i=blockIdx.x*blockDim.x+threadIdx.x,j=blockIdx.y*blockDim.y+threadIdx.y,k=blockIdx.z*blockDim.z+threadIdx.z;
+  if(i>=nx||j>=ny||k>=nz) return; long VOL=(long)nx*ny*nz,q=IDX(i,j,k);
+  float D[NV]; compute_D(R,i,j,k,nx,ny,nz,lam,PRM,D); for(int c=0;c<NV;c++) O[(long)c*VOL+q]=R[(long)c*VOL+q]-D[c]; }
+__global__ void k_rk2b(const float* R,const float* U1,float* O,int nx,int ny,int nz,float lam,const float* PRM){
+  int i=blockIdx.x*blockDim.x+threadIdx.x,j=blockIdx.y*blockDim.y+threadIdx.y,k=blockIdx.z*blockDim.z+threadIdx.z;
+  if(i>=nx||j>=ny||k>=nz) return; long VOL=(long)nx*ny*nz,q=IDX(i,j,k);
+  float D[NV]; compute_D(U1,i,j,k,nx,ny,nz,lam,PRM,D);
+  for(int c=0;c<NV;c++) O[(long)c*VOL+q]=0.5f*(R[(long)c*VOL+q]+U1[(long)c*VOL+q]-D[c]); }
+extern "C" void fv_run_rk2(float* R,float* T,float* O,int nx,int ny,int nz,float lam,const float* PRM,int nsteps){
+  dim3 thr(8,8,4),grp((nx+7)/8,(ny+7)/8,(nz+3)/4); float* curr=R; float* sc=O;
+  for(int s=0;s<nsteps;s++){ k_euler<<<grp,thr>>>(curr,T,nx,ny,nz,lam,PRM);
+    k_rk2b<<<grp,thr>>>(curr,T,sc,nx,ny,nz,lam,PRM); float* t=curr; curr=sc; sc=t; }
+  if(curr!=R) cudaMemcpy(R,curr,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
   cudaDeviceSynchronize(); }
 """, "NV" => string(NV))
     "#include <cuda_runtime.h>\n#include <math.h>\n#define NV $NV\n\n" *
@@ -167,8 +211,10 @@ end
 
 mutable struct Grid3DCuMarch{N,S<:FVSystem}
     sys::S
-    R::CuVector{Float32}; O::CuVector{Float32}; prm::CuVector{Float32}   # state = (NV*nx*ny*nz) var-major
-    frun::Ptr{Cvoid}
+    R::CuVector{Float32}; O::CuVector{Float32}; T::CuVector{Float32}     # state + 2 scratch (var-major)
+    prm::CuVector{Float32}
+    spd::CuVector{Float32}                                               # scratch: per-cell CFL speed
+    frun::Ptr{Cvoid}; frun2::Ptr{Cvoid}; fspeed::Ptr{Cvoid}
     nx::Int; ny::Int; nz::Int; dx::Float32
 end
 
@@ -182,17 +228,60 @@ function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::St
     end
     R = CuArray(Uh)
     prm = CuArray(Float32[getfield(sys, p) for p in _fvmeta(sys).params])
-    Grid3DCuMarch{N,typeof(sys)}(sys, R, CUDA.zeros(Float32, N*VOL), prm,
-                                 Libdl.dlsym(lib, :fv_run), nx, ny, nz, Float32(dx))
+    Grid3DCuMarch{N,typeof(sys)}(sys, R, CUDA.zeros(Float32, N*VOL), CUDA.zeros(Float32, N*VOL), prm,
+                                 CUDA.zeros(Float32, VOL),
+                                 Libdl.dlsym(lib, :fv_run), Libdl.dlsym(lib, :fv_run_rk2),
+                                 Libdl.dlsym(lib, :fv_speed), nx, ny, nz, Float32(dx))
 end
 
 @inline _devptr(x) = reinterpret(Ptr{Float32}, UInt(UInt64(pointer(x))))
 
-"Run `nsteps` of the transpiled kernel at fixed `dt` (result left in `g.R`)."
+"Run `nsteps` of the fast 1st-order-in-time fused single-pass kernel at fixed `dt` (the throughput
+benchmark; result left in `g.R`). For science use the 2nd-order `evolve!`/`run_rk2!`."
 function run!(g::Grid3DCuMarch, dt, nsteps::Integer)
     ccall(g.frun, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Cfloat, Ptr{Float32}, Cint),
           _devptr(g.R), _devptr(g.O), g.nx, g.ny, g.nz, Float32(dt)/g.dx, _devptr(g.prm), Int32(nsteps))
     return g
+end
+
+"Run `nsteps` of the genuinely 2nd-order MUSCL + SSP-RK2 scheme at fixed `dt` (result left in `g.R`)."
+function run_rk2!(g::Grid3DCuMarch, dt, nsteps::Integer)
+    ccall(g.frun2, Cvoid, (Ptr{Float32}, Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Cfloat, Ptr{Float32}, Cint),
+          _devptr(g.R), _devptr(g.T), _devptr(g.O), g.nx, g.ny, g.nz, Float32(dt)/g.dx, _devptr(g.prm), Int32(nsteps))
+    return g
+end
+
+"Max over cells of the per-cell summed directional signal speed (the unsplit-CFL quantity, on device)."
+function maxspeed_sum(g::Grid3DCuMarch)
+    ccall(g.fspeed, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Ptr{Float32}),
+          _devptr(g.R), _devptr(g.spd), g.nx, g.ny, g.nz, _devptr(g.prm))
+    Float32(maximum(g.spd))
+end
+
+"CFL-stable timestep: `cfl·dx / max_cell(sx+sy+sz)` (cfl ≤ 1 for the fused unsplit update)."
+dt_cfl(g::Grid3DCuMarch; cfl = 0.4f0) = Float32(cfl) * g.dx / maxspeed_sum(g)
+
+"""
+    evolve!(g::Grid3DCuMarch, tend; cfl=0.4f0, dtevery=4, maxsteps=10^7) -> g
+
+Integrate to physical time `tend` with adaptive CFL timesteps (recomputed every `dtevery` steps, with
+a `cfl` margin to cover speed growth between recomputes). Result is left in `g.R`.
+"""
+function evolve!(g::Grid3DCuMarch, tend; cfl = 0.4f0, dtevery::Integer = 4, maxsteps::Integer = 10^7)
+    t = 0.0f0; tend = Float32(tend); n = 0; dt = 0.0f0
+    while t < tend && n < maxsteps
+        (n % dtevery == 0) && (dt = dt_cfl(g; cfl = cfl))
+        dts = min(dt, tend - t)
+        run_rk2!(g, dts, 1)            # genuinely 2nd-order in space & time
+        t += dts; n += 1
+    end
+    return (g = g, t = t, nsteps = n)
+end
+
+"Conserved totals Σ U · dx³ (var-major), for the conservation check."
+function conserved_total(g::Grid3DCuMarch{N}) where {N}
+    VOL = g.nx*g.ny*g.nz; v = g.dx^3
+    ntuple(c -> Float32(sum(@view g.R[(c-1)*VOL+1 : c*VOL]) * v), Val(N))
 end
 
 function primitives(g::Grid3DCuMarch{N}) where {N}

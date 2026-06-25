@@ -71,17 +71,23 @@ library is to get *close to that* — for **any** system — while you write onl
 
 ### What this library delivers from one `@fvsystem` stencil
 
-GPU, 3D Euler PLM, vs the hand-tuned reference (6865):
+GPU, 3D Euler, vs the hand-tuned reference (6865):
 
-| backend | what it is | Euler 3D | vs `.cu` 6865 |
+| backend / scheme | what it is | Euler 3D | vs `.cu` 6865 |
 |---|---|---:|---:|
-| `Grid3DCU` (native CUDA) | dimensional split, CUDA.jl codegen | ~2550 Mcell/s | **~37–42%** |
-| **`Grid3DCuMarch`** (transpile→nvcc) | emits the stencil as CUDA-C, nvcc | **~6000 Mcell/s** | **~85–90%** |
+| `Grid3DCU` (native CUDA) | dimensional-split **2nd-order**, CUDA.jl codegen | ~2550 Mcell/s | ~37–42% |
+| `Grid3DCuMarch` · **`evolve!`** | **validated 2nd-order solver** (MUSCL + SSP-RK2), CFL-adaptive | ~2580 Mcell/s | ~38% |
+| `Grid3DCuMarch` · `run!` | 1st-order-in-time fused **single-pass throughput demo** | **~6000 Mcell/s** | **~85–90%** |
 
-The headline: the **native CUDA** path is fully portable (bit-identical on every backend, needs no nvcc)
-at ~40% of the hand-tuned ceiling; the **transpile path** reaches **~85–90% of the hand-tuned `.cu`** —
-and the transpiled physics is **bit-identical to your Julia functions** (`transpile_selfcheck` → `0.0`).
-You never hand-write a CUDA kernel, a march, or an f16 tile.
+Two honest readings. (1) The **transpiler emits `.cu`-class code**: its fused single-pass kernel hits
+**~85–90% of the hand-tuned reference** — and the transpiled physics is **bit-identical to your Julia
+functions** (`transpile_selfcheck` → `0.0`). But that kernel is 1st-order in time (it can't alternate
+sweep order the way a split solver does), so it's a *throughput demonstration*, not the science path.
+(2) The **science path is `evolve!`** — a genuinely 2nd-order MUSCL + SSP-RK2 solver with CFL-adaptive
+timestepping, **validated** (entropy-wave convergence order ≈ 2, conservation to machine precision). Two
+RK stages cost ~2×, landing it at ~38% of the reference — on par with the native 2nd-order CUDA backend.
+Closing *that* gap (the reference reaches 2nd order in a single pass via a transverse CTU predictor) is
+the next optimization. Either way you never hand-write a CUDA kernel, a march, or an f16 tile.
 
 **On the CPU**, the same source runs as a SIMD-vectorized, threaded solver: ~1 Mcell/s scalar (1 core,
 3D) → **~145 Mcell/s** at the threaded peak (2D, `JULIA_NUM_THREADS ≈ 8–16`). These kernels are
@@ -90,15 +96,17 @@ memory-bandwidth bound, so they peak at ~8–16 threads — **don't over-subscri
 
 ```julia
 g = Grid3DCuMarch(Euler(γ=1.4f0), U0; dx=dx)   # transpiles the stencil + nvcc-compiles + loads
-run!(g, dt, 1000)                              # ~.cu-class throughput
+evolve!(g, 0.2f0)                              # the science path: CFL-adaptive, 2nd-order (MUSCL+SSP-RK2)
+run!(g, dt, 1000)                              # the fast 1st-order single-pass throughput demo
 transpile_selfcheck(Euler(γ=1.4f0))            # 0.0 — emitted CUDA-C ≡ Julia physics, bit-exact
 ```
 
-**Honest caveats.** The `.cu` 6865 is 2nd-order PLM; comparisons are *scheme-matched* (PLM vs PLM) — a
-cheaper 1st-order kernel runs ~10,800 Mcell/s (157%) but that's not a fair comparison. GLM-MHD transpiled
-hits ~`.cu`-class but currently uses LLF where the reference uses HLLD (a Riemann mismatch). The last
-~10% to the reference is its hand-tuned march/f16 — a fixed, system-agnostic C-template optimization not
-yet ported. Throughput also varies ~±15% with GPU thermal state, so compare runs in one process.
+**Honest caveats.** Comparisons are *scheme-matched* (PLM vs PLM); a cheaper pure-1st-order kernel runs
+~10,800 Mcell/s but that's not a fair comparison. The `run!` single-pass demo is 1st-order *in time* —
+use `evolve!` (2nd-order, validated) for science. GLM-MHD transpiled uses LLF where the reference uses
+HLLD (a Riemann mismatch). The reference reaches 2nd order in one pass (transverse CTU predictor); the
+RK2 solver takes two — porting CTU is the route to a single-pass 2nd-order transpile kernel. Throughput
+varies ~±15% with GPU thermal state, so compare runs in one process.
 
 ## Design
 

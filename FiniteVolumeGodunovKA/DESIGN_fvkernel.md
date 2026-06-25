@@ -159,11 +159,11 @@ is a working v0 for `Euler`:
 - nvcc `--use_fast_math` → `.so`, run over `CuArray`s via the `march_bridge` `ccall` mechanism.
 - **The transpiled C physics is BIT-IDENTICAL to the Julia functions** (max|Δ| = 0 over 2000 random
   states) — the part that proves the transpiler.
-- A fused **2nd-order PLM MUSCL-Hancock** nvcc kernel (scheme-matched to the `.cu`) reaches **87–94% of
-  the hand-tuned `.cu` 6865** (5993–6428 Mcell/s, 256–480³) — vs the native CUDA.jl backend's ~37%. The
-  transpile path essentially **closes the gap to the `.cu` from the same branch-free Julia source.**
-  (A 1st-order LLF kernel runs ~10,800 = 157%, i.e. faster than the 2nd-order `.cu` because it's cheaper
-  per cell — useful as an upper bound, not a fair comparison.)
+- A fused single-pass **PLM MUSCL-Hancock** nvcc kernel (2nd-order in *space*) reaches **85–90% of the
+  hand-tuned `.cu` 6865** (5236–6428 Mcell/s, 256–480³) — vs the native CUDA.jl backend's ~37%. This is
+  the *throughput demonstration* that the transpiler emits `.cu`-class code. **But it is 1st-order in
+  *time*** (see "Making it a real solver" below) — a fused kernel does all directions simultaneously
+  (Lie splitting) and can't alternate sweep order, so it is a benchmark, not the science path.
 
 So the two-backend design is fully realized: **portable native (~37%, bit-identical on scalar/SIMD/CUDA
 × 1D/2D/3D, runs everywhere) + transpile-to-nvcc (~90% of the `.cu`, NVIDIA), from one `@fvsystem`
@@ -181,8 +181,33 @@ reconstruction/Riemann are NVARS-generic fixed C. Validated on BOTH from one pip
   bound; the point is it *generalizes* and hits `.cu`-class).
 
 So the transpile backend is general: write any system in `@fvsystem`, get `.cu`-class CUDA from the same
-source. Remaining: HLLD in the transpiled kernel (fair GLM compare); the march/f16 C template (last ~10%
-for hydro); CT transpile (staggered structure); package as a `CuMarch` backend.
+source. Remaining: HLLD in the transpiled kernel (fair GLM compare); the march/f16 C template; CT
+transpile (staggered structure).
+
+## Making it a real solver — CFL timestepping + 2nd-order, validated
+
+The `Grid3DCuMarch` v0 was a fixed-`dt` throughput demo. Promoting it to a usable solver surfaced a
+real scheme finding and a fix:
+
+- **On-device CFL timestep.** A `k_speed` kernel writes per-cell `(sx+sy+sz)` (the summed directional
+  signal speeds — the unsplit-CFL quantity); the host reduces the max and sets `dt = cfl·dx/max`.
+  `evolve!(g, tend)` integrates to a physical end time, recomputing `dt` every `dtevery` steps.
+- **The convergence test caught a 1st-order scheme.** On a smooth entropy wave (exact solution known),
+  the fused single-pass kernel converged at **order ~1.1**, while the scalar backend — same MC limiter,
+  same problem — hit **~2.0**. So it wasn't the limiter: the fused kernel is **1st-order in time**
+  (simultaneous directions = Lie splitting; a fused kernel *can't* alternate sweep order, which is how
+  the split backends recover 2nd order).
+- **Fix: MUSCL + SSP-RK2.** Added a Hancock-free PLM+LLF flux operator integrated with SSP-RK2 (Heun) —
+  textbook 2nd-order in space *and* time. `evolve!` uses it. Validated: entropy-wave convergence
+  **order ≈ 1.9**, mass & energy conserved to **machine zero** (periodic), and it agrees with the scalar
+  2nd-order backend to **below** each one's own discretization error. These are now CUDA-guarded tests.
+- **The cost, honestly.** RK2 is two stages → ~2× the single-pass demo: the 2nd-order solver runs
+  **~2580 Mcell/s (~38% of the `.cu`)**, on par with the native 2nd-order CUDA backend. The reference
+  reaches 2nd order in *one* pass via a transverse **CTU** predictor; porting CTU is the route to a
+  single-pass 2nd-order transpile kernel (recovering most of the 2× toward the ~85–90% the demo shows).
+
+Net: `run!` = the 1st-order-in-time single-pass **benchmark** (~85–90% of `.cu`); `evolve!` = the
+**validated 2nd-order science solver** (~38%, CFL-adaptive). Both from the same `@fvsystem` stencil.
 
 ## Roadmap (priority order)
 

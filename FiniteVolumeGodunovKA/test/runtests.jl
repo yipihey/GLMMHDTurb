@@ -337,6 +337,19 @@ if CUDA.functional()
             U0 = [prim2cons(s, (1f0+0.1f0*sinpi(2f0*Float32(i+j+k)/n), 0.2f0,0.1f0,0.1f0, 1f0)) for i in 1:n, j in 1:n, k in 1:n]
             g = Grid3DCuMarch(s, U0; dx=d); FV.run!(g, 0.2f0*d, 20); W = FV.primitives(g)
             @test all(w -> all(isfinite, w) && w[1] > 0 && w[5] > 0, W)
+
+            # the SOLVER guarantees: evolve! is 2nd-order (MUSCL+SSP-RK2) and exactly conservative
+            ρe(x,y,z,t) = 1f0 + 0.2f0*sinpi(2f0*(x+y+z-3f0*t))
+            ent(m) = [prim2cons(s, (ρe((i-.5f0)/m,(j-.5f0)/m,(k-.5f0)/m,0f0),1f0,1f0,1f0,1f0)) for i in 1:m,j in 1:m,k in 1:m]
+            l1(m) = (g2=Grid3DCuMarch(s, ent(m); dx=1f0/m); evolve!(g2, 0.1f0); ρ=[w[1] for w in primitives(g2)];
+                     sum(abs(ρ[i,j,k]-ρe((i-.5f0)/m,(j-.5f0)/m,(k-.5f0)/m,0.1f0)) for i in 1:m,j in 1:m,k in 1:m)/m^3)
+            e16, e32 = l1(16), l1(32)
+            @test log(e16/e32)/log(2) > 1.7            # genuine 2nd-order convergence
+
+            gc = Grid3DCuMarch(s, ent(32); dx=1f0/32); c0 = conserved_total(gc)
+            evolve!(gc, 0.15f0); c1 = conserved_total(gc)
+            @test abs(c1[1]-c0[1]) ≤ 1f-5*abs(c0[1])   # mass conserved to machine precision
+            @test abs(c1[5]-c0[5]) ≤ 1f-5*abs(c0[5])   # energy conserved
         end
     else
         @info "nvcc not found — skipping transpile backend tests"
