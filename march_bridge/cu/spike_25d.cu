@@ -546,7 +546,7 @@ __global__ void init(Ptrs q){
     q.su[0][i]=enc_log2(log2f(0.3f+0.2f*ph));            // ~O(0.3) fraction
     q.su[1][i]=enc_log2(log2f(1e-20f*(1.f+0.5f*ph)));    // trace species, exercises 30-dex range
 #elif defined(SCALARS)
-    float rho=1.f+0.3f*ph; q.v[5][i]=rho*(0.2f+0.5f*ph); q.v[6][i]=rho*(0.7f-0.3f*ph); // rho*s
+    q.v[5][i]=rho*(0.2f+0.5f*ph); q.v[6][i]=rho*(0.7f-0.3f*ph); // rho*s (rho from above)
 #endif
 }
 

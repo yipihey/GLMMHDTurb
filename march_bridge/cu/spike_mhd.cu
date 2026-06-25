@@ -27,7 +27,10 @@
 #ifndef NZ
 #define NZ 480
 #endif
-#define NV 9
+#ifndef NSP
+#define NSP 0                  // passive species via CMA (ride the mass flux). -DPPM = parabolic recon.
+#endif
+#define NV (9+NSP)
 #ifndef OX
 #define OX 32
 #endif
@@ -48,20 +51,33 @@ __device__ __forceinline__ int ring(int m){ int r=m%PLANES; return r<0?r+PLANES:
 
 __constant__ float GAMMA=1.4f, DTDX=0.02f, SMALLR=1e-6f, SMALLP=1e-6f, CH=1.0f, GLMFAC=1.0f;
 
-struct Prim { float r,u,v,w,p,bx,by,bz,ps; };
-struct Cons { float r,mx,my,mz,E,bx,by,bz,ps; };
+struct Prim { float r,u,v,w,p,bx,by,bz,ps;
+#if NSP>0
+    float s[NSP];                          // passive species FRACTION X
+#endif
+};
+struct Cons { float r,mx,my,mz,E,bx,by,bz,ps;
+#if NSP>0
+    float s[NSP];                          // conserved rho*X (or CMA flux)
+#endif
+};
 
 __device__ __forceinline__ Prim prim_from_cons(float r,float mx,float my,float mz,float E,float bx,float by,float bz,float ps){
     Prim q; q.r=fmaxf(r,SMALLR); float ir=1.f/q.r;
     q.u=mx*ir; q.v=my*ir; q.w=mz*ir;
     float ekin=0.5f*(mx*mx+my*my+mz*mz)*ir, emag=0.5f*(bx*bx+by*by+bz*bz);
     q.p=fmaxf((GAMMA-1.f)*(E-ekin-emag),SMALLP);
-    q.bx=bx; q.by=by; q.bz=bz; q.ps=ps; return q;
+    q.bx=bx; q.by=by; q.bz=bz; q.ps=ps; return q;   // species set by GP after (tile holds fraction)
 }
 __device__ __forceinline__ Cons toCons(Prim q){
     Cons c; c.r=q.r; c.mx=q.r*q.u; c.my=q.r*q.v; c.mz=q.r*q.w;
     float ekin=0.5f*q.r*(q.u*q.u+q.v*q.v+q.w*q.w), emag=0.5f*(q.bx*q.bx+q.by*q.by+q.bz*q.bz);
-    c.E=q.p/(GAMMA-1.f)+ekin+emag; c.bx=q.bx; c.by=q.by; c.bz=q.bz; c.ps=q.ps; return c;
+    c.E=q.p/(GAMMA-1.f)+ekin+emag; c.bx=q.bx; c.by=q.by; c.bz=q.bz; c.ps=q.ps;
+#if NSP>0
+    #pragma unroll
+    for(int i=0;i<NSP;i++) c.s[i]=q.r*q.s[i];   // conserved rho*X
+#endif
+    return c;
 }
 // fast magnetosonic speed for normal field bn (prim state, x-normal frame)
 __device__ __forceinline__ float fast_speed(Prim q,float bn){
@@ -109,11 +125,20 @@ __device__ __forceinline__ Prim slopeP(Prim a,Prim b,Prim c){
     Prim s; s.r=moncen(a.r,b.r,c.r); s.u=moncen(a.u,b.u,c.u); s.v=moncen(a.v,b.v,c.v);
     s.w=moncen(a.w,b.w,c.w); s.p=moncen(a.p,b.p,c.p); s.bx=moncen(a.bx,b.bx,c.bx);
     s.by=moncen(a.by,b.by,c.by); s.bz=moncen(a.bz,b.bz,c.bz); s.ps=moncen(a.ps,b.ps,c.ps);
+#if NSP>0
+    #pragma unroll
+    for(int i=0;i<NSP;i++) s.s[i]=moncen(a.s[i],b.s[i],c.s[i]);
+#endif
     return s;
 }
 __device__ __forceinline__ Prim padd(Prim b,Prim s,float a){
     Prim e; e.r=b.r+a*s.r; e.u=b.u+a*s.u; e.v=b.v+a*s.v; e.w=b.w+a*s.w; e.p=b.p+a*s.p;
-    e.bx=b.bx+a*s.bx; e.by=b.by+a*s.by; e.bz=b.bz+a*s.bz; e.ps=b.ps+a*s.ps; return e;
+    e.bx=b.bx+a*s.bx; e.by=b.by+a*s.by; e.bz=b.bz+a*s.bz; e.ps=b.ps+a*s.ps;
+#if NSP>0
+    #pragma unroll
+    for(int i=0;i<NSP;i++) e.s[i]=b.s[i]+a*s.s[i];
+#endif
+    return e;
 }
 // spatial face reconstruction b +/- 0.5 s (sign=+/-1), floored
 __device__ __forceinline__ Prim edge(Prim b,Prim s,float sign){
@@ -126,8 +151,45 @@ __device__ __forceinline__ Prim hanc1d(Prim c0,Prim s,int dir){
     Cons U=toCons(c0); float h=0.5f*DTDX;
     U.r-=h*(FR.r-FL.r); U.mx-=h*(FR.mx-FL.mx); U.my-=h*(FR.my-FL.my); U.mz-=h*(FR.mz-FL.mz);
     U.E-=h*(FR.E-FL.E); U.bx-=h*(FR.bx-FL.bx); U.by-=h*(FR.by-FL.by); U.bz-=h*(FR.bz-FL.bz); U.ps-=h*(FR.ps-FL.ps);
-    return prim_from_cons(U.r,U.mx,U.my,U.mz,U.E,U.bx,U.by,U.bz,U.ps);
+    Prim mh=prim_from_cons(U.r,U.mx,U.my,U.mz,U.E,U.bx,U.by,U.bz,U.ps);
+#if NSP>0
+    float un=dir==0?c0.u:dir==1?c0.v:c0.w;   // passive advection predictor: X_half = X - h*un*dX
+    #pragma unroll
+    for(int i=0;i<NSP;i++) mh.s[i]=c0.s[i]-h*un*s.s[i];
+#endif
+    return mh;
 }
+#ifdef PPM
+// lean parabolic-edge reconstruction (3-pt CW84 parabola + monotonize) + 1D-Hancock predictor.
+__device__ __forceinline__ float ppm1(float qm,float q0,float qp,float sgn){
+    float d=0.25f*(qp-qm), cu=(qm-2.f*q0+qp)*(1.f/6.f);
+    float qr=q0+d-cu, ql=q0-d-cu;
+    if((qr-q0)*(q0-ql)<=0.f){ qr=q0; ql=q0; }
+    else { float dqe=qr-ql, d6=6.f*(q0-0.5f*(ql+qr));
+        if(dqe*d6 >  dqe*dqe) ql=3.f*q0-2.f*qr;
+        if(dqe*d6 < -dqe*dqe) qr=3.f*q0-2.f*ql; }
+    return sgn>0.f?qr:ql;
+}
+__device__ __forceinline__ Prim ppm_edge(Prim a,Prim b,Prim c,float sgn){
+    Prim e; e.r=ppm1(a.r,b.r,c.r,sgn); e.u=ppm1(a.u,b.u,c.u,sgn); e.v=ppm1(a.v,b.v,c.v,sgn);
+    e.w=ppm1(a.w,b.w,c.w,sgn); e.p=ppm1(a.p,b.p,c.p,sgn); e.bx=ppm1(a.bx,b.bx,c.bx,sgn);
+    e.by=ppm1(a.by,b.by,c.by,sgn); e.bz=ppm1(a.bz,b.bz,c.bz,sgn); e.ps=ppm1(a.ps,b.ps,c.ps,sgn);
+#if NSP>0
+    #pragma unroll
+    for(int i=0;i<NSP;i++) e.s[i]=ppm1(a.s[i],b.s[i],c.s[i],sgn);
+#endif
+    e.r=fmaxf(e.r,SMALLR); e.p=fmaxf(e.p,SMALLP); return e;
+}
+__device__ __forceinline__ Prim padd_pred(Prim e,Prim mh,Prim c){   // PPM face + predictor shift (e+mh-c)
+    Prim o; o.r=e.r+mh.r-c.r; o.u=e.u+mh.u-c.u; o.v=e.v+mh.v-c.v; o.w=e.w+mh.w-c.w; o.p=e.p+mh.p-c.p;
+    o.bx=e.bx+mh.bx-c.bx; o.by=e.by+mh.by-c.by; o.bz=e.bz+mh.bz-c.bz; o.ps=e.ps+mh.ps-c.ps;
+#if NSP>0
+    #pragma unroll
+    for(int i=0;i<NSP;i++) o.s[i]=e.s[i]+mh.s[i]-c.s[i];
+#endif
+    o.r=fmaxf(o.r,SMALLR); o.p=fmaxf(o.p,SMALLP); return o;
+}
+#endif
 // Dedner GLM pair: clean normal field; returns cleaned bn* and psi* (uses CH).
 __device__ __forceinline__ void glm_pair(float bnL,float bnR,float psiL,float psiR,float& bns,float& psis){
     bns =0.5f*(bnL+bnR)-0.5f*(psiR-psiL)/CH;
@@ -152,7 +214,12 @@ __device__ __forceinline__ Cons hllMHD(Prim Lq,Prim Rq,int dir){
     F.by=(SR*FL.by-SL*FR.by+SL*SR*(UR.by-UL.by))*ihd;
     F.bz=(SR*FL.bz-SL*FR.bz+SL*SR*(UR.bz-UL.bz))*ihd;
     F.bx=fbn; F.ps=fpsi;
-    return rot_flux_from(F,dir);
+    Cons FF=rot_flux_from(F,dir);
+#if NSP>0
+    #pragma unroll
+    for(int i=0;i<NSP;i++) FF.s[i] = FF.r>=0.f ? FF.r*Lq.s[i] : FF.r*Rq.s[i];   // CMA species flux
+#endif
+    return FF;
 }
 
 struct Ptrs { float* v[NV]; };
@@ -170,13 +237,23 @@ __global__ void __launch_bounds__(THREADS) march(Ptrs q, Ptrs o){
             int gi=wrap(x0-GHOST+lx,NX), gj=wrap(y0-GHOST+ly,NY);
             size_t g=gidx(gi,gj,gk);
             #pragma unroll
-            for(int v=0;v<NV;v++) sh[v][s][c]=__float2half(q.v[v][g]);
+            for(int v=0;v<9;v++) sh[v][s][c]=__float2half(q.v[v][g]);   // conserved
+#if NSP>0
+            float ir=1.f/fmaxf(q.v[0][g],SMALLR);
+            #pragma unroll
+            for(int i=0;i<NSP;i++) sh[9+i][s][c]=__float2half(q.v[9+i][g]*ir);   // species FRACTION
+#endif
         }
     };
     for(int k=-2;k<=2;k++) loadPlane(k);
     __syncthreads();
 #define CR(di,dj,dk,v) __half2float(sh[v][ring(k+(dk))][(li+(di))+GX*(lj+(dj))])
+#if NSP>0
+#define GP(di,dj,dk) ({ Prim _q=prim_from_cons(CR(di,dj,dk,0),CR(di,dj,dk,1),CR(di,dj,dk,2),CR(di,dj,dk,3),CR(di,dj,dk,4),CR(di,dj,dk,5),CR(di,dj,dk,6),CR(di,dj,dk,7),CR(di,dj,dk,8)); \
+    _Pragma("unroll") for(int _i=0;_i<NSP;_i++) _q.s[_i]=CR(di,dj,dk,9+_i); _q; })
+#else
 #define GP(di,dj,dk) prim_from_cons(CR(di,dj,dk,0),CR(di,dj,dk,1),CR(di,dj,dk,2),CR(di,dj,dk,3),CR(di,dj,dk,4),CR(di,dj,dk,5),CR(di,dj,dk,6),CR(di,dj,dk,7),CR(di,dj,dk,8))
+#endif
     for(int k=0;k<NZ;k++){
         Prim c0=GP(0,0,0);
         Cons U=toCons(c0);
@@ -189,18 +266,35 @@ __global__ void __launch_bounds__(THREADS) march(Ptrs q, Ptrs o){
                  cp1=GP(ox,oy,oz),          cp2=GP(2*ox,2*oy,2*oz);
             Prim sm1=slopeP(cm2,cm1,c0), s0=slopeP(cm1,c0,cp1), sp1=slopeP(c0,cp1,cp2);
             Prim mhm=hanc1d(cm1,sm1,d), mh0=hanc1d(c0,s0,d), mhp=hanc1d(cp1,sp1,d);
+#ifdef PPM
+            Cons Fm=hllMHD(padd_pred(ppm_edge(cm2,cm1,c0,+1.f),mhm,cm1), padd_pred(ppm_edge(cm1,c0,cp1,-1.f),mh0,c0), d);
+            Cons Fp=hllMHD(padd_pred(ppm_edge(cm1,c0,cp1,+1.f),mh0,c0), padd_pred(ppm_edge(c0,cp1,cp2,-1.f),mhp,cp1), d);
+#else
             Cons Fm=hllMHD(edge(mhm,sm1,+1.f), edge(mh0,s0,-1.f), d);
             Cons Fp=hllMHD(edge(mh0,s0,+1.f),  edge(mhp,sp1,-1.f), d);
+#endif
             div.r+=Fp.r-Fm.r; div.mx+=Fp.mx-Fm.mx; div.my+=Fp.my-Fm.my; div.mz+=Fp.mz-Fm.mz;
             div.E+=Fp.E-Fm.E; div.bx+=Fp.bx-Fm.bx; div.by+=Fp.by-Fm.by; div.bz+=Fp.bz-Fm.bz; div.ps+=Fp.ps-Fm.ps;
+#if NSP>0
+            #pragma unroll
+            for(int i=0;i<NSP;i++) div.s[i]+=Fp.s[i]-Fm.s[i];
+#endif
         }
         U.r-=DTDX*div.r; U.mx-=DTDX*div.mx; U.my-=DTDX*div.my; U.mz-=DTDX*div.mz; U.E-=DTDX*div.E;
         U.bx-=DTDX*div.bx; U.by-=DTDX*div.by; U.bz-=DTDX*div.bz; U.ps-=DTDX*div.ps;
         U.ps*=GLMFAC;   // GLM parabolic source (psi decay)
+#if NSP>0
+        #pragma unroll
+        for(int i=0;i<NSP;i++) U.s[i]-=DTDX*div.s[i];
+#endif
 #endif
         size_t g=gidx(x0+tx,y0+ty,k);
         o.v[0][g]=U.r; o.v[1][g]=U.mx; o.v[2][g]=U.my; o.v[3][g]=U.mz; o.v[4][g]=U.E;
         o.v[5][g]=U.bx; o.v[6][g]=U.by; o.v[7][g]=U.bz; o.v[8][g]=U.ps;
+#if NSP>0
+        #pragma unroll
+        for(int i=0;i<NSP;i++) o.v[9+i][g]=U.s[i];
+#endif
         loadPlane(k+3); __syncthreads();
     }
 #undef CR
@@ -216,6 +310,10 @@ __global__ void init(Ptrs q){
     Cons c=toCons(s);
     q.v[0][i]=c.r; q.v[1][i]=c.mx; q.v[2][i]=c.my; q.v[3][i]=c.mz; q.v[4][i]=c.E;
     q.v[5][i]=c.bx; q.v[6][i]=c.by; q.v[7][i]=c.bz; q.v[8][i]=c.ps;
+#if NSP>0
+    #pragma unroll
+    for(int j=0;j<NSP;j++) q.v[9+j][i]=c.r*(0.2f+0.3f*ph);   // rho*X
+#endif
 }
 
 #ifdef AS_LIB
@@ -223,6 +321,7 @@ __global__ void init(Ptrs q){
 extern "C" {
 int march_nv(){ return NV; }
 int march_nx(){ return NX; }
+int march_nsp(){ return NSP; }
 void march_set_dtdx(float v){ cudaMemcpyToSymbol(DTDX, &v, sizeof(float)); }
 void march_set_glm(float ch,float fac){ cudaMemcpyToSymbol(CH,&ch,sizeof(float)); cudaMemcpyToSymbol(GLMFAC,&fac,sizeof(float)); }
 void march_set_gamma(float g){ cudaMemcpyToSymbol(GAMMA, &g, sizeof(float)); }

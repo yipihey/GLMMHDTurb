@@ -180,3 +180,25 @@ Memory gate: 72 B/cell (two fp32 (N,N,N,9) buffers, no scratch). Throughput gate
 
 PPM is wired into the module as an opt-in: `step_plm!(...; recon=:ppm)` / `step_hydro!(...; recon=:ppm)`
 (f16+HLL path only; PLM stays the default). Numbers above reproduced through the public API.
+
+## Complete reference matrix — 3 solvers × PLM/PPM × ±2 species (@480³, A6000, gradient IC)
+
+All measured on the **same gradient IC** (the `ph=0.001·mod(i,911)` pattern the standalone spikes use,
+so the MonCen limiter does real work). NB a *uniform* IC lets MonCen early-return (`dl·dr≤0→0`) and
+inflates throughput ~20–40% (worst for PPM) — the earlier CT numbers (1206–1575) were uniform-IC; the
+representative gradient values below are the honest ones. Best 2-block tile per cell.
+
+| solver | PLM no-sp | PLM +2sp | PPM no-sp | PPM +2sp | reference kernel |
+|---|---:|---:|---:|---:|---|
+| **Hydro** (5-var) | **6865** | 5082 | 3995 | 3822 | `spike_25d.cu` (`HANCOCK1D`/`PPM1D`, `SCALARS+CMA`) |
+| **GLM-MHD** (9-var) | **3175** | 2733 | 2064 | 1410 | `spike_mhd.cu` (`-DPPM`, `-DNSP=2`) |
+| **CT-MHD** (8-var) | **1255** | 1011 | 752 | 558 | `spike_ctm.cu` (`-DPPM`, `-DNSP=2`) |
+
+Register counts (GLM, `cuobjdump -res-usage`): PLM 128, **PPM 128 (no inflation!)**, PLM+2sp 128,
+PPM+2sp 177. **The lean parabolic-edge PPM does NOT inflate registers** — its ~1.5–1.7× penalty is
+*pure compute* (parabola + monotonize per var), staying at the same occupancy. This is the decisive
+contrast with the old **full-characteristic** MHD-PPM (201 regs → 1 block → 669, a 4.7× cliff): the
+viable MHD/CT PPM is the parabolic-edge form. Species via CMA cost −12% (hydro) to −33% (GLM+PPM),
+mostly the extra data dropping a block; Σ X_i = 1 exact, species mass conserved to ~1e-7, div·B
+unaffected. Hydro PPM+sp barely costs over PPM (−4%: hydro PPM is compute-bound, the +2 vars don't
+drop a block). All cells validated (Orszag-Tang / conservation).
