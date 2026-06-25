@@ -56,7 +56,7 @@ end
     nL = ρL*sL*(SL - SM); nR = ρR*sR*(SR - SM)
     dL = nL - Bx2; dR = nR - Bx2
     okL = dL > 1f-8 * nL; okR = dR > 1f-8 * nR
-    iL = ifelse(okL, 1f0/dL, 0f0); iR = ifelse(okR, 1f0/dR, 0f0)
+    iL = ifelse(okL, 1f0/dL, zero(dL)); iR = ifelse(okR, 1f0/dR, zero(dR))   # zero(...) matches Vec/scalar
     nbL = ρL*sL*sL - Bx2; nbR = ρR*sR*sR - Bx2
     vLs = vL - Bx*ByL*(SM - uL)*iL; wLs = wL - Bx*BzL*(SM - uL)*iL
     vRs = vR - Bx*ByR*(SM - uR)*iR; wRs = wR - Bx*BzR*(SM - uR)*iR

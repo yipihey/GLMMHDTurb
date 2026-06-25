@@ -145,7 +145,10 @@ If profiling ever shows the dt sync mattering at scale, revisit with a *block-hi
      only when `dK = ρ(S−u)(S−Sₘ) − Bₓ² > 0` (else fall back to the un-rotated limit, not `1/dK`); and
      the star **energy** convective term is `(S−u)·E` (E is a density), NOT `(S−u)·ρ·E` — the spurious
      `ρ` blew up the low-density state. Guard `sqrt(ρ*)` (computed branch-free, even where unselected).
-5. **2D SIMD** backend + **3D**; **CPU threads + cache-blocking**; `Vec{16}` on AVX-512.
+5. ~~**2D SIMD** backend~~ ✅ `Grid2DSoA`: SoA flat storage (x contiguous), vectorized along x for
+   both sweeps (x-sweep shifted x-loads; y-sweep aligned x-blocks at rows j±1/j±2), reusing
+   `_update_dir` + perm with `Vec{8}`. Bit-identical to scalar 2D (Euler/HLLC + GLM/HLLD), ~6.6× faster
+   single-core. Remaining: **3D**; **CPU threads + cache-blocking**; `Vec{16}` on AVX-512.
 6. **Metal** — measure the Metal.jl gap vs its bandwidth roofline before deciding native-vs-MSL.
 7. **CT** through the reserved staggered/EMF seam (exact div·B, vs GLM's cleaning).
 8. **Packaging:** move CUDA to a weakdep + extension (CPU-only installs stay light).

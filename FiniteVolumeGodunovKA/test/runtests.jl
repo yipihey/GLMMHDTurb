@@ -164,6 +164,28 @@ end
 end
 
 # ---------------------------------------------------------------------------
+# 2D SIMD backend (Grid2DSoA) — vectorized along x for both sweeps. Bit-identical
+# to the 2D scalar backend for Euler/HLLC AND GLM-MHD/HLLD (the Vec path of every solver).
+# ---------------------------------------------------------------------------
+@testset "2D SIMD ≡ 2D scalar (bit-identical)" begin
+    cmp2d(s, U0, recon, rsol, nsteps) = begin
+        n = size(U0, 1); d = 1f0/n
+        gsc = Grid2D(s, copy(U0); dx=d, dy=d, bc=:periodic, recon=recon, rsol=rsol)
+        gsi = Grid2DSoA(s, copy(U0); dx=d, dy=d, bc=:periodic, recon=recon, rsol=rsol)
+        for _ in 1:nsteps; FV.step!(gsc, 0.1f0*d); FV.step!(gsi, 0.1f0*d); end
+        Wc = FV.primitives(gsc); Wi = FV.primitives_soa(gsi)
+        maximum(maximum(abs.(Wc[i,j] .- Wi[i,j])) for i in 1:n, j in 1:n)
+    end
+    se = Euler(γ = 1.4f0); n = 64
+    U0e = [prim2cons(se, (1f0 + 0.3f0*sinpi(2f0*((i-0.5f0)/n + (j-0.5f0)/n)), 0.5f0, 0.3f0, 0f0, 1f0)) for i in 1:n, j in 1:n]
+    @test cmp2d(se, U0e, PLM(), HLLC(), 15) == 0f0
+    sm = GLMMHD(γ = 5f0/3f0, ch = 2f0); B0 = 1f0/sqrt(4f0*Float32(π))
+    U0m = [prim2cons(sm, (0.5f0, -sinpi(2f0*(j-0.5f0)/n), sinpi(2f0*(i-0.5f0)/n), 0f0, 0.5f0,
+                          -B0*sinpi(2f0*(j-0.5f0)/n), B0*sinpi(4f0*(i-0.5f0)/n), 0f0, 0f0)) for i in 1:n, j in 1:n]
+    @test cmp2d(sm, U0m, PLM(), HLLD(), 12) == 0f0
+end
+
+# ---------------------------------------------------------------------------
 # HLLD — the Miyoshi-Kusano MHD solver, keyed to GLMMHD. Consistency, Brio-Wu
 # stability/positivity/conservation, and bit-exact rotation.
 # ---------------------------------------------------------------------------
