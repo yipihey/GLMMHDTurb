@@ -170,9 +170,19 @@ So the two-backend design is fully realized: **portable native (~37%, bit-identi
 stencil.** The last ~10% to the `.cu` is its hand-tuned 2.5D march + shared-memory staging + f16 — a
 fixed, system-agnostic C-template optimization that would lift every transpiled system at once.
 
-Next: transpile the reconstruction+Riemann (currently fixed C) so any `@fvsystem` system works; wire
-`_fvexprs` capture into `@fvsystem` (v0 reads the Euler Exprs directly); add the march/f16 C template for
-the last ~10%; package as a `CuMarch` backend; GLM/CT transpile.
+**GENERALIZED (v1) — works for ANY `@fvsystem` system.** `@fvsystem` now emits `_fvmeta(sys)` (the
+stencil captured as data: nvars, vidx, params, physics Exprs). The transpiler reads it and handles
+arbitrary **params** (→ a `PRM[]` array), **NVARS**, the **`vidx` rotation** (generated `swap_y`/`swap_z`
+over all vector triples), and **inter-physics calls** (GLM `maxspeed_x`→`fastspeed_x`). The
+reconstruction/Riemann are NVARS-generic fixed C. Validated on BOTH from one pipeline:
+- **Euler** (5 var, 1 param, 1 triple): physics bit-identical, PLM **85–90% of `.cu`**.
+- **GLM-MHD** (9 var, 3 params, 2 triples): physics bit-identical (max|Δ|=0), PLM **104–107% of `.cu` GLM
+  3175** (faster because it's LLF vs the `.cu`'s HLLD — a Riemann mismatch, like the 1st-order upper
+  bound; the point is it *generalizes* and hits `.cu`-class).
+
+So the transpile backend is general: write any system in `@fvsystem`, get `.cu`-class CUDA from the same
+source. Remaining: HLLD in the transpiled kernel (fair GLM compare); the march/f16 C template (last ~10%
+for hydro); CT transpile (staggered structure); package as a `CuMarch` backend.
 
 ## Roadmap (priority order)
 

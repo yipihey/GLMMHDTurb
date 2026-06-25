@@ -88,5 +88,18 @@ macro fvsystem(name, body)
         push!(defs, mkmethod(fname, argsig, body))
     end
 
+    # Capture the raw physics + meta as DATA for the transpile backend (the stencil, verbatim).
+    physpairs = Expr[]
+    for m in methods
+        sig = m.args[1]; fb = m.args[2]
+        push!(physpairs, Expr(:(=), sig.args[1], :(($(QuoteNode(sig.args[2])), $(QuoteNode(fb))))))
+    end
+    pnames = Expr(:tuple, [QuoteNode(f) for (f, _) in params]...)
+    meta = :((nvars = $(esc(nvars)),
+              vidx = $(vidxval === nothing ? :(()) : esc(vidxval)),
+              params = $pnames,
+              phys = $(Expr(:tuple, physpairs...))))
+    push!(defs, mkmethod(:_fvmeta, (Expr(:(::), ename),), (meta,)))
+
     Expr(:block, defs...)
 end

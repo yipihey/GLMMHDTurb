@@ -4,3 +4,5 @@ ot_density.png
 ot_meta.txt
 fv_euler.cu
 libfv*.so
+fv_*.cu
+libfv_*.so
