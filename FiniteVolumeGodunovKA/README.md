@@ -36,7 +36,14 @@ vector triples — the library's rotation handled y/z automatically. Brio-Wu sho
 preserves the normal field exactly; the two-vector rotation isotropy is bit-exact. GLM-MHD also has
 a ψ-damping `source`, runs on the GPU (Orszag-Tang, `Grid2DCU`), and sets the cleaning speed `ch`
 dynamically to the global max fast speed each step (via the `fastspeed_x`/`prestep` hooks). See
-`DESIGN_fvkernel.md` for the contract and roadmap (next: 2D SIMD, HLLD, Metal/CT).
+`DESIGN_fvkernel.md` for the contract and roadmap.
+
+**Backends shipped:** scalar / SIMD (threaded, `Vec{8}`) / CUDA across 1D/2D/3D; **HLLD** (Miyoshi-
+Kusano) for sharp MHD; **CT** (`Grid2DCT`, face-staggered B + edge EMF) for machine-zero div·B; dynamic
+`ch`. A **Metal** backend (`metal/metal_2d.jl`) mirrors the CUDA one but is **untested** — Metal.jl is
+macOS-only and can't run on this Linux/NVIDIA host; validate it (and the Metal.jl-gap experiment) on a
+Mac. CPU SIMD peaks at ~145 Mcell/s with `JULIA_NUM_THREADS≈8–16` (these kernels are bandwidth-bound;
+don't over-subscribe).
 
 See `DESIGN_fvkernel.md` for the contract, the rotation/Riemann design wins, the three locked
 decisions, and the roadmap. Run the tests with `julia --project=. -e 'using Pkg; Pkg.test()'`.
