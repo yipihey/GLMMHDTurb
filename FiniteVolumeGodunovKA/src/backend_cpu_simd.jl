@@ -10,7 +10,11 @@
 # Threads + cache-blocking are the next increment; this establishes correctness and the
 # single-core vectorization win against the scalar backend.
 
-const _W = 8  # lane width (Vec{8,Float32} = 256-bit; bump to 16 on AVX-512 hosts)
+# SIMD lane width. Vec{8,Float32} = 256-bit AVX2 — optimal on this AVX2 host (AMD EPYC 7763,
+# Zen 3). Measured: Vec{16} (512-bit) is WORSE here (87-98 vs 111-145 Mcell/s) because without
+# AVX-512 it lowers to 2× emulated 256-bit ops + more register pressure. Set 16 only on a real
+# AVX-512 host (Zen 4 / Intel Skylake-X+), where it can use true 512-bit lanes.
+const _W = 8
 
 # Chunk-capped threading: these sweeps are memory-bandwidth-bound, so spawning one task per
 # thread per sweep over-subscribes on small grids (128 threads × tiny work = barrier overhead

@@ -162,6 +162,11 @@ If profiling ever shows the dt sync mattering at scale, revisit with a *block-hi
    small-grid footgun, but the right knob is `JULIA_NUM_THREADS ≈ 8–16` — do NOT use `-t auto` (128)
    for these. **Cache-blocking** (sweep-fusion over tiles) is a further refinement, not yet needed
    since threading already exceeds the target; deferred.
+8. ~~**`Vec{16}`**~~ ✅ measured — a *documented negative* on this host. The lane width `_W` is a single
+   tunable const. On the AMD EPYC 7763 (Zen 3, **AVX2 only, no AVX-512**), `Vec{16}` is *worse* than
+   `Vec{8}` (87–98 vs 111–145 Mcell/s) because it lowers to 2× emulated 256-bit ops + register
+   pressure. Kept `_W = 8`; documented that `_W = 16` is for real AVX-512 hosts (Zen 4 / Intel
+   Skylake-X+), which we can't test here.
 6. **Metal** — measure the Metal.jl gap vs its bandwidth roofline before deciding native-vs-MSL.
 7. **CT** through the reserved staggered/EMF seam (exact div·B, vs GLM's cleaning).
 8. **Packaging:** move CUDA to a weakdep + extension (CPU-only installs stay light).
