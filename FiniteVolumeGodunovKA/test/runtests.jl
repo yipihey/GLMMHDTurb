@@ -218,6 +218,19 @@ end
     U0 = [prim2cons(sm, icW((i-0.5f0)*dd,(j-0.5f0)*dd,(k-0.5f0)*dd)) for i in 1:nn, j in 1:nn, k in 1:nn]
     g = Grid3D(sm, U0; dx=dd,dy=dd,dz=dd, bc=:periodic, recon=PLM(), rsol=HLLD(), cfl=0.4f0); FV.evolve3d!(g, 0.03f0)
     @test all(w -> all(isfinite, w) && w[1] > 0 && w[5] > 0, FV.primitives(g))
+
+    # 3D SIMD bit-identical to scalar (Euler/HLLC + GLM/HLLD).
+    nn = 24; dd = 1f0/nn
+    U0e = [prim2cons(se, (1f0+0.3f0*sinpi(2f0*(i+j+k-1.5f0)/nn), 0.5f0,0.3f0,0.2f0, 1f0)) for i in 1:nn, j in 1:nn, k in 1:nn]
+    cmp3d(s, U0, rsol, ns) = begin
+        gsc = Grid3D(s, copy(U0); dx=dd,dy=dd,dz=dd, bc=:periodic, recon=PLM(), rsol=rsol)
+        gsi = Grid3DSoA(s, copy(U0); dx=dd,dy=dd,dz=dd, bc=:periodic, recon=PLM(), rsol=rsol)
+        for _ in 1:ns; FV.step!(gsc, 0.1f0*dd); FV.step!(gsi, 0.1f0*dd); end
+        maximum(maximum(abs.(FV.primitives(gsc)[i,j,k] .- FV.primitives_soa(gsi)[i,j,k])) for i in 1:nn, j in 1:nn, k in 1:nn)
+    end
+    @test cmp3d(se, U0e, HLLC(), 8) == 0f0
+    U0g = [prim2cons(sm, icW((i-0.5f0)/nn,(j-0.5f0)/nn,(k-0.5f0)/nn)) for i in 1:nn, j in 1:nn, k in 1:nn]
+    @test cmp3d(sm, U0g, HLLD(), 6) == 0f0
 end
 
 # ---------------------------------------------------------------------------
@@ -269,6 +282,16 @@ if CUDA.functional()
         wave = [prim2cons(s, (1f0 + 0.2f0*sinpi(2f0*x), 1f0, 0f0, 0f0, 1f0)) for x in xs]
         @test cmp(sod,  dx, :outflow;  recon = PLM(), rsol = HLLC()) == 0f0
         @test cmp(wave, dx, :periodic; recon = PLM(), rsol = HLL())  == 0f0
+    end
+
+    @testset "3D CUDA ≡ 3D scalar" begin
+        s = Euler(γ = 1.4f0); n = 24; d = 1f0/n
+        U0 = [prim2cons(s, (1f0+0.3f0*sinpi(2f0*(i+j+k-1.5f0)/n), 0.5f0,0.3f0,0.2f0, 1f0)) for i in 1:n, j in 1:n, k in 1:n]
+        gsc = Grid3D(s, copy(U0); dx=d,dy=d,dz=d, bc=:periodic, recon=PLM(), rsol=HLLC())
+        gg  = Grid3DCU(s, copy(U0); dx=d,dy=d,dz=d, bc=:periodic, recon=PLM(), rsol=HLLC())
+        for _ in 1:8; FV.step!(gsc, 0.1f0*d); FV.step!(gg, 0.1f0*d); end
+        Wc = FV.primitives(gsc); Wg = FV.primitives(gg)
+        @test maximum(maximum(abs.(Wc[i,j,k] .- Wg[i,j,k])) for i in 1:n, j in 1:n, k in 1:n) == 0f0
     end
 
     @testset "2D CUDA ≡ 2D CPU (rotation on GPU)" begin

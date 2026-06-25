@@ -32,7 +32,7 @@ export Grid1D, step!, evolve!, primitives, conserved_total
 export Grid1DSoA, evolve_simd!, primitives_soa
 export Grid1DCU, evolve_cuda!, primitives_cuda
 export Grid2D, evolve2d!, Grid2DCU, Grid2DSoA, evolve_simd2d!
-export Grid3D, evolve3d!
+export Grid3D, evolve3d!, Grid3DCU, Grid3DSoA, evolve_simd3d!
 
 # ---------------------------------------------------------------------------
 # The contract. A system is a `<: FVSystem` value; the per-cell physics are
@@ -81,7 +81,9 @@ include("backend_cuda.jl")
 include("backend_cpu_2d.jl")
 include("backend_cpu_simd_2d.jl")
 include("backend_cpu_3d.jl")
+include("backend_cpu_simd_3d.jl")
 include("backend_cuda_2d.jl")
+include("backend_cuda_3d.jl")
 include("systems.jl")
 include("riemann_mhd.jl")
 
