@@ -41,12 +41,16 @@ is structural register reduction (Lever 2). Note: unlike nvcc (where fast-math c
 
 ## Next steps (prioritized)
 
-1. **CT structural port (biggest gap, 205→target).** Port the `.cu` fused staged f16 CT tile
-   (`spike_ct2.cu` structure: load prim+faceB f16 tile → phase-A flux → shared → phase-B hydro update +
-   edge-EMF + face-B, f32 update base) into a single CUDA.jl `@cuda` kernel, reusing the `ct_mhd.jl`
-   NTuple helpers (`cellprim`/`dflux`/`hll`/`hanc1d`). Eliminates the global flux round-trips. Expect
-   205 → several hundred+ (structure dominates; codegen caps the rest). Validate div·B machine-zero vs
-   the 7-kernel.
+1. **CT structural port (done — DOCUMENTED NEGATIVE).** Ported the `.cu` fused staged f16 CT tile
+   (`spike_ct2.cu`) to a CUDA.jl `@cuda` kernel (`ct_mhd.jl ct_fused!`), f16 tile + f32 update base,
+   double-buffered, reusing the NTuple helpers. CORRECT: div·B 7.2e-5 = the 7-kernel (machine-zero),
+   fields match to ~2e-4. But **SLOWER**: best 194 (6×6×6, 1 block) vs the 7-kernel's 206. Unlike the
+   `.cu` (where the fused tile *won*, 1206 vs the multi-kernel), in CUDA.jl it loses — the shared tile
+   caps occupancy at **1 block** (the 7-kernel runs many blocks), the NG=3 halo wastes ~80–94% of the
+   tile, and Julia's 1-block codegen can't overcome it the way nvcc's does. **The Julia CT 3D-tile
+   family ceilings at ~206 (16% of the .cu 1255) — a fundamental CUDA.jl occupancy+codegen limit, not
+   fixable by this restructure.** Kept as a validated-correct negative. The only higher-headroom Julia
+   path is a z-march (no halo, full occupancy) — high codegen risk, future work.
 2. **GLM PPM register reduction (203→toward 128, 1→2 blocks).** @fastmath-coverage audit on `ppm9`/
    `ppm_edges`/`spj`; reduce live state; the goal is 2 blocks.
 3. **Hydro structural** — the `.cu` hydro is a *march* (4 blocks); the Julia cube is 3 blocks. Either
