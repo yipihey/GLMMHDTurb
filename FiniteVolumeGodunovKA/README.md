@@ -131,8 +131,9 @@ transpile_selfcheck(Euler(γ=1.4f0))            # 0.0 — emitted CUDA-C ≡ Jul
 
 **Honest caveats.** Comparisons are *scheme-matched* (PLM vs PLM); a cheaper pure-1st-order kernel runs
 ~10,800 Mcell/s but that's not a fair comparison. The `run!` single-pass demo is 1st-order *in time* —
-use `evolve!` (2nd-order, validated) for science. GLM-MHD transpiled uses LLF where the reference uses
-HLLD (a Riemann mismatch). The default `:ctu` scheme uses an f16 shared tile for reconstruction (the
+use `evolve!` (2nd-order, validated) for science. The GLM-MHD transpile path uses **HLLD** (the f32
+kernels select a hand-written HLLD that is bit-identical to the Julia solver — scheme-matched to the
+reference; Euler uses LLF). The default `:ctu` scheme uses an f16 shared tile for reconstruction (the
 f32 update keeps conservation exact); `scheme=:rk2` is the pure-f32 path. Throughput varies ~±15% with
 GPU thermal state, so compare runs in one process.
 

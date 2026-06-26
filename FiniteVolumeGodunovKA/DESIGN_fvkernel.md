@@ -181,8 +181,18 @@ reconstruction/Riemann are NVARS-generic fixed C. Validated on BOTH from one pip
   bound; the point is it *generalizes* and hits `.cu`-class).
 
 So the transpile backend is general: write any system in `@fvsystem`, get `.cu`-class CUDA from the same
-source. Remaining: HLLD in the transpiled kernel (fair GLM compare); the march/f16 C template; CT
-transpile (staggered structure).
+source.
+
+**HLLD in the transpile kernel (GLM now scheme-matched).** The f32 transpile kernels call a `RSOLVE`
+macro that `gen_cuda_c` `#define`s to a hand-written **`hlld`** for `GLMMHD` (a 1:1 transcription of
+`riemann_mhd.jl`, keyed to the GLM layout) and the generic **`llf`** otherwise — so the heavily-tested
+Euler path is untouched and only GLM changes. The C HLLD is **bit-identical to the Julia solver**
+(max|ΔF| = 0 over 5000 random states, now part of `transpile_selfcheck` for `GLMMHD`); a GLM Orszag-Tang
+run is stable and conserving (Δmass = Δenergy = 0). The Riemann is genuinely a *library service that may
+be system-specialized* (as in the native backends), so this stays consistent with the write-once thesis —
+the generic physics is still generic; only the Riemann is specialized, exactly as the contract intends.
+This retires the last "honest caveat": the GLM transpile number is now scheme-matched (HLLD vs HLLD), not
+LLF-vs-HLLD. Remaining options: the march/f16 C template (ceiling reached, ~69%); CT transpile.
 
 ## Making it a real solver — CFL timestepping + 2nd-order, validated
 

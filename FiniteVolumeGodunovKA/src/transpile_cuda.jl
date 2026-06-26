@@ -78,6 +78,55 @@ function _genswap(cname, vidx, d; half::Bool=false)
     "__device__ void $cname($T* W){ $sw }\n"
 end
 
+# HLLD (Miyoshi-Kusano) for GLM-MHD, a 1:1 transcription of src/riemann_mhd.jl. NOT generic — keyed to the
+# GLMMHD layout W=(ρ,u,v,w,P,Bx,By,Bz,ψ), PRM=(γ,ch,…) — so it is emitted only for `GLMMHD` and selected
+# via `RSOLVE` (Euler keeps the generic `llf`). Branch-free; bit-validated against the Julia solver.
+const _HLLD_C = raw"""
+__host__ __device__ float _fastmhd(float g,float r,float p,float Bx,float By,float Bz){
+  float a2=g*p/r, b2=(Bx*Bx+By*By+Bz*Bz)/r, bx2=Bx*Bx/r;
+  return sqrtf(0.5f*(a2+b2+sqrtf(fmaxf(0.f,(a2+b2)*(a2+b2)-4.f*a2*bx2)))); }
+__host__ __device__ void hlld(const float* WL,const float* WR,float* F,const float* PRM){
+  float g=PRM[0], ch=PRM[1];
+  float rL=WL[0],uL=WL[1],vL=WL[2],wL=WL[3],pL=WL[4],BxL=WL[5],ByL=WL[6],BzL=WL[7],psL=WL[8];
+  float rR=WR[0],uR=WR[1],vR=WR[2],wR=WR[3],pR=WR[4],BxR=WR[5],ByR=WR[6],BzR=WR[7],psR=WR[8];
+  float Bx=0.5f*(BxL+BxR)-(0.5f/ch)*(psR-psL), psi=0.5f*(psL+psR)-(0.5f*ch)*(BxR-BxL), Bx2=Bx*Bx;
+  float BL2=Bx2+ByL*ByL+BzL*BzL, BR2=Bx2+ByR*ByR+BzR*BzR;
+  float pTL=pL+0.5f*BL2, pTR=pR+0.5f*BR2;
+  float EL=pL/(g-1.f)+0.5f*rL*(uL*uL+vL*vL+wL*wL)+0.5f*BL2;
+  float ER=pR/(g-1.f)+0.5f*rR*(uR*uR+vR*vR+wR*wR)+0.5f*BR2;
+  float cfL=_fastmhd(g,rL,pL,Bx,ByL,BzL), cfR=_fastmhd(g,rR,pR,Bx,ByR,BzR);
+  float SL=fminf(uL,uR)-fmaxf(cfL,cfR), SR=fmaxf(uL,uR)+fmaxf(cfL,cfR), sL=SL-uL, sR=SR-uR;
+  float den=sR*rR-sL*rL;
+  float SM=(sR*rR*uR-sL*rL*uL-pTR+pTL)/den, pT=(sR*rR*pTL-sL*rL*pTR+rL*rR*sR*sL*(uR-uL))/den;
+  float vBL=uL*Bx+vL*ByL+wL*BzL, vBR=uR*Bx+vR*ByR+wR*BzR;
+  float FL[7]={rL*uL, rL*uL*uL+pTL-Bx2, rL*uL*vL-Bx*ByL, rL*uL*wL-Bx*BzL, (EL+pTL)*uL-Bx*vBL, ByL*uL-Bx*vL, BzL*uL-Bx*wL};
+  float FR[7]={rR*uR, rR*uR*uR+pTR-Bx2, rR*uR*vR-Bx*ByR, rR*uR*wR-Bx*BzR, (ER+pTR)*uR-Bx*vBR, ByR*uR-Bx*vR, BzR*uR-Bx*wR};
+  float UL[7]={rL, rL*uL, rL*vL, rL*wL, EL, ByL, BzL};
+  float UR[7]={rR, rR*uR, rR*vR, rR*wR, ER, ByR, BzR};
+  float tiny=1e-12f, rLs=rL*sL/(SL-SM), rRs=rR*sR/(SR-SM);
+  float nL=rL*sL*(SL-SM), nR=rR*sR*(SR-SM), dL=nL-Bx2, dR=nR-Bx2;
+  bool okL=dL>1e-8f*nL, okR=dR>1e-8f*nR;
+  float iL=okL?1.f/dL:0.f, iR=okR?1.f/dR:0.f, nbL=rL*sL*sL-Bx2, nbR=rR*sR*sR-Bx2;
+  float vLs=vL-Bx*ByL*(SM-uL)*iL, wLs=wL-Bx*BzL*(SM-uL)*iL, vRs=vR-Bx*ByR*(SM-uR)*iR, wRs=wR-Bx*BzR*(SM-uR)*iR;
+  float ByLs=okL?ByL*nbL*iL:ByL, BzLs=okL?BzL*nbL*iL:BzL, ByRs=okR?ByR*nbR*iR:ByR, BzRs=okR?BzR*nbR*iR:BzR;
+  float vBLs=SM*Bx+vLs*ByLs+wLs*BzLs, vBRs=SM*Bx+vRs*ByRs+wRs*BzRs;
+  float ELs=(sL*EL-pTL*uL+pT*SM+Bx*(vBL-vBLs))/(SL-SM), ERs=(sR*ER-pTR*uR+pT*SM+Bx*(vBR-vBRs))/(SR-SM);
+  float ULs[7]={rLs, rLs*SM, rLs*vLs, rLs*wLs, ELs, ByLs, BzLs};
+  float URs[7]={rRs, rRs*SM, rRs*vRs, rRs*wRs, ERs, ByRs, BzRs};
+  float qL=sqrtf(fmaxf(rLs,tiny)), qR=sqrtf(fmaxf(rRs,tiny)), sB=(Bx>=0.f)?1.f:-1.f, ir=1.f/(qL+qR);
+  float vss=(qL*vLs+qR*vRs+(ByRs-ByLs)*sB)*ir, wss=(qL*wLs+qR*wRs+(BzRs-BzLs)*sB)*ir;
+  float Byss=(qL*ByRs+qR*ByLs+qL*qR*(vRs-vLs)*sB)*ir, Bzss=(qL*BzRs+qR*BzLs+qL*qR*(wRs-wLs)*sB)*ir;
+  float vBss=SM*Bx+vss*Byss+wss*Bzss, ELss=ELs-qL*(vBLs-vBss)*sB, ERss=ERs+qR*(vBRs-vBss)*sB;
+  float ULss[7]={rLs, rLs*SM, rLs*vss, rLs*wss, ELss, Byss, Bzss};
+  float URss[7]={rRs, rRs*SM, rRs*vss, rRs*wss, ERss, Byss, Bzss};
+  float SLs=SM-fabsf(Bx)/qL, SRs=SM+fabsf(Bx)/qR, F7[7];
+  for(int c=0;c<7;c++){ float fl=FL[c],fr=FR[c], fls=fl+SL*(ULs[c]-UL[c]), frs=fr+SR*(URs[c]-UR[c]);
+    float flss=fls+SLs*(ULss[c]-ULs[c]), frss=frs+SRs*(URss[c]-URs[c]);
+    F7[c]=(SL>=0.f)?fl:((SLs>=0.f)?fls:((SM>=0.f)?flss:((SRs>=0.f)?frss:((SR>=0.f)?frs:fr)))); }
+  F[0]=F7[0];F[1]=F7[1];F[2]=F7[2];F[3]=F7[3];F[4]=F7[4];F[5]=psi;F[6]=F7[5];F[7]=F7[6];F[8]=ch*ch*Bx; }
+extern "C" void fv_hlld(const float* WL,const float* WR,float* F,const float* P){ hlld(WL,WR,F,P); }
+"""
+
 "`gen_cuda_c(sys) -> String`: the full CUDA-C source emitted from the system's `@fvsystem` stencil."
 function gen_cuda_c(sys::FVSystem)
     m = _fvmeta(sys); NV = m.nvars
@@ -114,7 +163,7 @@ __device__ void llf(const float* WL,const float* WR,float* F,const float* PRM){
 __device__ void fluxdiff(const float* const W[5],float lam,const float* PRM,float* out){
   float WRm[NV],WL0[NV],WR0[NV],WLp[NV],dump[NV];
   halfstep(W[0],W[1],W[2],lam,PRM,dump,WRm); halfstep(W[1],W[2],W[3],lam,PRM,WL0,WR0); halfstep(W[2],W[3],W[4],lam,PRM,WLp,dump);
-  float Fl[NV],Fr[NV]; llf(WRm,WL0,Fl,PRM); llf(WR0,WLp,Fr,PRM); for(int c=0;c<NV;c++) out[c]=Fr[c]-Fl[c]; }
+  float Fl[NV],Fr[NV]; RSOLVE(WRm,WL0,Fl,PRM); RSOLVE(WR0,WLp,Fr,PRM); for(int c=0;c<NV;c++) out[c]=Fr[c]-Fl[c]; }
 #define IDX(a,b,c) (((long)(c)*ny+(b))*nx+(a))
 #define LDP(W,ii,jj,kk) float W[NV]; { long q=IDX(ii,jj,kk); float U[NV]; for(int c=0;c<NV;c++) U[c]=R[(long)c*VOL+q]; cons2prim(U,W,PRM); }
 #define SWC(dst,src,sw) float dst[NV]; { for(int c=0;c<NV;c++) dst[c]=src[c]; sw(dst); }
@@ -150,7 +199,7 @@ __device__ void recon(const float* Wm,const float* W0,const float* Wp,float* WL,
 __device__ void fluxdiff_rk(const float* const W[5],const float* PRM,float* out){
   float WLm[NV],WRm[NV],WL0[NV],WR0[NV],WLp[NV],WRp[NV];
   recon(W[0],W[1],W[2],WLm,WRm); recon(W[1],W[2],W[3],WL0,WR0); recon(W[2],W[3],W[4],WLp,WRp);
-  float Fl[NV],Fr[NV]; llf(WRm,WL0,Fl,PRM); llf(WR0,WLp,Fr,PRM); for(int c=0;c<NV;c++) out[c]=Fr[c]-Fl[c]; }
+  float Fl[NV],Fr[NV]; RSOLVE(WRm,WL0,Fl,PRM); RSOLVE(WR0,WLp,Fr,PRM); for(int c=0;c<NV;c++) out[c]=Fr[c]-Fl[c]; }
 #define LDPS(W,src,ii,jj,kk) float W[NV]; { long q=IDX(ii,jj,kk); float U[NV]; for(int c=0;c<NV;c++) U[c]=src[(long)c*VOL+q]; cons2prim(U,W,PRM); }
 // D = lam*(div F) for the conservative state in S at cell (i,j,k); the per-stage RK increment.
 __device__ void compute_D(const float* S,int i,int j,int k,int nx,int ny,int nz,float lam,const float* PRM,float* D){
@@ -188,7 +237,7 @@ __device__ void flux_dir(const float* W,int dir,const float* PRM,float* F){
 __device__ void llf_dir(const float* WL,const float* WR,int dir,float* F,const float* PRM){
   float L[NV],Rr[NV]; for(int c=0;c<NV;c++){ L[c]=WL[c]; Rr[c]=WR[c]; }
   if(dir==1){ swap_y(L); swap_y(Rr);} else if(dir==2){ swap_z(L); swap_z(Rr);}
-  llf(L,Rr,F,PRM); if(dir==1) swap_y(F); else if(dir==2) swap_z(F); }
+  RSOLVE(L,Rr,F,PRM); if(dir==1) swap_y(F); else if(dir==2) swap_z(F); }
 // cell's 6 face states, PLM-reconstructed and evolved dt/2 by the FULL (all-direction) flux divergence.
 __device__ void predict_cell(const float* R,int i,int j,int k,int nx,int ny,int nz,float lam,const float* PRM,
                              float* WxL,float* WxR,float* WyL,float* WyR,float* WzL,float* WzR){
@@ -483,10 +532,14 @@ extern "C" void fv_run_ctumh(float* R,float* O,int nx,int ny,int nz,float lam,co
   if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
   cudaDeviceSynchronize(); }
 """, "NV" => string(NV), "ZZTBZ" => string(NV <= 5 ? 8 : 4), "ZZMB" => string(NV <= 5 ? 16 : 8))
+    # the f32 kernels call RSOLVE: hand-written HLLD for GLM-MHD (scheme-matched to the .cu), else LLF.
+    ismhd  = sys isa GLMMHD
+    rblock = (ismhd ? _HLLD_C : "") * "#define RSOLVE " * (ismhd ? "hlld" : "llf") * "\n"
     "#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n#define NV $NV\n\n" *
     join(protos, "\n") * "\n\n" * join(defs, "\n") *
     _genswap("swap_y", m.vidx, 2) * _genswap("swap_z", m.vidx, 3) *
-    _genswap("swap_y_h", m.vidx, 2; half = true) * _genswap("swap_z_h", m.vidx, 3; half = true) * "\n" * tests * fixed
+    _genswap("swap_y_h", m.vidx, 2; half = true) * _genswap("swap_z_h", m.vidx, 3; half = true) *
+    "\n" * tests * rblock * fixed
 end
 
 function _find_nvcc()
@@ -655,6 +708,17 @@ function transpile_selfcheck(sys::FVSystem; trials = 2000)
         me = max(me, maximum(abs.(Wc .- collect(Float32, cons2prim(sys, prim2cons(sys,W))))),
                      maximum(abs.(Fc .- collect(Float32, physflux_x(sys, W)))),
                      abs(aC - maxspeed_x(sys, W)))
+    end
+    if sys isa GLMMHD                       # also check the hand-written HLLD C ≡ the Julia HLLD solver
+        fh = Libdl.dlsym(lib, :fv_hlld)
+        for _ in 1:trials
+            WL = ntuple(c -> (c == 1 || c == 5) ? 0.5f0 + rand(Float32) : rand(Float32) - 0.5f0, NV)
+            WR = ntuple(c -> (c == 1 || c == 5) ? 0.5f0 + rand(Float32) : rand(Float32) - 0.5f0, NV)
+            Fc = zeros(Float32, NV)
+            ccall(fh, Cvoid, (Ptr{Float32},Ptr{Float32},Ptr{Float32},Ptr{Float32}), collect(Float32,WL), collect(Float32,WR), Fc, PRM)
+            Fj = collect(Float32, riemann(HLLD(), sys, WL, WR))
+            (all(isfinite, Fc) && all(isfinite, Fj)) && (me = max(me, maximum(abs.(Fc .- Fj))))
+        end
     end
     return me
 end
