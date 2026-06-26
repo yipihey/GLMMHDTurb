@@ -28,6 +28,7 @@ using Libdl
 @inline Base.ifelse(m::Vec{N,Bool}, a::Vec{N,T}, b::Vec{N,T}) where {N,T} = vifelse(m, a, b)
 
 export @fvsystem, FVSystem
+export cons2prim, prim2cons, physflux_x, maxspeed_x, nconserved   # the contract API (build ICs, query physics)
 export PLM, PCM, LLF, HLL, HLLC, HLLD
 export Grid1D, step!, evolve!, primitives, conserved_total
 export Grid1DSoA, evolve_simd!, primitives_soa

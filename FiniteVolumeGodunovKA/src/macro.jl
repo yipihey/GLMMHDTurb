@@ -24,6 +24,17 @@ const _CONTRACT_FNS = (:cons2prim, :prim2cons, :physflux_x, :maxspeed_x, :eig_x,
 _check_contract(sym::Symbol) = sym in _CONTRACT_FNS ? sym :
     error("@fvsystem: `$sym` is not a contract function $(_CONTRACT_FNS)")
 
+"""
+    @fvsystem Name begin … end
+
+Declare a finite-volume system: the conserved-variable count, which components rotate under dimensional
+permutation (`vidx`), the `@params`, and the branch-free per-cell physics (`cons2prim`, `prim2cons`,
+`physflux_x`, `maxspeed_x`, optionally `eig_x`/`source`/`fastspeed_x`). Desugars to a
+`struct Name <: FVSystem` plus `@inline` methods on the contract functions, generic over the element
+type so the *same* source runs as Float32 scalars, `Vec{N}` SIMD lanes, and on a GPU thread — and is
+transpilable to CUDA-C. The physics must be **branch-free on field values** (use `ifelse`/`min`/`max`).
+See `Euler` and `GLMMHD` for complete examples.
+"""
 macro fvsystem(name, body)
     body isa Expr && body.head === :block || error("@fvsystem: expected a begin…end block")
 

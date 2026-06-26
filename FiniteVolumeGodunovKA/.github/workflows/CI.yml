@@ -1,0 +1,28 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# CI runners have no NVIDIA GPU and no nvcc, so the CUDA and transpile testsets
+# auto-skip (they are guarded by `CUDA.functional()` / nvcc detection). What runs
+# is the GPU-free core: the @fvsystem contract, Sod, entropy-wave convergence,
+# SIMD≡scalar bit-identity, 2D/3D rotation isotropy, GLM-MHD, CT div·B, and HLLD.
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.10', '1']
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1

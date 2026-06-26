@@ -1,5 +1,8 @@
 # FiniteVolumeGodunovKA.jl
 
+[![CI](https://github.com/yipihey/FiniteVolumeGodunovKA.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/yipihey/FiniteVolumeGodunovKA.jl/actions/workflows/CI.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Write a finite-volume Godunov solver's *physics* once, in pure Julia, and run it fast on **CPU and
 CUDA** — the KernelAbstractions *philosophy* (write-once, multi-backend) specialized to FV Godunov,
 with the performant backends KA lacks for this domain. You declare a **system** (conserved variables +
@@ -133,8 +136,32 @@ HLLD (a Riemann mismatch). The default `:ctu` scheme uses an f16 shared tile for
 f32 update keeps conservation exact); `scheme=:rk2` is the pure-f32 path. Throughput varies ~±15% with
 GPU thermal state, so compare runs in one process.
 
+## Install & test
+
+Not yet registered — add by URL:
+
+```julia
+pkg> add https://github.com/yipihey/FiniteVolumeGodunovKA.jl
+```
+
+Requirements: Julia 1.10+. CUDA.jl is a dependency (so installing pulls its artifacts), but the package
+loads and the CPU backends run without a GPU — the CUDA backends are inert and the GPU/transpile tests
+auto-skip. The transpile backend additionally needs `nvcc` (CUDA Toolkit / HPC SDK) *at construction
+time only*. Run the suite: `julia --project=. -e 'using Pkg; Pkg.test()'`. (CUDA being a hard dependency
+of a GPU-optional package is a known wart; making it a weak-dependency extension is a sensible future
+change, deferred because Julia can't cleanly export extension-defined types like `Grid3DCuMarch`.)
+
+## Examples
+
+Runnable demos, validators, and benchmarks are in `examples/` (see `examples/README.md`) — e.g.
+`julia -O3 --project=. examples/orszag_tang.jl` for a GLM-MHD Orszag-Tang vortex.
+
 ## Design
 
 See `DESIGN_fvkernel.md` for the contract rationale, the rotation/Riemann design, every optimization
-(threading, alternating Strang, the transpile backend) with its measured outcome, and the documented
-negatives (lagged-dt, `Vec{16}` on AVX2). Run the tests: `julia --project=. -e 'using Pkg; Pkg.test()'`.
+(threading, alternating Strang, the transpile/tiled/march backends, the f16 study) with its measured
+outcome, and the documented negatives (lagged-dt, `Vec{16}` on AVX2, register-capping). 
+
+## License
+
+MIT — see [`LICENSE`](LICENSE). © 2026 Tom Abel.

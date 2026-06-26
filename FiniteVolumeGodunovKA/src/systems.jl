@@ -111,3 +111,14 @@ export Euler, GLMMHD
 # Dynamic cleaning speed: each step the driver sets ch to the global max fast speed (Dedner).
 prestep(s::GLMMHD, cmax) = GLMMHD(s.γ, cmax, s.cr)
 has_source(::GLMMHD) = true                  # ψ-damping; Euler keeps the default (false → skipped)
+
+@doc """    Euler(; γ = 5/3)
+
+Compressible Euler hydrodynamics (5 conserved variables: density, 3 momenta, total energy), defined
+entirely through the [`@fvsystem`](@ref) contract. Primitive `W = (ρ, u, v, w, P)`.""" Euler
+
+@doc """    GLMMHD(; γ = 5/3, ch = 1, cr = 0.18)
+
+GLM-MHD with Dedner hyperbolic divergence cleaning (9 variables: Euler + magnetic field `B` + cleaning
+scalar `ψ`), via the [`@fvsystem`](@ref) contract — two rotating vectors (momentum and `B`), a ψ-damping
+`source`, and dynamic `ch` (set each step to the max fast speed).""" GLMMHD
