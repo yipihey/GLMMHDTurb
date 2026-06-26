@@ -35,15 +35,20 @@ y and z (the `vidx` declaration marks which components rotate, including multipl
 
 ## Backends (one source, all bit-identical where the scheme matches)
 
-| | scalar | SIMD (threaded) | CUDA | transpile→nvcc |
-|---|---|---|---|---|
-| **1D** | `Grid1D` | `Grid1DSoA` | `Grid1DCU` | |
-| **2D** | `Grid2D` | `Grid2DSoA` | `Grid2DCU` | |
-| **3D** | `Grid3D` | `Grid3DSoA` | `Grid3DCU` | `Grid3DCuMarch` |
+| | scalar | SIMD (threaded) | CUDA | transpile→nvcc | Metal¹ |
+|---|---|---|---|---|---|
+| **1D** | `Grid1D` | `Grid1DSoA` | `Grid1DCU` | | `Grid1DMtl` |
+| **2D** | `Grid2D` | `Grid2DSoA` | `Grid2DCU` | | `Grid2DMtl` |
+| **3D** | `Grid3D` | `Grid3DSoA` | `Grid3DCU` | `Grid3DCuMarch` | `Grid3DMtl` |
 
-Plus **`Grid2DCT`** (constrained transport — face-staggered B + edge EMF → machine-zero div·B) and an
-untested **Metal** backend (`metal/metal_2d.jl`, for Apple hardware). Riemann solvers: `LLF`, `HLL`,
-`HLLC` (Euler), `HLLD` (MHD). Reconstruction: `PLM` (MC limiter / unlimited), `PCM`.
+Plus **`Grid2DCT`** (constrained transport — face-staggered B + edge EMF → machine-zero div·B). Riemann
+solvers: `LLF`, `HLL`, `HLLC` (Euler), `HLLD` (MHD). Reconstruction: `PLM` (MC limiter / unlimited), `PCM`.
+
+¹ **Metal** (Apple GPU, `metal/metal.jl`) mirrors the CUDA backends 1D/2D/3D — kernel bodies identical,
+only the launch macro / thread-index intrinsics / array type differ. It is **UNTESTED** (written on a
+Linux/NVIDIA host where Metal.jl can't run); validate on a Mac with `metal_selfcheck_{1d,2d,3d}()` (each
+must be bit-identical to the scalar reference). The transpile→nvcc path has no Metal analog (it builds via
+`nvcc`); an MSL transpile target is future work.
 
 Every fast path is **bit-identical** to its scalar reference (max |Δ| = 0) on Sod/Brio-Wu/smooth-wave
 across the solvers; rotation (1, 2, or 3 axes; momentum + B) is exact; schemes are 2nd order in 1D/2D/3D.

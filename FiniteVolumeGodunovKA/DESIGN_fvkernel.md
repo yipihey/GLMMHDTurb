@@ -352,8 +352,13 @@ past it either trades occupancy the wrong way or needs a non-generic layout. The
    Orszag-Tang: IC div·B = 0 exactly; after evolution max|div·B| = 2.9e-4 (Float32 roundoff × 1/dx)
    vs the GLM cleaning's ~2.0 — ~7000× smaller. Uses the GLMMHD physics with ch=0 as the ideal-MHD
    flux. Remaining CT: the `@staggered`/`@emf` CONTRACT seam (user-definable CT systems), PLM, 3D, GPU.
-10. **Metal** — write the backend (analogous to CUDA); CANNOT be compiled/tested on this Linux/NVIDIA
-    host (Metal.jl is macOS-only). Measure the Metal.jl gap on Apple hardware.
+10. **Metal** — DONE (`metal/metal.jl`): `Grid1DMtl`/`Grid2DMtl`/`Grid3DMtl` at full parity with the CUDA
+    1D/2D/3D backends (identical kernel bodies; only the launch macro, `thread_position_in_grid_*d`, and
+    `MtlArray` differ; alternating Strang + `has_source` + dynamic `ch` mirrored). Statically validated on
+    the Linux host (parses; all referenced module names resolve) but UNTESTED on hardware — Metal.jl is
+    macOS-only. Validate on a Mac via `metal_selfcheck_{1d,2d,3d}()` (must be bit-identical to scalar),
+    then measure the Metal.jl-vs-roofline gap (the open question: does it need an MSL transpile target, as
+    CUDA needed `Grid3DCuMarch`?). The transpile→nvcc backend has no Metal analog yet.
 11. **Packaging:** move CUDA to a weakdep + extension (CPU-only installs stay light).
 
 Conformance lives in the parent `GLMMHDTurb` repo (OT, Sod, turbulence, div·B, the gradient-IC
