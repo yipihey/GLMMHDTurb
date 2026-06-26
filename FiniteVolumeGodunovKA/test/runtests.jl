@@ -358,6 +358,7 @@ if CUDA.functional()
                      sum(abs(ρ[i,j,k]-ρe((i-.5f0)/m,(j-.5f0)/m,(k-.5f0)/m,0.1f0)) for i in 1:m,j in 1:m,k in 1:m)/m^3)
             @test log(ctconv(run_ctu!,16)/ctconv(run_ctu!,32))/log(2) > 1.7     # naive CTU 2nd-order
             @test log(ctconv(run_ctus!,16)/ctconv(run_ctus!,32))/log(2) > 1.7   # tiled f16 CTU 2nd-order
+            @test log(ctconv(run_ctum!,16)/ctconv(run_ctum!,32))/log(2) > 1.7   # streaming z-march 2nd-order
         end
     else
         @info "nvcc not found — skipping transpile backend tests"

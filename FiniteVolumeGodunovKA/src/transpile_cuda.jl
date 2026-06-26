@@ -307,7 +307,85 @@ extern "C" void fv_run_ctus(float* R,float* O,int nx,int ny,int nz,float lam,con
   for(int s=0;s<nsteps;s++){ k_ctus<<<grp,thr,shbytes>>>(a,b,nx,ny,nz,lam,PRM); float* t=a; a=b; b=t; }
   if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
   cudaDeviceSynchronize(); }
-""", "NV" => string(NV), "ZZTBZ" => string(NV <= 5 ? 8 : 4))   # bigger z-tile for small NV (shared budget)
+// ===== streaming z-march (2.5D): a 2D (x,y) block marches through z, rolling 5 W + 3 dU planes in shared =====
+#define MBX ZZMB
+#define MBY ZZMB
+#define MWX (MBX+4)
+#define MWY (MBY+4)
+#define MUX (MBX+2)
+#define MUY (MBY+2)
+#define MWI(s,lx,ly) ((((s)*MWY+(ly))*MWX+(lx))*NV)
+#define MUI(s,lx,ly) ((((s)*MUY+(ly))*MUX+(lx))*NV)
+#define SL5(kz) ((((kz)%5)+5)%5)
+#define SL3(kz) ((((kz)%3)+3)%3)
+__device__ void mload_W(const float* R,__half* sW,int kz,int bx0,int by0,int nx,int ny,int nz,int tid,int NT,const float* PRM){
+  int s=SL5(kz); int gz=((kz%nz)+nz)%nz; long VOL=(long)nx*ny*nz;
+  for(int t=tid;t<MWX*MWY;t+=NT){ int lx=t%MWX, ly=t/MWX;
+    int gx=((bx0-2+lx)%nx+nx)%nx, gy=((by0-2+ly)%ny+ny)%ny;
+    long q=((long)gz*ny+gy)*nx+gx; float U[NV],W[NV]; for(int c=0;c<NV;c++) U[c]=R[(long)c*VOL+q];
+    cons2prim(U,W,PRM); for(int c=0;c<NV;c++) sW[MWI(s,lx,ly)+c]=__float2half(W[c]); } }
+__device__ void mcompute_dU(__half* sW,__half* sdU,int kz,int tid,int NT,float lam,const float* PRM){
+  int sd=SL3(kz), s0=SL5(kz), sm=SL5(kz-1), sp=SL5(kz+1);
+  for(int t=tid;t<MUX*MUY;t+=NT){ int ux=t%MUX, uy=t/MUX; int wx=ux+1, wy=uy+1;
+    float W0[NV],Wxm[NV],Wxp[NV],Wym[NV],Wyp[NV],Wzm[NV],Wzp[NV];
+    ldh(sW+MWI(s0,wx,wy),W0);
+    ldh(sW+MWI(s0,wx-1,wy),Wxm); ldh(sW+MWI(s0,wx+1,wy),Wxp);
+    ldh(sW+MWI(s0,wx,wy-1),Wym); ldh(sW+MWI(s0,wx,wy+1),Wyp);
+    ldh(sW+MWI(sm,wx,wy),Wzm); ldh(sW+MWI(sp,wx,wy),Wzp);
+    float WxL[NV],WxR[NV],WyL[NV],WyR[NV],WzL[NV],WzR[NV];
+    recon(Wxm,W0,Wxp,WxL,WxR); recon(Wym,W0,Wyp,WyL,WyR); recon(Wzm,W0,Wzp,WzL,WzR);
+    float Fa[NV],Fb[NV],d[NV]; for(int c=0;c<NV;c++) d[c]=0.f;
+    flux_dir(WxR,0,PRM,Fa);flux_dir(WxL,0,PRM,Fb);for(int c=0;c<NV;c++)d[c]+=Fa[c]-Fb[c];
+    flux_dir(WyR,1,PRM,Fa);flux_dir(WyL,1,PRM,Fb);for(int c=0;c<NV;c++)d[c]+=Fa[c]-Fb[c];
+    flux_dir(WzR,2,PRM,Fa);flux_dir(WzL,2,PRM,Fb);for(int c=0;c<NV;c++)d[c]+=Fa[c]-Fb[c];
+    for(int c=0;c<NV;c++) sdU[MUI(sd,ux,uy)+c]=__float2half(d[c]*-0.5f*lam); } }
+__device__ void mpf_ip(__half* sW,__half* sdU,int s0,int sd,int wx,int wy,int ux,int uy,int dir,int side,const float* PRM,float* out){
+  int ex=(dir==0),ey=(dir==1); float Wm[NV],W0[NV],Wp[NV],dU[NV],Wf[NV];
+  ldh(sW+MWI(s0,wx-ex,wy-ey),Wm); ldh(sW+MWI(s0,wx,wy),W0); ldh(sW+MWI(s0,wx+ex,wy+ey),Wp); ldh(sdU+MUI(sd,ux,uy),dU);
+  recon_one(Wm,W0,Wp,side,Wf); float U[NV]; prim2cons(Wf,U,PRM); for(int c=0;c<NV;c++) U[c]+=dU[c]; cons2prim(U,out,PRM); }
+__device__ void mpf_z(__half* sW,__half* sdU,int sm,int s0,int sp,int wx,int wy,int sd,int ux,int uy,int side,const float* PRM,float* out){
+  float Wm[NV],W0[NV],Wp[NV],dU[NV],Wf[NV];
+  ldh(sW+MWI(sm,wx,wy),Wm); ldh(sW+MWI(s0,wx,wy),W0); ldh(sW+MWI(sp,wx,wy),Wp); ldh(sdU+MUI(sd,ux,uy),dU);
+  recon_one(Wm,W0,Wp,side,Wf); float U[NV]; prim2cons(Wf,U,PRM); for(int c=0;c<NV;c++) U[c]+=dU[c]; cons2prim(U,out,PRM); }
+__global__ void k_ctum(const float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM){
+  __half* sW=smem; __half* sdU=smem+5*MWX*MWY*NV;
+  int bx0=blockIdx.x*MBX, by0=blockIdx.y*MBY;
+  int tid=threadIdx.y*MBX+threadIdx.x; const int NT=MBX*MBY;
+  int i=bx0+threadIdx.x, j=by0+threadIdx.y; bool valid=(i<nx&&j<ny);
+  int wx=threadIdx.x+2, wy=threadIdx.y+2, ux=threadIdx.x+1, uy=threadIdx.y+1;
+  long VOL=(long)nx*ny*nz;
+  for(int kz=-2;kz<=2;kz++) mload_W(R,sW,kz,bx0,by0,nx,ny,nz,tid,NT,PRM);
+  __syncthreads();
+  for(int kz=-1;kz<=1;kz++) mcompute_dU(sW,sdU,kz,tid,NT,lam,PRM);
+  __syncthreads();
+  for(int k=0;k<nz;k++){
+    if(valid){
+      int s0=SL5(k),sm=SL5(k-1),sp=SL5(k+1),sm2=SL5(k-2),sp2=SL5(k+2);
+      int d0=SL3(k),dm=SL3(k-1),dp=SL3(k+1);
+      float A[NV],B[NV],F[NV],acc[NV]; for(int c=0;c<NV;c++) acc[c]=0.f;
+      mpf_ip(sW,sdU,s0,d0,wx-1,wy,ux-1,uy,0,1,PRM,A); mpf_ip(sW,sdU,s0,d0,wx,wy,ux,uy,0,0,PRM,B); llf_dir(A,B,0,F,PRM); for(int c=0;c<NV;c++) acc[c]-=F[c];
+      mpf_ip(sW,sdU,s0,d0,wx,wy,ux,uy,0,1,PRM,A); mpf_ip(sW,sdU,s0,d0,wx+1,wy,ux+1,uy,0,0,PRM,B); llf_dir(A,B,0,F,PRM); for(int c=0;c<NV;c++) acc[c]+=F[c];
+      mpf_ip(sW,sdU,s0,d0,wx,wy-1,ux,uy-1,1,1,PRM,A); mpf_ip(sW,sdU,s0,d0,wx,wy,ux,uy,1,0,PRM,B); llf_dir(A,B,1,F,PRM); for(int c=0;c<NV;c++) acc[c]-=F[c];
+      mpf_ip(sW,sdU,s0,d0,wx,wy,ux,uy,1,1,PRM,A); mpf_ip(sW,sdU,s0,d0,wx,wy+1,ux,uy+1,1,0,PRM,B); llf_dir(A,B,1,F,PRM); for(int c=0;c<NV;c++) acc[c]+=F[c];
+      mpf_z(sW,sdU,sm2,sm,s0,wx,wy,dm,ux,uy,1,PRM,A); mpf_z(sW,sdU,sm,s0,sp,wx,wy,d0,ux,uy,0,PRM,B); llf_dir(A,B,2,F,PRM); for(int c=0;c<NV;c++) acc[c]-=F[c];
+      mpf_z(sW,sdU,sm,s0,sp,wx,wy,d0,ux,uy,1,PRM,A); mpf_z(sW,sdU,s0,sp,sp2,wx,wy,dp,ux,uy,0,PRM,B); llf_dir(A,B,2,F,PRM); for(int c=0;c<NV;c++) acc[c]+=F[c];
+      long q=IDX(i,j,k); for(int c=0;c<NV;c++) O[(long)c*VOL+q]=R[(long)c*VOL+q]-lam*acc[c];
+    }
+    __syncthreads();
+    mload_W(R,sW,k+3,bx0,by0,nx,ny,nz,tid,NT,PRM);
+    __syncthreads();
+    mcompute_dU(sW,sdU,k+2,tid,NT,lam,PRM);
+    __syncthreads();
+  } }
+extern "C" void fv_run_ctum(float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM,int nsteps){
+  dim3 thr(MBX,MBY), grp((nx+MBX-1)/MBX,(ny+MBY-1)/MBY);
+  int shb=(int)((5*MWX*MWY+3*MUX*MUY)*NV*sizeof(__half));
+  cudaFuncSetAttribute(k_ctum, cudaFuncAttributeMaxDynamicSharedMemorySize, shb);
+  float *a=R,*b=O;
+  for(int s=0;s<nsteps;s++){ k_ctum<<<grp,thr,shb>>>(a,b,nx,ny,nz,lam,PRM); float* t=a; a=b; b=t; }
+  if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
+  cudaDeviceSynchronize(); }
+""", "NV" => string(NV), "ZZTBZ" => string(NV <= 5 ? 8 : 4), "ZZMB" => string(NV <= 5 ? 16 : 8))
     "#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n#define NV $NV\n\n" *
     join(protos, "\n") * "\n\n" * join(defs, "\n") *
     _genswap("swap_y", m.vidx, 2) * _genswap("swap_z", m.vidx, 3) * "\n" * tests * fixed
@@ -349,7 +427,7 @@ mutable struct Grid3DCuMarch{N,S<:FVSystem}
     R::CuVector{Float32}; O::CuVector{Float32}; T::CuVector{Float32}     # state + 2 scratch (var-major)
     prm::CuVector{Float32}
     spd::CuVector{Float32}                                               # scratch: per-cell CFL speed
-    frun::Ptr{Cvoid}; frun2::Ptr{Cvoid}; fctu::Ptr{Cvoid}; fctus::Ptr{Cvoid}; fspeed::Ptr{Cvoid}
+    frun::Ptr{Cvoid}; frun2::Ptr{Cvoid}; fctu::Ptr{Cvoid}; fctus::Ptr{Cvoid}; fctum::Ptr{Cvoid}; fspeed::Ptr{Cvoid}
     nx::Int; ny::Int; nz::Int; dx::Float32
 end
 
@@ -367,7 +445,8 @@ function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::St
                                  CUDA.zeros(Float32, VOL),
                                  Libdl.dlsym(lib, :fv_run), Libdl.dlsym(lib, :fv_run_rk2),
                                  Libdl.dlsym(lib, :fv_run_ctu), Libdl.dlsym(lib, :fv_run_ctus),
-                                 Libdl.dlsym(lib, :fv_speed), nx, ny, nz, Float32(dx))
+                                 Libdl.dlsym(lib, :fv_run_ctum), Libdl.dlsym(lib, :fv_speed),
+                                 nx, ny, nz, Float32(dx))
 end
 
 @inline _devptr(x) = reinterpret(Ptr{Float32}, UInt(UInt64(pointer(x))))
@@ -401,6 +480,13 @@ function run_ctus!(g::Grid3DCuMarch, dt, nsteps::Integer)
     return g
 end
 
+"Run `nsteps` of the streaming z-march CTU kernel (2D block marches z, rolling 5 W + 3 dU planes; result in `g.R`)."
+function run_ctum!(g::Grid3DCuMarch, dt, nsteps::Integer)
+    ccall(g.fctum, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Cfloat, Ptr{Float32}, Cint),
+          _devptr(g.R), _devptr(g.O), g.nx, g.ny, g.nz, Float32(dt)/g.dx, _devptr(g.prm), Int32(nsteps))
+    return g
+end
+
 "Max over cells of the per-cell summed directional signal speed (the unsplit-CFL quantity, on device)."
 function maxspeed_sum(g::Grid3DCuMarch)
     ccall(g.fspeed, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Ptr{Float32}),
@@ -412,16 +498,20 @@ end
 dt_cfl(g::Grid3DCuMarch; cfl = 0.4f0) = Float32(cfl) * g.dx / maxspeed_sum(g)
 
 """
-    evolve!(g::Grid3DCuMarch, tend; cfl=0.4f0, dtevery=4, scheme=:ctu, maxsteps=10^7) -> g
+    evolve!(g::Grid3DCuMarch, tend; cfl=0.4f0, dtevery=4, scheme=:auto, maxsteps=10^7) -> g
 
 Integrate to physical time `tend` with adaptive CFL timesteps (recomputed every `dtevery` steps, with
 a `cfl` margin to cover speed growth between recomputes). Result is left in `g.R`. `scheme`:
-`:ctu` — the shared-memory-tiled single-pass 2nd-order kernel (f16 tile, fastest; default);
-`:rk2` — pure-f32 MUSCL + SSP-RK2 (two stages). Both validated 2nd-order and conservative.
+`:auto` — pick the fastest single-pass 2nd-order kernel for the grid (streaming z-march for large grids,
+shared-mem-tiled CTU otherwise; default); `:ctu` — force the tiled kernel; `:march` — force the z-march;
+`:rk2` — pure-f32 MUSCL + SSP-RK2 (two stages). All validated 2nd-order and conservative.
 """
-function evolve!(g::Grid3DCuMarch, tend; cfl = 0.4f0, dtevery::Integer = 4, scheme::Symbol = :ctu,
-                 maxsteps::Integer = 10^7)
-    stepper = scheme === :rk2 ? run_rk2! : run_ctus!
+function evolve!(g::Grid3DCuMarch{N}, tend; cfl = 0.4f0, dtevery::Integer = 4, scheme::Symbol = :auto,
+                 maxsteps::Integer = 10^7) where {N}
+    # the z-march halves global over-read but needs enough (x,y) blocks (16²-cell tiles) to fill the GPU;
+    # below that the tiled kernel's higher occupancy wins. (Euler-class NV only; GLM uses the tiled path.)
+    use_march = scheme === :march || (scheme === :auto && N <= 5 && (g.nx ÷ 16) * (g.ny ÷ 16) ≥ 512)
+    stepper = scheme === :rk2 ? run_rk2! : use_march ? run_ctum! : run_ctus!
     t = 0.0f0; tend = Float32(tend); n = 0; dt = 0.0f0
     while t < tend && n < maxsteps
         (n % dtevery == 0) && (dt = dt_cfl(g; cfl = cfl))

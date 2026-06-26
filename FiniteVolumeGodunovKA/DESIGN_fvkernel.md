@@ -246,9 +246,26 @@ Mcell/s (55%). (2) **One-sided reconstruction**: `predicted_face` computed both 
 z-tile to **8³ for Euler** (NV≤5) to amortize the halo (Ws over-read 4.5×→3.4×) and lift occupancy to 2
 blocks/SM = 66%; GLM (NV=9) keeps 8×8×4 (the transpiler emits `TBZ` per system, since 8³ at NV=9 needs
 ~98 KB shared). → **~4220 Mcell/s = 61% of the `.cu`, 2.1× over naive, 1.4× over RK2** — 2nd-order and
-conservation preserved throughout. The remaining 61→91% is the reference's rolling z-stream march (holds
-only a few z-slabs of shared per output cell, vs our whole-tile-in-shared), full-f16, and a leaner flux —
-the "long campaign" structure, diminishing returns from one transpiled stencil.
+conservation preserved throughout.
+
+### The streaming z-march — the reference's actual architecture (`run_ctum!`)
+
+The tiled kernel stages a whole 3D block in shared; the reference instead **marches**. A 2D (x,y) block
+walks through z keeping a rolling window of just **5 W-planes + 3 dU-planes** in shared (the CTU stencil
+needs W[k-2..k+2], dU[k-1..k+1]); each plane is read from global **once** (over-read 3.4× → 1.6×). Per
+step: update cell k, then load plane k+3 and compute dU plane k+2 for the next iteration; circular slots
+`SL5`/`SL3` and periodic-z wrapping in the load. Reproduced generically from the transpiler — in-plane
+faces from one plane slot, z-faces reconstructed across three slots — **correct on the first build**
+(matches the tiled kernel to the f16 floor, order 2.0–2.6, `Δmass`~1e-7).
+
+**The measurement that matters — it's a *scaling* win, not a flat one.** The march has far fewer blocks
+(one per z-column, not per 8³ tile), so it underfills the GPU at small grids: at 256³ it's **50% — below
+the tiled 61%** (3 `__syncthreads`/plane + 72 regs → 50% occupancy beats the memory saving). But its
+advantage compounds with size: **384³ → 62% (1.03× tiled), 512³ → 64% (1.05×) and climbing**, as the
+halved over-read pays off and the block count finally fills the GPU. So `evolve!(scheme=:auto)` picks the
+march once `(nx÷16)(ny÷16) ≥ 512` blocks, else the tiled kernel — best of both, automatically. The last
+64→91% would be the reference's flux-once-in-march + double-buffered loads (cut the per-plane barriers) +
+full-f16 — the genuine end of the campaign.
 
 ## Roadmap (priority order)
 

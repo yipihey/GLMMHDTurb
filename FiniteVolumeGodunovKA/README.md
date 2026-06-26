@@ -77,7 +77,9 @@ GPU, 3D Euler, vs the hand-tuned reference (6865):
 |---|---|---:|---:|
 | `Grid3DCU` (native CUDA) | dimensional-split **2nd-order**, CUDA.jl codegen | ~2550 Mcell/s | ~37–42% |
 | `evolve!` `scheme=:rk2` | 2nd-order MUSCL + SSP-RK2 (pure f32, two stages) | ~3000 Mcell/s | ~44% |
-| `evolve!` `scheme=:ctu` (**default**) | **single-pass 2nd-order**, shared-mem-tiled f16 CTU | **~4220 Mcell/s** | **~61%** |
+| `evolve!` `scheme=:ctu` | single-pass 2nd-order, shared-mem-tiled f16 CTU | ~4220 Mcell/s | ~61% |
+| `evolve!` `scheme=:march` | single-pass 2nd-order, **streaming z-march** (large grids) | **~4420 Mcell/s** | **~64%** |
+| `evolve!` `scheme=:auto` (**default**) | picks march vs tiled by grid size | **~4220–4420** | **~61–64%** |
 | `Grid3DCuMarch` · `run!` | 1st-order-in-time fused **single-pass throughput demo** | **~6300 Mcell/s** | **~91%** |
 
 Two honest readings. (1) The **transpiler emits `.cu`-class code**: its fused single-pass kernel hits
@@ -90,11 +92,16 @@ order ≈ 2, conservation to machine precision, validated as CUDA tests). Its de
 reproduced from the transpiler: each cell's transverse correction is computed *once* into a half-precision
 shared tile (the f32 update keeps conservation exact). After a profiling-driven audit — compute each
 interface flux **once** into a shared flux tile (not twice per cell), one-sided PLM reconstruction, and
-an NV-aware tile size (8³ for Euler) to amortize the halo — it reaches **~61% of the reference**,
-**2.1× over the naive single-pass and 1.4× over pure-f32 RK2** (`scheme=:rk2`, available for full f32).
-The gap from there to the 91% of the 1st-order demo is the reference's deeper hand-tuning (its rolling
-z-stream march that holds far less shared per output cell, full-f16, a leaner flux) — diminishing
-returns. Either way you never hand-write a CUDA kernel, a march, or an f16 tile.
+an NV-aware tile size (8³ for Euler) to amortize the halo — the tiled kernel reaches **~61% of the
+reference**, 2.1× over the naive single-pass and 1.4× over pure-f32 RK2 (`scheme=:rk2`, full f32).
+
+Then the reference's actual architecture: a **streaming z-march** (`scheme=:march`) — a 2D (x,y) block
+that marches through z keeping a rolling window of 5 W-planes + 3 dU-planes in shared, so each plane is
+read from global **once** (over-read 3.4× → 1.6×). Reproduced generically from the transpiler, it's
+validated 2nd-order and conservative. It has far fewer blocks (one per z-column), so it *underfills* small
+grids (50% at 256³) but **wins at production scale** as its memory advantage compounds: **62% at 384³,
+64% at 512³ and climbing**. `scheme=:auto` (the default) picks the march for large grids and the tiled
+kernel otherwise. Either way you never hand-write a CUDA kernel, a march, or an f16 tile.
 
 **On the CPU**, the same source runs as a SIMD-vectorized, threaded solver: ~1 Mcell/s scalar (1 core,
 3D) → **~145 Mcell/s** at the threaded peak (2D, `JULIA_NUM_THREADS ≈ 8–16`). These kernels are
