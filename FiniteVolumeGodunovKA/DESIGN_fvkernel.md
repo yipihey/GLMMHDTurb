@@ -234,9 +234,21 @@ update is f32. Validated 2nd-order (order 2.0–2.6, `Δmass`~1e-7, matches the 
 floor ~2e-4). Result: **~3300 Mcell/s = ~48% of the `.cu`, 1.6× over naive and 1.17× over pure-f32 RK2**
 — now `evolve!`'s default (`scheme=:ctu`; `:rk2` keeps the pure-f32 path). `__launch_bounds__(256,4)` to
 force 64 regs / 4 blocks made it *worse* (spills) — the "reduce structurally, never cap registers" lesson
-re-confirmed. The gap from 48% to the 91% of the 1st-order demo is the reference's deeper hand-tuning (a
-leaner flux phase to kill the double-Riemann, register discipline, its specific z-march) — diminishing
-returns from here.
+re-confirmed.
+
+**High-effort audit: 48% → 61%.** ptxas + a structural read found three wins. (1) **Flux-once**: phase 2
+computed every interface flux *twice* (cell `i`'s `Fxp` is cell `i+1`'s `Fxm`). Restructured to compute
+each interface **once** into a shared flux tile (`Fs`, +1 halo) and have each cell accumulate the
+divergence — halving the Riemann/`predicted_face` work. This *also* dropped registers **80 → 48** (an
+`acc[NV]` accumulator instead of holding 8 flux arrays live), removing the register pressure. → ~3750
+Mcell/s (55%). (2) **One-sided reconstruction**: `predicted_face` computed both PLM faces but used one;
+`recon_one` does just the needed side. (3) **NV-aware tile**: with registers now cheap (48), grow the
+z-tile to **8³ for Euler** (NV≤5) to amortize the halo (Ws over-read 4.5×→3.4×) and lift occupancy to 2
+blocks/SM = 66%; GLM (NV=9) keeps 8×8×4 (the transpiler emits `TBZ` per system, since 8³ at NV=9 needs
+~98 KB shared). → **~4220 Mcell/s = 61% of the `.cu`, 2.1× over naive, 1.4× over RK2** — 2nd-order and
+conservation preserved throughout. The remaining 61→91% is the reference's rolling z-stream march (holds
+only a few z-slabs of shared per output cell, vs our whole-tile-in-shared), full-f16, and a leaner flux —
+the "long campaign" structure, diminishing returns from one transpiled stencil.
 
 ## Roadmap (priority order)
 

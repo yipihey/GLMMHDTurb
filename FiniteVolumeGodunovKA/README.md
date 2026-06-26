@@ -76,8 +76,8 @@ GPU, 3D Euler, vs the hand-tuned reference (6865):
 | backend / scheme | what it is | Euler 3D | vs `.cu` 6865 |
 |---|---|---:|---:|
 | `Grid3DCU` (native CUDA) | dimensional-split **2nd-order**, CUDA.jl codegen | ~2550 Mcell/s | ~37–42% |
-| `evolve!` `scheme=:rk2` | 2nd-order MUSCL + SSP-RK2 (pure f32, two stages) | ~2900 Mcell/s | ~42% |
-| `evolve!` `scheme=:ctu` (**default**) | **single-pass 2nd-order**, shared-mem-tiled f16 CTU | ~3300 Mcell/s | ~48% |
+| `evolve!` `scheme=:rk2` | 2nd-order MUSCL + SSP-RK2 (pure f32, two stages) | ~3000 Mcell/s | ~44% |
+| `evolve!` `scheme=:ctu` (**default**) | **single-pass 2nd-order**, shared-mem-tiled f16 CTU | **~4220 Mcell/s** | **~61%** |
 | `Grid3DCuMarch` · `run!` | 1st-order-in-time fused **single-pass throughput demo** | **~6300 Mcell/s** | **~91%** |
 
 Two honest readings. (1) The **transpiler emits `.cu`-class code**: its fused single-pass kernel hits
@@ -88,11 +88,13 @@ sweep order the way a split solver does), so it's a *throughput demonstration*, 
 order ≈ 2, conservation to machine precision, validated as CUDA tests). Its default `:ctu` scheme is the
 **shared-memory-tiled, f16-tiled single-pass CTU** kernel — the reference `.cu`'s own technique,
 reproduced from the transpiler: each cell's transverse correction is computed *once* into a half-precision
-shared tile (the f32 update keeps conservation exact). That lands it at **~48% of the reference**,
-**1.6× over the naive single-pass and 1.17× over pure-f32 RK2** (`scheme=:rk2`, available for full f32).
-The gap from there to the 91% of the 1st-order demo is the reference's deeper hand-tuning (a leaner flux
-phase, register discipline, its specific z-march) — diminishing returns. Either way you never hand-write
-a CUDA kernel, a march, or an f16 tile.
+shared tile (the f32 update keeps conservation exact). After a profiling-driven audit — compute each
+interface flux **once** into a shared flux tile (not twice per cell), one-sided PLM reconstruction, and
+an NV-aware tile size (8³ for Euler) to amortize the halo — it reaches **~61% of the reference**,
+**2.1× over the naive single-pass and 1.4× over pure-f32 RK2** (`scheme=:rk2`, available for full f32).
+The gap from there to the 91% of the 1st-order demo is the reference's deeper hand-tuning (its rolling
+z-stream march that holds far less shared per output cell, full-f16, a leaner flux) — diminishing
+returns. Either way you never hand-write a CUDA kernel, a march, or an f16 tile.
 
 **On the CPU**, the same source runs as a SIMD-vectorized, threaded solver: ~1 Mcell/s scalar (1 core,
 3D) → **~145 Mcell/s** at the threaded peak (2D, `JULIA_NUM_THREADS ≈ 8–16`). These kernels are

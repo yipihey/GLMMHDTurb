@@ -219,15 +219,19 @@ extern "C" void fv_run_ctu(float* R,float* O,int nx,int ny,int nz,float lam,cons
 // ---- shared-memory-TILED single-pass CTU: compute each cell's transverse dU ONCE into shared ----
 #define TBX 8
 #define TBY 8
-#define TBZ 4
+#define TBZ ZZTBZ
 #define WSX (TBX+4)
 #define WSY (TBY+4)
 #define WSZ (TBZ+4)
 #define DSX (TBX+2)
 #define DSY (TBY+2)
 #define DSZ (TBZ+2)
+#define FSX (TBX+1)
+#define FSY (TBY+1)
+#define FSZ (TBZ+1)
 #define WSI(lx,ly,lz) ((((lz)*WSY+(ly))*WSX+(lx))*NV)
 #define DSI(lx,ly,lz) ((((lz)*DSY+(ly))*DSX+(lx))*NV)
+#define FSI(lx,ly,lz) ((((lz)*FSY+(ly))*FSX+(lx))*NV)
 __device__ inline void ldh(const __half* p,float* w){ for(int c=0;c<NV;c++) w[c]=__half2float(p[c]); }
 // transverse correction dU = -0.5*lam*div(F of reconstructed faces), for Ws-local cell (lx,ly,lz). f16 tile.
 __device__ void compute_dU(const __half* Ws,int lx,int ly,int lz,float lam,const float* PRM,__half* dU){
@@ -243,14 +247,22 @@ __device__ void compute_dU(const __half* Ws,int lx,int ly,int lz,float lam,const
   flux_dir(WyR,1,PRM,Fa); flux_dir(WyL,1,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
   flux_dir(WzR,2,PRM,Fa); flux_dir(WzL,2,PRM,Fb); for(int c=0;c<NV;c++) d[c]+=Fa[c]-Fb[c];
   for(int c=0;c<NV;c++) dU[c]=__float2half(d[c]*-0.5f*lam); }
+// one-sided PLM reconstruction (only the face we need; side 0=L i.e. -, 1=R i.e. +).
+__device__ void recon_one(const float* Wm,const float* W0,const float* Wp,int side,float* out){
+  float s=(side?0.5f:-0.5f); for(int c=0;c<NV;c++) out[c]=W0[c]+s*mc(W0[c]-Wm[c],Wp[c]-W0[c]); }
 // predicted face state of Ws-local cell (lx,ly,lz): PLM recon along dir, evolved by stored dUcell. side 0=L,1=R.
 __device__ void predicted_face(const __half* Ws,int lx,int ly,int lz,int dir,int side,const __half* dUcell,const float* PRM,float* out){
   int ex=(dir==0),ey=(dir==1),ez=(dir==2);
-  float Wm[NV],W0[NV],Wp[NV],dU[NV];
+  float Wm[NV],W0[NV],Wp[NV],dU[NV],Wf[NV];
   ldh(Ws+WSI(lx-ex,ly-ey,lz-ez),Wm); ldh(Ws+WSI(lx,ly,lz),W0); ldh(Ws+WSI(lx+ex,ly+ey,lz+ez),Wp); ldh(dUcell,dU);
-  float WL[NV],WR[NV]; recon(Wm,W0,Wp,WL,WR);
-  float* Wf=(side==0)?WL:WR; float U[NV]; prim2cons(Wf,U,PRM);
-  for(int c=0;c<NV;c++) U[c]+=dU[c]; cons2prim(U,out,PRM); }
+  recon_one(Wm,W0,Wp,side,Wf);
+  float U[NV]; prim2cons(Wf,U,PRM); for(int c=0;c<NV;c++) U[c]+=dU[c]; cons2prim(U,out,PRM); }
+// flux at the interface between Ws-local cell (lx,ly,lz) and its +dir neighbor — computed ONCE, shared.
+__device__ void iface_flux(const __half* Ws,const __half* dUs,int lx,int ly,int lz,int dir,const float* PRM,float* F){
+  int ex=(dir==0),ey=(dir==1),ez=(dir==2); float L[NV],Rr[NV];
+  predicted_face(Ws,lx,ly,lz,dir,1,dUs+DSI(lx-1,ly-1,lz-1),PRM,L);
+  predicted_face(Ws,lx+ex,ly+ey,lz+ez,dir,0,dUs+DSI(lx-1+ex,ly-1+ey,lz-1+ez),PRM,Rr);
+  llf_dir(L,Rr,dir,F,PRM); }
 extern __shared__ __half smem[];
 __global__ void k_ctus(const float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM){
   __half* Ws=smem; __half* dUs=smem+WSX*WSY*WSZ*NV;
@@ -267,19 +279,26 @@ __global__ void k_ctus(const float* R,float* O,int nx,int ny,int nz,float lam,co
     int dx=t%DSX, dy=(t/DSX)%DSY, dz=t/(DSX*DSY);
     compute_dU(Ws,dx+1,dy+1,dz+1,lam,PRM,dUs+DSI(dx,dy,dz)); }
   __syncthreads();
+  // phase 2: each interface flux computed ONCE into a shared tile, then each cell accumulates the divergence.
+  __shared__ float Fs[FSX*FSY*FSZ*NV];
   int i=blockIdx.x*TBX+threadIdx.x, j=blockIdx.y*TBY+threadIdx.y, k=blockIdx.z*TBZ+threadIdx.z;
-  if(i>=nx||j>=ny||k>=nz) return;
-  int sx=threadIdx.x+2, sy=threadIdx.y+2, sz=threadIdx.z+2;   // this cell's Ws-local
-  int ax=threadIdx.x+1, ay=threadIdx.y+1, az=threadIdx.z+1;   // this cell's dUs-local
-  const __half* dUc=dUs+DSI(ax,ay,az);
-  float A[NV],B[NV],Fxp[NV],Fxm[NV],Fyp[NV],Fym[NV],Fzp[NV],Fzm[NV];
-  predicted_face(Ws,sx,sy,sz,0,1,dUc,PRM,A);     predicted_face(Ws,sx+1,sy,sz,0,0,dUs+DSI(ax+1,ay,az),PRM,B); llf_dir(A,B,0,Fxp,PRM);
-  predicted_face(Ws,sx-1,sy,sz,0,1,dUs+DSI(ax-1,ay,az),PRM,A); predicted_face(Ws,sx,sy,sz,0,0,dUc,PRM,B);      llf_dir(A,B,0,Fxm,PRM);
-  predicted_face(Ws,sx,sy,sz,1,1,dUc,PRM,A);     predicted_face(Ws,sx,sy+1,sz,1,0,dUs+DSI(ax,ay+1,az),PRM,B); llf_dir(A,B,1,Fyp,PRM);
-  predicted_face(Ws,sx,sy-1,sz,1,1,dUs+DSI(ax,ay-1,az),PRM,A); predicted_face(Ws,sx,sy,sz,1,0,dUc,PRM,B);      llf_dir(A,B,1,Fym,PRM);
-  predicted_face(Ws,sx,sy,sz,2,1,dUc,PRM,A);     predicted_face(Ws,sx,sy,sz+1,2,0,dUs+DSI(ax,ay,az+1),PRM,B); llf_dir(A,B,2,Fzp,PRM);
-  predicted_face(Ws,sx,sy,sz-1,2,1,dUs+DSI(ax,ay,az-1),PRM,A); predicted_face(Ws,sx,sy,sz,2,0,dUc,PRM,B);      llf_dir(A,B,2,Fzm,PRM);
-  long q=IDX(i,j,k); for(int c=0;c<NV;c++) O[(long)c*VOL+q]=R[(long)c*VOL+q]-lam*((Fxp[c]-Fxm[c])+(Fyp[c]-Fym[c])+(Fzp[c]-Fzm[c])); }
+  int tx=threadIdx.x, ty=threadIdx.y, tz=threadIdx.z; bool valid=(i<nx&&j<ny&&k<nz);
+  float acc[NV]; for(int c=0;c<NV;c++) acc[c]=0.f;
+  for(int p=tid;p<FSX*TBY*TBZ;p+=NT){ int fx=p%FSX, fy=(p/FSX)%TBY, fz=p/(FSX*TBY);   // X interfaces
+    iface_flux(Ws,dUs,fx+1,fy+2,fz+2,0,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid) for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx+1,ty,tz)+c]-Fs[FSI(tx,ty,tz)+c];
+  __syncthreads();
+  for(int p=tid;p<TBX*FSY*TBZ;p+=NT){ int fx=p%TBX, fy=(p/TBX)%FSY, fz=p/(TBX*FSY);   // Y interfaces
+    iface_flux(Ws,dUs,fx+2,fy+1,fz+2,1,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid) for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx,ty+1,tz)+c]-Fs[FSI(tx,ty,tz)+c];
+  __syncthreads();
+  for(int p=tid;p<TBX*TBY*FSZ;p+=NT){ int fx=p%TBX, fy=(p/TBX)%TBY, fz=p/(TBX*TBY);   // Z interfaces
+    iface_flux(Ws,dUs,fx+2,fy+2,fz+1,2,PRM,Fs+FSI(fx,fy,fz)); }
+  __syncthreads();
+  if(valid){ for(int c=0;c<NV;c++) acc[c]+=Fs[FSI(tx,ty,tz+1)+c]-Fs[FSI(tx,ty,tz)+c];
+    long q=IDX(i,j,k); for(int c=0;c<NV;c++) O[(long)c*VOL+q]=R[(long)c*VOL+q]-lam*acc[c]; } }
 extern "C" void fv_run_ctus(float* R,float* O,int nx,int ny,int nz,float lam,const float* PRM,int nsteps){
   dim3 thr(TBX,TBY,TBZ), grp((nx+TBX-1)/TBX,(ny+TBY-1)/TBY,(nz+TBZ-1)/TBZ);
   int shbytes=(int)((WSX*WSY*WSZ+DSX*DSY*DSZ)*NV*sizeof(__half));
@@ -288,7 +307,7 @@ extern "C" void fv_run_ctus(float* R,float* O,int nx,int ny,int nz,float lam,con
   for(int s=0;s<nsteps;s++){ k_ctus<<<grp,thr,shbytes>>>(a,b,nx,ny,nz,lam,PRM); float* t=a; a=b; b=t; }
   if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
   cudaDeviceSynchronize(); }
-""", "NV" => string(NV))
+""", "NV" => string(NV), "ZZTBZ" => string(NV <= 5 ? 8 : 4))   # bigger z-tile for small NV (shared budget)
     "#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n#define NV $NV\n\n" *
     join(protos, "\n") * "\n\n" * join(defs, "\n") *
     _genswap("swap_y", m.vidx, 2) * _genswap("swap_z", m.vidx, 3) * "\n" * tests * fixed
