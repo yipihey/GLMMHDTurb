@@ -105,6 +105,15 @@ flux is computed once and carried down the march, not recomputed by the next pla
 default) picks the march for large grids and the tiled kernel otherwise. Either way you never hand-write a
 CUDA kernel, a march, or an f16 tile.
 
+**`scheme=:f16` — offered, but honestly not a win on Ampere.** The transpiler can emit a second `__half`
+copy of the physics and run the whole march in f16 arithmetic (conserved I/O + update stay f32, so
+conservation is exact; 2nd-order down to the f16 floor ~1e-3, then it plateaus). *Measured*, it's
+**slower** (60% vs the f32 march's 65%): scalar `__half` runs at ~f32 rate on GA10x but adds conversion
+overhead, and nvcc doesn't auto-pack it into `half2`. Closing the last 69%→91% needs explicit `half2`
+SIMD packing (2 values per instruction) — a non-generic data layout the transpiler can't synthesize — or
+tensor-core-class f16 hardware. So 69% is the honest ceiling for a *generic* transpiled 2nd-order kernel;
+`:f16` is kept as an opt-in for f16-fast hardware and lower-precision turbulence runs.
+
 **On the CPU**, the same source runs as a SIMD-vectorized, threaded solver: ~1 Mcell/s scalar (1 core,
 3D) → **~145 Mcell/s** at the threaded peak (2D, `JULIA_NUM_THREADS ≈ 8–16`). These kernels are
 memory-bandwidth bound, so they peak at ~8–16 threads — **don't over-subscribe** (`-t auto` on a

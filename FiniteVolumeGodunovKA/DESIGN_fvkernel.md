@@ -276,11 +276,23 @@ trick — they have no temporal ordering within a plane.
 regs / ~30 KB shared (5 W + 3 dU f16 planes) → 3 blocks/SM = 50% occupancy. The two remaining pipeline
 ideas both push the *wrong* way on the limiter: in-plane flux-once needs shared `Fs` tiles (+11 KB) and
 6+4-plane double-buffering (to cut 3 barriers→2) needs +2 planes — each drops to 2 blocks/SM = 33%,
-trading compute/syncs for occupancy when occupancy is exactly what's scarce. The reference's path to 91%
-is **full-f16 arithmetic** (pack values `half2`, halving register+shared pressure to lift occupancy) — but
-that requires the *physics functions themselves* to run in f16, which breaks the contract's generic f32
-physics and risks accuracy. So ~69% is near the practical ceiling for a correct, **generic** transpiled
-2nd-order kernel — 30%→48%→61%→69% across the campaign, every step validated 2nd-order and conservative.
+trading compute/syncs for occupancy when occupancy is exactly what's scarce.
+
+**Full-f16 arithmetic — built, measured, and it doesn't help (`scheme=:f16`).** The last idea was the
+reference's f16 path. The transpiler now emits a second **`__half` copy of the physics** (`_e2c`/`_genfunc`
+gained a `half` flag — `sqrtf`→`hsqrt`, `fmaxf`→`__hmax`, literals→`__float2half`, device-only since the
+f16 intrinsics are), and a full f16-arithmetic march (`k_ctumh`) computes recon/flux in half precision
+while keeping conserved I/O + update in f32 (conservation stays exact; 2nd-order down to the f16 floor
+~1e-3, then it plateaus — the n=48 order drops to 0.4, exactly the floor). But *measured*, it's **slower:
+60% vs the f32 march's 65%**. On GA10x scalar `__half` runs at ~f32 rate and adds conversion overhead, and
+nvcc does **not** auto-pack scalars into `half2` — so registers/occupancy don't improve. The reference's
+91% needs explicit **`half2` SIMD packing** (2 lanes per instruction), a non-generic data layout the
+transpiler can't synthesize from per-cell scalar physics, or tensor-core-class f16 hardware.
+
+So **~69% is the measured ceiling for a correct, *generic* transpiled 2nd-order kernel** — every lever
+past it either trades occupancy the wrong way or needs a non-generic layout. The campaign:
+**30% → 48% → 61% → 69%**, every step validated 2nd-order and conservative, with the f16 option offered
+(opt-in, honestly characterized) for f16-fast hardware and lower-precision runs.
 
 ## Roadmap (priority order)
 

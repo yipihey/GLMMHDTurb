@@ -12,25 +12,28 @@
 const _CU_NAMEMAP = Dict('ρ'=>"rho", 'γ'=>"gam", 'ψ'=>"psi", 'Δ'=>"D", 'λ'=>"lam")
 _csan(s) = join(get(_CU_NAMEMAP, c, string(c)) for c in string(s))
 
-function _e2c(e, pidx, physset)
-    e isa Float32 && return string(e) * "f"
-    e isa Float64 && return string(Float32(e)) * "f"
-    e isa Int     && return string(e) * ".0f"
+# `half=true` emits the identical expression in `__half` (f16) arithmetic — operators on __half are
+# overloaded in device code; only the intrinsics and literals change. The f32 path is byte-identical.
+function _e2c(e, pidx, physset; half::Bool=false)
+    lit(x) = half ? "__float2half($(x)f)" : "$(x)f"
+    e isa Float32 && return lit(e)
+    e isa Float64 && return lit(Float32(e))
+    e isa Int     && return half ? "__float2half($(e).0f)" : "$(e).0f"
     e isa Symbol  && return _csan(e)
     if e isa Expr
         if e.head === :call
-            op = e.args[1]; a = e.args[2:end]
-            op in physset && return string(_csan(op), "(", join([_e2c(x,pidx,physset) for x in a if x !== :p], ","), ", PRM)")
-            op === :inv  && return "(1.0f/(" * _e2c(a[1],pidx,physset) * "))"
-            op === :sqrt && return "sqrtf(" * _e2c(a[1],pidx,physset) * ")"
-            op === :abs  && return "fabsf(" * _e2c(a[1],pidx,physset) * ")"
-            op === :min  && return "fminf(" * _e2c(a[1],pidx,physset) * "," * _e2c(a[2],pidx,physset) * ")"
-            op === :max  && return "fmaxf(" * _e2c(a[1],pidx,physset) * "," * _e2c(a[2],pidx,physset) * ")"
-            op === :sign && return "((" * _e2c(a[1],pidx,physset) * ")>=0.f?1.f:-1.f)"
-            op === :ifelse && return "((" * _e2c(a[1],pidx,physset) * ")?(" * _e2c(a[2],pidx,physset) * "):(" * _e2c(a[3],pidx,physset) * "))"
+            op = e.args[1]; a = e.args[2:end]; rec(x) = _e2c(x, pidx, physset; half=half)
+            op in physset && return string(_csan(op), half ? "_h(" : "(", join([rec(x) for x in a if x !== :p], ","), ", PRM)")
+            op === :inv  && return "(" * lit(1.0) * "/(" * rec(a[1]) * "))"
+            op === :sqrt && return (half ? "hsqrt(" : "sqrtf(") * rec(a[1]) * ")"
+            op === :abs  && return (half ? "__habs(" : "fabsf(") * rec(a[1]) * ")"
+            op === :min  && return (half ? "__hmin(" : "fminf(") * rec(a[1]) * "," * rec(a[2]) * ")"
+            op === :max  && return (half ? "__hmax(" : "fmaxf(") * rec(a[1]) * "," * rec(a[2]) * ")"
+            op === :sign && return "((" * rec(a[1]) * ")>=" * lit(0.0) * "?" * lit(1.0) * ":" * lit(-1.0) * ")"
+            op === :ifelse && return "((" * rec(a[1]) * ")?(" * rec(a[2]) * "):(" * rec(a[3]) * "))"
             if op in (:+, :-, :*, :/)
-                length(a) == 1 && op === :- && return "(-" * _e2c(a[1],pidx,physset) * ")"
-                s = _e2c(a[1],pidx,physset); for x in a[2:end]; s = "(" * s * string(op) * _e2c(x,pidx,physset) * ")"; end
+                length(a) == 1 && op === :- && return "(-" * rec(a[1]) * ")"
+                s = rec(a[1]); for x in a[2:end]; s = "(" * s * string(op) * rec(x) * ")"; end
                 return s
             end
             error("transpile: unsupported call $op")
@@ -41,35 +44,38 @@ function _e2c(e, pidx, physset)
     error("transpile: unsupported expr $e")
 end
 
-function _genfunc(cname, arg, body, pidx, physset)
+function _genfunc(cname, arg, body, pidx, physset; half::Bool=false)
+    T = half ? "__half" : "float"; sfx = half ? "_h" : ""; rec(x) = _e2c(x, pidx, physset; half=half)
+    qual = half ? "__device__" : "__host__ __device__"   # f16 intrinsics (hsqrt…) are device-only
     items = filter(x -> !(x isa LineNumberNode), body.args); ret = items[end]; stmts = String[]
     for s in items[1:end-1]
         lhs, rhs = s.args[1], s.args[2]
         if lhs isa Symbol
-            push!(stmts, "  float $(_csan(lhs)) = $(_e2c(rhs,pidx,physset));")
+            push!(stmts, "  $T $(_csan(lhs)) = $(rec(rhs));")
         elseif lhs.head === :tuple
             names = [_csan(x) for x in lhs.args]
             if rhs isa Symbol
-                for (i,n) in enumerate(names); push!(stmts, "  float $n = $(_csan(rhs))[$(i-1)];"); end
+                for (i,n) in enumerate(names); push!(stmts, "  $T $n = $(_csan(rhs))[$(i-1)];"); end
             else
-                for (n,ex) in zip(names, rhs.args); push!(stmts, "  float $n = $(_e2c(ex,pidx,physset));"); end
+                for (n,ex) in zip(names, rhs.args); push!(stmts, "  $T $n = $(rec(ex));"); end
             end
         end
     end
     bs = join(stmts, "\n") * (isempty(stmts) ? "" : "\n")
     if ret isa Expr && ret.head === :tuple
-        outs = join(["  out[$(i-1)] = $(_e2c(ex,pidx,physset));" for (i,ex) in enumerate(ret.args)], "\n")
-        return ("void $cname(const float* $(_csan(arg)), float* out, const float* PRM)",
-                "__host__ __device__ void $cname(const float* $(_csan(arg)), float* out, const float* PRM) {\n$bs$outs\n}\n")
+        outs = join(["  out[$(i-1)] = $(rec(ex));" for (i,ex) in enumerate(ret.args)], "\n")
+        return ("$qual void $cname$sfx(const $T* $(_csan(arg)), $T* out, const $T* PRM)",
+                "$qual void $cname$sfx(const $T* $(_csan(arg)), $T* out, const $T* PRM) {\n$bs$outs\n}\n")
     else
-        return ("float $cname(const float* $(_csan(arg)), const float* PRM)",
-                "__host__ __device__ float $cname(const float* $(_csan(arg)), const float* PRM) {\n$bs  return $(_e2c(ret,pidx,physset));\n}\n")
+        return ("$qual $T $cname$sfx(const $T* $(_csan(arg)), const $T* PRM)",
+                "$qual $T $cname$sfx(const $T* $(_csan(arg)), const $T* PRM) {\n$bs  return $(rec(ret));\n}\n")
     end
 end
 
-function _genswap(cname, vidx, d)
-    sw = join(["{ float t=W[$(tr[1]-1)]; W[$(tr[1]-1)]=W[$(tr[d]-1)]; W[$(tr[d]-1)]=t; }" for tr in vidx], " ")
-    "__device__ void $cname(float* W){ $sw }\n"
+function _genswap(cname, vidx, d; half::Bool=false)
+    T = half ? "__half" : "float"
+    sw = join(["{ $T t=W[$(tr[1]-1)]; W[$(tr[1]-1)]=W[$(tr[d]-1)]; W[$(tr[d]-1)]=t; }" for tr in vidx], " ")
+    "__device__ void $cname($T* W){ $sw }\n"
 end
 
 "`gen_cuda_c(sys) -> String`: the full CUDA-C source emitted from the system's `@fvsystem` stencil."
@@ -82,7 +88,9 @@ function gen_cuda_c(sys::FVSystem)
     for f in want
         haskey(m.phys, f) || continue
         proto, def = _genfunc(string(f), m.phys[f][1], m.phys[f][2], pidx, physset)
-        push!(protos, "__host__ __device__ $proto;"); push!(defs, def)
+        push!(protos, "$proto;"); push!(defs, def)
+        ph, dh = _genfunc(string(f), m.phys[f][1], m.phys[f][2], pidx, physset; half = true)  # f16 twin (scheme=:f16)
+        push!(protos, "$ph;"); push!(defs, dh)
     end
     tests = """
 extern "C" {
@@ -391,10 +399,94 @@ extern "C" void fv_run_ctum(float* R,float* O,int nx,int ny,int nz,float lam,con
   for(int s=0;s<nsteps;s++){ k_ctum<<<grp,thr,shb>>>(a,b,nx,ny,nz,lam,PRM); float* t=a; a=b; b=t; }
   if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
   cudaDeviceSynchronize(); }
+// ===== f16-ARITHMETIC streaming march (scheme=:f16): recon/flux in __half; conserved I/O + update stay f32 =====
+__device__ __half mc_h(__half a,__half b){ __half z=__float2half(0.f);
+  if(a*b<=z) return z; __half s=(a>z)?__float2half(1.f):__float2half(-1.f);
+  return s*__hmin(__float2half(0.5f)*__habs(a+b),__hmin(__float2half(2.f)*__habs(a),__float2half(2.f)*__habs(b))); }
+__device__ void recon_one_h(const __half* Wm,const __half* W0,const __half* Wp,int side,__half* out){
+  __half h=side?__float2half(0.5f):__float2half(-0.5f); for(int c=0;c<NV;c++) out[c]=W0[c]+h*mc_h(W0[c]-Wm[c],Wp[c]-W0[c]); }
+__device__ void recon_h(const __half* Wm,const __half* W0,const __half* Wp,__half* WL,__half* WR){
+  __half h=__float2half(0.5f); for(int c=0;c<NV;c++){ __half d=mc_h(W0[c]-Wm[c],Wp[c]-W0[c]); WL[c]=W0[c]-h*d; WR[c]=W0[c]+h*d; } }
+__device__ void llf_h(const __half* WL,const __half* WR,__half* F,const __half* PRM){
+  __half UL[NV],UR[NV],FL[NV],FR[NV]; prim2cons_h(WL,UL,PRM); prim2cons_h(WR,UR,PRM); physflux_x_h(WL,FL,PRM); physflux_x_h(WR,FR,PRM);
+  __half s=__hmax(maxspeed_x_h(WL,PRM),maxspeed_x_h(WR,PRM)),h=__float2half(0.5f);
+  for(int c=0;c<NV;c++) F[c]=h*(FL[c]+FR[c])-h*s*(UR[c]-UL[c]); }
+__device__ void flux_dir_h(const __half* W,int dir,const __half* PRM,__half* F){
+  __half Wr[NV]; for(int c=0;c<NV;c++) Wr[c]=W[c]; if(dir==1) swap_y_h(Wr); else if(dir==2) swap_z_h(Wr);
+  physflux_x_h(Wr,F,PRM); if(dir==1) swap_y_h(F); else if(dir==2) swap_z_h(F); }
+__device__ void llf_dir_h(const __half* WL,const __half* WR,int dir,__half* F,const __half* PRM){
+  __half L[NV],Rr[NV]; for(int c=0;c<NV;c++){L[c]=WL[c];Rr[c]=WR[c];} if(dir==1){swap_y_h(L);swap_y_h(Rr);} else if(dir==2){swap_z_h(L);swap_z_h(Rr);}
+  llf_h(L,Rr,F,PRM); if(dir==1)swap_y_h(F); else if(dir==2)swap_z_h(F); }
+__device__ void mload_Wh(const float* R,__half* sW,int kz,int bx0,int by0,int nx,int ny,int nz,int tid,int NT,const __half* PRM){
+  int s=SL5(kz); int gz=((kz%nz)+nz)%nz; long VOL=(long)nx*ny*nz;
+  for(int t=tid;t<MWX*MWY;t+=NT){ int lx=t%MWX, ly=t/MWX;
+    int gx=((bx0-2+lx)%nx+nx)%nx, gy=((by0-2+ly)%ny+ny)%ny;
+    long q=((long)gz*ny+gy)*nx+gx; __half U[NV]; for(int c=0;c<NV;c++) U[c]=__float2half(R[(long)c*VOL+q]);
+    cons2prim_h(U,sW+MWI(s,lx,ly),PRM); } }
+__device__ void mcompute_dUh(__half* sW,__half* sdU,int kz,int tid,int NT,__half nhl,const __half* PRM){
+  int sd=SL3(kz), s0=SL5(kz), sm=SL5(kz-1), sp=SL5(kz+1);
+  for(int t=tid;t<MUX*MUY;t+=NT){ int ux=t%MUX, uy=t/MUX; int wx=ux+1, wy=uy+1; const __half* W0=sW+MWI(s0,wx,wy);
+    __half WxL[NV],WxR[NV],WyL[NV],WyR[NV],WzL[NV],WzR[NV];
+    recon_h(sW+MWI(s0,wx-1,wy),W0,sW+MWI(s0,wx+1,wy),WxL,WxR);
+    recon_h(sW+MWI(s0,wx,wy-1),W0,sW+MWI(s0,wx,wy+1),WyL,WyR);
+    recon_h(sW+MWI(sm,wx,wy),W0,sW+MWI(sp,wx,wy),WzL,WzR);
+    __half Fa[NV],Fb[NV],d[NV]; for(int c=0;c<NV;c++) d[c]=__float2half(0.f);
+    flux_dir_h(WxR,0,PRM,Fa);flux_dir_h(WxL,0,PRM,Fb);for(int c=0;c<NV;c++)d[c]=d[c]+Fa[c]-Fb[c];
+    flux_dir_h(WyR,1,PRM,Fa);flux_dir_h(WyL,1,PRM,Fb);for(int c=0;c<NV;c++)d[c]=d[c]+Fa[c]-Fb[c];
+    flux_dir_h(WzR,2,PRM,Fa);flux_dir_h(WzL,2,PRM,Fb);for(int c=0;c<NV;c++)d[c]=d[c]+Fa[c]-Fb[c];
+    for(int c=0;c<NV;c++) sdU[MUI(sd,ux,uy)+c]=nhl*d[c]; } }
+__device__ void mpf_iph(__half* sW,__half* sdU,int s0,int sd,int wx,int wy,int ux,int uy,int dir,int side,const __half* PRM,__half* out){
+  int ex=(dir==0),ey=(dir==1); __half Wf[NV],U[NV];
+  recon_one_h(sW+MWI(s0,wx-ex,wy-ey),sW+MWI(s0,wx,wy),sW+MWI(s0,wx+ex,wy+ey),side,Wf);
+  prim2cons_h(Wf,U,PRM); const __half* dU=sdU+MUI(sd,ux,uy); for(int c=0;c<NV;c++) U[c]=U[c]+dU[c]; cons2prim_h(U,out,PRM); }
+__device__ void mpf_zh(__half* sW,__half* sdU,int sm,int s0,int sp,int wx,int wy,int sd,int ux,int uy,int side,const __half* PRM,__half* out){
+  __half Wf[NV],U[NV];
+  recon_one_h(sW+MWI(sm,wx,wy),sW+MWI(s0,wx,wy),sW+MWI(sp,wx,wy),side,Wf);
+  prim2cons_h(Wf,U,PRM); const __half* dU=sdU+MUI(sd,ux,uy); for(int c=0;c<NV;c++) U[c]=U[c]+dU[c]; cons2prim_h(U,out,PRM); }
+__global__ void k_ctumh(const float* R,float* O,int nx,int ny,int nz,float lam,const __half* PRM){
+  __half* sW=smem; __half* sdU=smem+5*MWX*MWY*NV;
+  int bx0=blockIdx.x*MBX, by0=blockIdx.y*MBY; int tid=threadIdx.y*MBX+threadIdx.x; const int NT=MBX*MBY;
+  int i=bx0+threadIdx.x, j=by0+threadIdx.y; bool valid=(i<nx&&j<ny);
+  int wx=threadIdx.x+2, wy=threadIdx.y+2, ux=threadIdx.x+1, uy=threadIdx.y+1;
+  long VOL=(long)nx*ny*nz; __half nhl=__float2half(-0.5f*lam);
+  for(int kz=-2;kz<=2;kz++) mload_Wh(R,sW,kz,bx0,by0,nx,ny,nz,tid,NT,PRM);
+  __syncthreads();
+  for(int kz=-1;kz<=1;kz++) mcompute_dUh(sW,sdU,kz,tid,NT,nhl,PRM);
+  __syncthreads();
+  __half Fz_prev[NV];
+  if(valid){ __half A[NV],B[NV];
+    mpf_zh(sW,sdU,SL5(-2),SL5(-1),SL5(0),wx,wy,SL3(-1),ux,uy,1,PRM,A);
+    mpf_zh(sW,sdU,SL5(-1),SL5(0),SL5(1),wx,wy,SL3(0),ux,uy,0,PRM,B);
+    llf_dir_h(A,B,2,Fz_prev,PRM); }
+  for(int k=0;k<nz;k++){
+    if(valid){
+      int s0=SL5(k),sm=SL5(k-1),sp=SL5(k+1),sp2=SL5(k+2); int d0=SL3(k),dp=SL3(k+1);
+      __half A[NV],B[NV],F[NV],acc[NV]; for(int c=0;c<NV;c++) acc[c]=__float2half(0.f);
+      mpf_iph(sW,sdU,s0,d0,wx-1,wy,ux-1,uy,0,1,PRM,A); mpf_iph(sW,sdU,s0,d0,wx,wy,ux,uy,0,0,PRM,B); llf_dir_h(A,B,0,F,PRM); for(int c=0;c<NV;c++) acc[c]=acc[c]-F[c];
+      mpf_iph(sW,sdU,s0,d0,wx,wy,ux,uy,0,1,PRM,A); mpf_iph(sW,sdU,s0,d0,wx+1,wy,ux+1,uy,0,0,PRM,B); llf_dir_h(A,B,0,F,PRM); for(int c=0;c<NV;c++) acc[c]=acc[c]+F[c];
+      mpf_iph(sW,sdU,s0,d0,wx,wy-1,ux,uy-1,1,1,PRM,A); mpf_iph(sW,sdU,s0,d0,wx,wy,ux,uy,1,0,PRM,B); llf_dir_h(A,B,1,F,PRM); for(int c=0;c<NV;c++) acc[c]=acc[c]-F[c];
+      mpf_iph(sW,sdU,s0,d0,wx,wy,ux,uy,1,1,PRM,A); mpf_iph(sW,sdU,s0,d0,wx,wy+1,ux,uy+1,1,0,PRM,B); llf_dir_h(A,B,1,F,PRM); for(int c=0;c<NV;c++) acc[c]=acc[c]+F[c];
+      for(int c=0;c<NV;c++) acc[c]=acc[c]-Fz_prev[c];
+      mpf_zh(sW,sdU,sm,s0,sp,wx,wy,d0,ux,uy,1,PRM,A); mpf_zh(sW,sdU,s0,sp,sp2,wx,wy,dp,ux,uy,0,PRM,B); llf_dir_h(A,B,2,F,PRM);
+      for(int c=0;c<NV;c++){ acc[c]=acc[c]+F[c]; Fz_prev[c]=F[c]; }
+      long q=IDX(i,j,k); for(int c=0;c<NV;c++) O[(long)c*VOL+q]=R[(long)c*VOL+q]-lam*__half2float(acc[c]);
+    }
+    __syncthreads(); mload_Wh(R,sW,k+3,bx0,by0,nx,ny,nz,tid,NT,PRM);
+    __syncthreads(); mcompute_dUh(sW,sdU,k+2,tid,NT,nhl,PRM); __syncthreads();
+  } }
+extern "C" void fv_run_ctumh(float* R,float* O,int nx,int ny,int nz,float lam,const __half* PRM,int nsteps){
+  dim3 thr(MBX,MBY), grp((nx+MBX-1)/MBX,(ny+MBY-1)/MBY);
+  int shb=(int)((5*MWX*MWY+3*MUX*MUY)*NV*sizeof(__half));
+  cudaFuncSetAttribute(k_ctumh, cudaFuncAttributeMaxDynamicSharedMemorySize, shb);
+  float *a=R,*b=O;
+  for(int s=0;s<nsteps;s++){ k_ctumh<<<grp,thr,shb>>>(a,b,nx,ny,nz,lam,PRM); float* t=a; a=b; b=t; }
+  if(a!=R) cudaMemcpy(R,a,(size_t)NV*nx*ny*nz*sizeof(float),cudaMemcpyDeviceToDevice);
+  cudaDeviceSynchronize(); }
 """, "NV" => string(NV), "ZZTBZ" => string(NV <= 5 ? 8 : 4), "ZZMB" => string(NV <= 5 ? 16 : 8))
     "#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n#define NV $NV\n\n" *
     join(protos, "\n") * "\n\n" * join(defs, "\n") *
-    _genswap("swap_y", m.vidx, 2) * _genswap("swap_z", m.vidx, 3) * "\n" * tests * fixed
+    _genswap("swap_y", m.vidx, 2) * _genswap("swap_z", m.vidx, 3) *
+    _genswap("swap_y_h", m.vidx, 2; half = true) * _genswap("swap_z_h", m.vidx, 3; half = true) * "\n" * tests * fixed
 end
 
 function _find_nvcc()
@@ -431,9 +523,10 @@ end
 mutable struct Grid3DCuMarch{N,S<:FVSystem}
     sys::S
     R::CuVector{Float32}; O::CuVector{Float32}; T::CuVector{Float32}     # state + 2 scratch (var-major)
-    prm::CuVector{Float32}
+    prm::CuVector{Float32}; prmh::CuVector{Float16}                      # params (f32 + f16 twin for :f16)
     spd::CuVector{Float32}                                               # scratch: per-cell CFL speed
-    frun::Ptr{Cvoid}; frun2::Ptr{Cvoid}; fctu::Ptr{Cvoid}; fctus::Ptr{Cvoid}; fctum::Ptr{Cvoid}; fspeed::Ptr{Cvoid}
+    frun::Ptr{Cvoid}; frun2::Ptr{Cvoid}; fctu::Ptr{Cvoid}; fctus::Ptr{Cvoid}
+    fctum::Ptr{Cvoid}; fctumh::Ptr{Cvoid}; fspeed::Ptr{Cvoid}
     nx::Int; ny::Int; nz::Int; dx::Float32
 end
 
@@ -446,16 +539,18 @@ function Grid3DCuMarch(sys::FVSystem, U0::Array{NTuple{N,Float32},3}; dx, sm::St
         for c in 1:N; Uh[(c-1)*VOL + q] = u[c]; end
     end
     R = CuArray(Uh)
-    prm = CuArray(Float32[getfield(sys, p) for p in _fvmeta(sys).params])
-    Grid3DCuMarch{N,typeof(sys)}(sys, R, CUDA.zeros(Float32, N*VOL), CUDA.zeros(Float32, N*VOL), prm,
+    pv = Float32[getfield(sys, p) for p in _fvmeta(sys).params]
+    prm = CuArray(pv); prmh = CuArray(Float16.(pv))
+    Grid3DCuMarch{N,typeof(sys)}(sys, R, CUDA.zeros(Float32, N*VOL), CUDA.zeros(Float32, N*VOL), prm, prmh,
                                  CUDA.zeros(Float32, VOL),
                                  Libdl.dlsym(lib, :fv_run), Libdl.dlsym(lib, :fv_run_rk2),
                                  Libdl.dlsym(lib, :fv_run_ctu), Libdl.dlsym(lib, :fv_run_ctus),
-                                 Libdl.dlsym(lib, :fv_run_ctum), Libdl.dlsym(lib, :fv_speed),
-                                 nx, ny, nz, Float32(dx))
+                                 Libdl.dlsym(lib, :fv_run_ctum), Libdl.dlsym(lib, :fv_run_ctumh),
+                                 Libdl.dlsym(lib, :fv_speed), nx, ny, nz, Float32(dx))
 end
 
 @inline _devptr(x) = reinterpret(Ptr{Float32}, UInt(UInt64(pointer(x))))
+@inline _devptrh(x) = reinterpret(Ptr{Float16}, UInt(UInt64(pointer(x))))
 
 "Run `nsteps` of the fast 1st-order-in-time fused single-pass kernel at fixed `dt` (the throughput
 benchmark; result left in `g.R`). For science use the 2nd-order `evolve!`/`run_rk2!`."
@@ -493,6 +588,14 @@ function run_ctum!(g::Grid3DCuMarch, dt, nsteps::Integer)
     return g
 end
 
+"Run `nsteps` of the f16-ARITHMETIC streaming march (recon/flux in half precision; conserved I/O + update
+stay f32). Lower precision by design — fastest at scale for hydro/turbulence. Result in `g.R`."
+function run_ctumh!(g::Grid3DCuMarch, dt, nsteps::Integer)
+    ccall(g.fctumh, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Cfloat, Ptr{Float16}, Cint),
+          _devptr(g.R), _devptr(g.O), g.nx, g.ny, g.nz, Float32(dt)/g.dx, _devptrh(g.prmh), Int32(nsteps))
+    return g
+end
+
 "Max over cells of the per-cell summed directional signal speed (the unsplit-CFL quantity, on device)."
 function maxspeed_sum(g::Grid3DCuMarch)
     ccall(g.fspeed, Cvoid, (Ptr{Float32}, Ptr{Float32}, Cint, Cint, Cint, Ptr{Float32}),
@@ -517,7 +620,7 @@ function evolve!(g::Grid3DCuMarch{N}, tend; cfl = 0.4f0, dtevery::Integer = 4, s
     # the z-march halves global over-read but needs enough (x,y) blocks (16²-cell tiles) to fill the GPU;
     # below that the tiled kernel's higher occupancy wins. (Euler-class NV only; GLM uses the tiled path.)
     use_march = scheme === :march || (scheme === :auto && N <= 5 && (g.nx ÷ 16) * (g.ny ÷ 16) ≥ 512)
-    stepper = scheme === :rk2 ? run_rk2! : use_march ? run_ctum! : run_ctus!
+    stepper = scheme === :rk2 ? run_rk2! : scheme === :f16 ? run_ctumh! : use_march ? run_ctum! : run_ctus!
     t = 0.0f0; tend = Float32(tend); n = 0; dt = 0.0f0
     while t < tend && n < maxsteps
         (n % dtevery == 0) && (dt = dt_cfl(g; cfl = cfl))

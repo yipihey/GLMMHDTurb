@@ -359,6 +359,7 @@ if CUDA.functional()
             @test log(ctconv(run_ctu!,16)/ctconv(run_ctu!,32))/log(2) > 1.7     # naive CTU 2nd-order
             @test log(ctconv(run_ctus!,16)/ctconv(run_ctus!,32))/log(2) > 1.7   # tiled f16 CTU 2nd-order
             @test log(ctconv(run_ctum!,16)/ctconv(run_ctum!,32))/log(2) > 1.7   # streaming z-march 2nd-order
+            @test log(ctconv(run_ctumh!,16)/ctconv(run_ctumh!,32))/log(2) > 1.5  # f16-arith march: 2nd-order to the f16 floor
         end
     else
         @info "nvcc not found — skipping transpile backend tests"
