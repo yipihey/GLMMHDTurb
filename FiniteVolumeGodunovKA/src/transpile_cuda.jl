@@ -358,6 +358,11 @@ __global__ void k_ctum(const float* R,float* O,int nx,int ny,int nz,float lam,co
   __syncthreads();
   for(int kz=-1;kz<=1;kz++) mcompute_dU(sW,sdU,kz,tid,NT,lam,PRM);
   __syncthreads();
+  float Fz_prev[NV];                                   // z-flux at interface (k-1/2), carried down the march
+  if(valid){ float A[NV],B[NV];
+    mpf_z(sW,sdU,SL5(-2),SL5(-1),SL5(0),wx,wy,SL3(-1),ux,uy,1,PRM,A);  // cell -1, R face
+    mpf_z(sW,sdU,SL5(-1),SL5(0),SL5(1),wx,wy,SL3(0),ux,uy,0,PRM,B);    // cell 0,  L face
+    llf_dir(A,B,2,Fz_prev,PRM); }
   for(int k=0;k<nz;k++){
     if(valid){
       int s0=SL5(k),sm=SL5(k-1),sp=SL5(k+1),sm2=SL5(k-2),sp2=SL5(k+2);
@@ -367,8 +372,9 @@ __global__ void k_ctum(const float* R,float* O,int nx,int ny,int nz,float lam,co
       mpf_ip(sW,sdU,s0,d0,wx,wy,ux,uy,0,1,PRM,A); mpf_ip(sW,sdU,s0,d0,wx+1,wy,ux+1,uy,0,0,PRM,B); llf_dir(A,B,0,F,PRM); for(int c=0;c<NV;c++) acc[c]+=F[c];
       mpf_ip(sW,sdU,s0,d0,wx,wy-1,ux,uy-1,1,1,PRM,A); mpf_ip(sW,sdU,s0,d0,wx,wy,ux,uy,1,0,PRM,B); llf_dir(A,B,1,F,PRM); for(int c=0;c<NV;c++) acc[c]-=F[c];
       mpf_ip(sW,sdU,s0,d0,wx,wy,ux,uy,1,1,PRM,A); mpf_ip(sW,sdU,s0,d0,wx,wy+1,ux,uy+1,1,0,PRM,B); llf_dir(A,B,1,F,PRM); for(int c=0;c<NV;c++) acc[c]+=F[c];
-      mpf_z(sW,sdU,sm2,sm,s0,wx,wy,dm,ux,uy,1,PRM,A); mpf_z(sW,sdU,sm,s0,sp,wx,wy,d0,ux,uy,0,PRM,B); llf_dir(A,B,2,F,PRM); for(int c=0;c<NV;c++) acc[c]-=F[c];
-      mpf_z(sW,sdU,sm,s0,sp,wx,wy,d0,ux,uy,1,PRM,A); mpf_z(sW,sdU,s0,sp,sp2,wx,wy,dp,ux,uy,0,PRM,B); llf_dir(A,B,2,F,PRM); for(int c=0;c<NV;c++) acc[c]+=F[c];
+      for(int c=0;c<NV;c++) acc[c]-=Fz_prev[c];                                                       // z- : carried
+      mpf_z(sW,sdU,sm,s0,sp,wx,wy,d0,ux,uy,1,PRM,A); mpf_z(sW,sdU,s0,sp,sp2,wx,wy,dp,ux,uy,0,PRM,B); llf_dir(A,B,2,F,PRM);
+      for(int c=0;c<NV;c++){ acc[c]+=F[c]; Fz_prev[c]=F[c]; }                                          // z+ : accumulate + carry
       long q=IDX(i,j,k); for(int c=0;c<NV;c++) O[(long)c*VOL+q]=R[(long)c*VOL+q]-lam*acc[c];
     }
     __syncthreads();

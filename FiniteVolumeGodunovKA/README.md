@@ -78,8 +78,8 @@ GPU, 3D Euler, vs the hand-tuned reference (6865):
 | `Grid3DCU` (native CUDA) | dimensional-split **2nd-order**, CUDA.jl codegen | ~2550 Mcell/s | ~37–42% |
 | `evolve!` `scheme=:rk2` | 2nd-order MUSCL + SSP-RK2 (pure f32, two stages) | ~3000 Mcell/s | ~44% |
 | `evolve!` `scheme=:ctu` | single-pass 2nd-order, shared-mem-tiled f16 CTU | ~4220 Mcell/s | ~61% |
-| `evolve!` `scheme=:march` | single-pass 2nd-order, **streaming z-march** (large grids) | **~4420 Mcell/s** | **~64%** |
-| `evolve!` `scheme=:auto` (**default**) | picks march vs tiled by grid size | **~4220–4420** | **~61–64%** |
+| `evolve!` `scheme=:march` | single-pass 2nd-order, **streaming z-march** (large grids) | **~4750 Mcell/s** | **~69%** |
+| `evolve!` `scheme=:auto` (**default**) | picks march vs tiled by grid size | **~4220–4750** | **~61–69%** |
 | `Grid3DCuMarch` · `run!` | 1st-order-in-time fused **single-pass throughput demo** | **~6300 Mcell/s** | **~91%** |
 
 Two honest readings. (1) The **transpiler emits `.cu`-class code**: its fused single-pass kernel hits
@@ -99,9 +99,11 @@ Then the reference's actual architecture: a **streaming z-march** (`scheme=:marc
 that marches through z keeping a rolling window of 5 W-planes + 3 dU-planes in shared, so each plane is
 read from global **once** (over-read 3.4× → 1.6×). Reproduced generically from the transpiler, it's
 validated 2nd-order and conservative. It has far fewer blocks (one per z-column), so it *underfills* small
-grids (50% at 256³) but **wins at production scale** as its memory advantage compounds: **62% at 384³,
-64% at 512³ and climbing**. `scheme=:auto` (the default) picks the march for large grids and the tiled
-kernel otherwise. Either way you never hand-write a CUDA kernel, a march, or an f16 tile.
+grids but **wins at production scale** as its memory advantage compounds. A z-flux carry (each z-interface
+flux is computed once and carried down the march, not recomputed by the next plane) lifts it to **64% at
+384³, 69% at 512³ and climbing** (vs 54% at 256³, where the tiled kernel still wins). `scheme=:auto` (the
+default) picks the march for large grids and the tiled kernel otherwise. Either way you never hand-write a
+CUDA kernel, a march, or an f16 tile.
 
 **On the CPU**, the same source runs as a SIMD-vectorized, threaded solver: ~1 Mcell/s scalar (1 core,
 3D) → **~145 Mcell/s** at the threaded peak (2D, `JULIA_NUM_THREADS ≈ 8–16`). These kernels are

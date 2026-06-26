@@ -261,11 +261,26 @@ faces from one plane slot, z-faces reconstructed across three slots — **correc
 **The measurement that matters — it's a *scaling* win, not a flat one.** The march has far fewer blocks
 (one per z-column, not per 8³ tile), so it underfills the GPU at small grids: at 256³ it's **50% — below
 the tiled 61%** (3 `__syncthreads`/plane + 72 regs → 50% occupancy beats the memory saving). But its
-advantage compounds with size: **384³ → 62% (1.03× tiled), 512³ → 64% (1.05×) and climbing**, as the
-halved over-read pays off and the block count finally fills the GPU. So `evolve!(scheme=:auto)` picks the
-march once `(nx÷16)(ny÷16) ≥ 512` blocks, else the tiled kernel — best of both, automatically. The last
-64→91% would be the reference's flux-once-in-march + double-buffered loads (cut the per-plane barriers) +
-full-f16 — the genuine end of the campaign.
+advantage compounds with size, and `evolve!(scheme=:auto)` picks the march once `(nx÷16)(ny÷16) ≥ 512`
+blocks, else the tiled kernel — best of both, automatically.
+
+**Pipeline pass — the z-flux carry (64% → 69%).** Each z-interface flux is computed twice (cell `k`'s
+`z+` is cell `k+1`'s `z−`); but the march visits planes in order, so carry the previous plane's `z+`
+forward as this plane's `z−` (a per-thread `Fz_prev[NV]`). It removes 2 `mpf_z` + 1 `llf` per cell with
+no extra shared or syncs — and *lowered* registers 72 → 68 (removed more work than the carry costs).
+Result: **54% at 256³, 64% at 384³, 69% at 512³** (still climbing with size), conservation exact (the
+interface flux at the periodic seam is computed identically on both ends). x and y can't use the same
+trick — they have no temporal ordering within a plane.
+
+**The honest ceiling (~69% for generic f32 physics).** ptxas says the march is **occupancy-limited**: 68
+regs / ~30 KB shared (5 W + 3 dU f16 planes) → 3 blocks/SM = 50% occupancy. The two remaining pipeline
+ideas both push the *wrong* way on the limiter: in-plane flux-once needs shared `Fs` tiles (+11 KB) and
+6+4-plane double-buffering (to cut 3 barriers→2) needs +2 planes — each drops to 2 blocks/SM = 33%,
+trading compute/syncs for occupancy when occupancy is exactly what's scarce. The reference's path to 91%
+is **full-f16 arithmetic** (pack values `half2`, halving register+shared pressure to lift occupancy) — but
+that requires the *physics functions themselves* to run in f16, which breaks the contract's generic f32
+physics and risks accuracy. So ~69% is near the practical ceiling for a correct, **generic** transpiled
+2nd-order kernel — 30%→48%→61%→69% across the campaign, every step validated 2nd-order and conservative.
 
 ## Roadmap (priority order)
 
