@@ -1,7 +1,7 @@
 # ct_mhd.jl — LEAN constrained-transport MHD in the GLMMHDTurb prototype style.
 #
 # What transfers from the GLM light line-march (verbatim): cell-centered Godunov with PLM(MonCen)
-# + transverse-free 1D-Hancock predictor + HLL, fp32, fast-math-friendly. What's NEW (the part that
+# + MUSCL-Hancock predictor (flux differences of all three directions, as the GLM kernels) + HLL, fp32. What's NEW (the part that
 # does NOT transfer): the induction step. B is FACE-staggered (bxf,byf,bzf), updated by the curl of
 # edge-EMFs (Balsara-Spicer average of the Godunov magnetic fluxes) -> div·B = 0 to machine
 # precision by construction. Normal B at a face is the single continuous face value (no Riemann on
@@ -33,7 +33,9 @@ end
     end
 end
 @inline psub(a::NTuple{8},b::NTuple{8},c::Float32)=ntuple(t->a[t]+c*b[t],8)
-@inline pslope(L::NTuple{8},M::NTuple{8},R::NTuple{8})=ntuple(t->0.5f0*moncen(M[t]-L[t],R[t]-M[t]),8)
+# The full limited slope: the callers take a cell to its faces with psub(q,s,+-0.5f0). (It returned half the slope,
+# which with the 0.5 of the callers made the reconstruction first order: entropy wave 32-128 converged at 0.74-0.87.)
+@inline pslope(L::NTuple{8},M::NTuple{8},R::NTuple{8})=ntuple(t->moncen(M[t]-L[t],R[t]-M[t]),8)
 
 # ideal-MHD flux of prim q in direction d (1=x,2=y,3=z); F[Bn]=0 (CT handles normal B via EMF)
 @inline function dflux(q::NTuple{8},d::Int)
@@ -70,11 +72,24 @@ end
     FL=dflux(L,d); FR=dflux(R,d); UL=toC(L); UR=toC(R); ih=1f0/(SR-SL)
     ntuple(t->(SR*FL[t]-SL*FR[t]+SL*SR*(UR[t]-UL[t]))*ih, 8)
 end
-# transverse-free 1D-Hancock half-step of the cell center in direction d
-@inline function hanc1d(q::NTuple{8},s::NTuple{8},d::Int,dtdx::Float32)
-    FL=dflux(psub(q,s,-0.5f0),d); FR=dflux(psub(q,s,0.5f0),d)
-    U=toC(q); h=0.5f0*dtdx
-    Uh=ntuple(t->U[t]-h*(FR[t]-FL[t]),8)
+# MUSCL-Hancock half step of the centre of cell (i,j,k) with the flux differences of ALL three directions (as the GLM
+# kernels' `hancock`). Returns the half-step primitive state and the slope along d. (The one-direction predictor this
+# replaces left the fluxes through the other faces, half of every edge EMF, uncentred in time; with the full slope
+# alone the Alfven wave converged at 1.1-1.5, with both at 2.2-2.3 on the CPU emulation.)
+@inline function hanc3d(U,bccx,bccy,bccz,i::Int,j::Int,k::Int,d::Int,dtdx::Float32,N::Int)
+    cp(a,b,c)=cellprim(U,bccx,bccy,bccz,a,b,c,GAMMA)
+    q=cp(i,j,k)
+    sx=pslope(cp(w(i-1,N),j,k),q,cp(w(i+1,N),j,k))
+    sy=pslope(cp(i,w(j-1,N),k),q,cp(i,w(j+1,N),k))
+    sz=pslope(cp(i,j,w(k-1,N)),q,cp(i,j,w(k+1,N)))
+    fxp=dflux(psub(q,sx,0.5f0),1); fxm=dflux(psub(q,sx,-0.5f0),1)
+    fyp=dflux(psub(q,sy,0.5f0),2); fym=dflux(psub(q,sy,-0.5f0),2)
+    fzp=dflux(psub(q,sz,0.5f0),3); fzm=dflux(psub(q,sz,-0.5f0),3)
+    C=toC(q); h=0.5f0*dtdx
+    Uh=ntuple(t->C[t]-h*((fxp[t]-fxm[t])+(fyp[t]-fym[t])+(fzp[t]-fzm[t])),8)
+    (halfprim(Uh), d==1 ? sx : d==2 ? sy : sz)
+end
+@inline function halfprim(Uh::NTuple{8})
     rho=max(Uh[1],SMALLR); ir=1f0/rho
     vx=Uh[2]*ir; vy=Uh[3]*ir; vz=Uh[4]*ir; bx=Uh[6]; by=Uh[7]; bz=Uh[8]
     p=max((GAMMA-1f0)*(Uh[5]-0.5f0*rho*(vx*vx+vy*vy+vz*vz)-0.5f0*(bx*bx+by*by+bz*bz)),SMALLP)
@@ -102,13 +117,8 @@ function flux_kernel!(F,U,bccx,bccy,bccz,bnf, d::Int,dtdx::Float32,N)
         @inbounds begin
             k=(i-1)÷(N*N)+1; j=((i-1)÷N)%N+1; ii=(i-1)%N+1
             o1=d==1 ? 1 : 0; o2=d==2 ? 1 : 0; o3=d==3 ? 1 : 0
-            cp(a,b,c)=cellprim(U,bccx,bccy,bccz,a,b,c,GAMMA)
-            m2=cp(w(ii-2o1,N),w(j-2o2,N),w(k-2o3,N))
-            m1=cp(w(ii-o1,N), w(j-o2,N), w(k-o3,N))
-            c0=cp(ii,j,k)
-            p1=cp(w(ii+o1,N), w(j+o2,N), w(k+o3,N))
-            sL=pslope(m2,m1,c0); sR=pslope(m1,c0,p1)
-            mhL=hanc1d(m1,sL,d,dtdx); mhR=hanc1d(c0,sR,d,dtdx)
+            mhL,sL=hanc3d(U,bccx,bccy,bccz,w(ii-o1,N),w(j-o2,N),w(k-o3,N),d,dtdx,N)
+            mhR,sR=hanc3d(U,bccx,bccy,bccz,ii,j,k,d,dtdx,N)
             L=psub(mhL,sL, 0.5f0)      # cell i-1 reconstructed to its +d edge
             R=psub(mhR,sR,-0.5f0)      # cell i   reconstructed to its -d edge
             bn=bnf[ii,j,k]
