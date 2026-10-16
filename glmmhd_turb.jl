@@ -579,10 +579,13 @@ end
 end
 
 # Fused step (no scratch): one kernel uold -> unew.
+# c_h = courant*dx/(NDIM*dt_cfl)*glm_ch_scale. Pass dt_cfl = the CFL step (compute_dt) when dt is shortened to land
+# on an output or t_end: with c_h from the shortened dt, c_h and the flux of psi (c_h^2 bn*) grow without bound on
+# such steps (a factor 1e2-1e4 on the sweep's movie runs, which then failed). Every step_* below takes the same keyword.
 function step_fused!(uold, unew, afield, p::Params, dt::Float32, t::Float32, be;
-                     use_hlld::Bool=true, do_turb::Bool=false)
+                     use_hlld::Bool=true, do_turb::Bool=false, dt_cfl::Float32=dt)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dt_cfl/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0)
     integrator_fused!(be)(unew, uold, afield, p.gamma, p.smallr, pfl, p.smallc, dt, dx, ch, glm_fac,
@@ -748,10 +751,10 @@ end
 # Tiled step (no scratch): one kernel launch, (N/4)^3 blocks of 128 threads.
 function step_tiled!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
                      use_hlld::Bool=true, do_turb::Bool=false, nthreads::Int=192, maxregs::Int=0,
-                     lean::Bool=false)
+                     lean::Bool=false, dt_cfl::Float32=dt)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
     @assert N % TB == 0 "N must be a multiple of $TB"
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dt_cfl/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0)
     nb = N ÷ TB
@@ -880,11 +883,11 @@ end
 # (tb=4,half=true,riemann=:hll). Other combos: error (add a branch if needed).
 function step_plm!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
                    do_turb::Bool=false, nthreads::Int=192, tb::Int=0, half::Bool=true,
-                   riemann::Symbol=:hll, recon::Symbol=:plm)
+                   riemann::Symbol=:hll, recon::Symbol=:plm, dt_cfl::Float32=dt)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
     tb == 0 && (tb = N % 6 == 0 ? 6 : 4)   # auto: nsubgrid=3 when it divides N, else nsubgrid=2
     @assert N % tb == 0 "N=$N not divisible by tb=$tb (need N%6==0 for the fast TB=6 path, or N%4==0)"
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dt_cfl/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0); nb = N ÷ tb
     if recon === :ppm   # lean parabolic-PPM (single-zone edges + Hancock + shock fallback); f16+HLL only
@@ -1949,10 +1952,10 @@ function integrator_stream!(unew, uold, afield,
 end
 
 function step_stream!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
-                      use_hlld::Bool=true, do_turb::Bool=false, nthreads::Int=64)
+                      use_hlld::Bool=true, do_turb::Bool=false, nthreads::Int=64, dt_cfl::Float32=dt)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
     @assert N % SBX == 0 && N % SBY == 0 && N % SCZ == 0 "N must be a multiple of $SBX and $SCZ"
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dt_cfl/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0)
     @cuda threads=nthreads blocks=(N÷SBX, N÷SBY, N÷SCZ) integrator_stream!(
@@ -1982,9 +1985,9 @@ end
 
 # ---- multi-kernel step (validation path) -----------------------------------
 function step_multi!(uold, unew, rec, flx, ct, afield, p::Params, dt::Float32, t::Float32,
-                     be; use_hlld::Bool=true, do_turb::Bool=false)
+                     be; use_hlld::Bool=true, do_turb::Bool=false, dt_cfl::Float32=dt)
     N = p.N; dx = dxof(p); dtdx = dt/dx; pfl = pfloor(p)
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dt_cfl/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0)
     recon_kernel!(be)(rec, uold, p.gamma, p.smallr, pfl, dtdx, N; ndrange=(N,N,N))
@@ -2058,9 +2061,9 @@ function run_ot(; N::Int=128, t_end::Float32=0.5f0, use_hlld::Bool=true,
     ic_ot_kernel!(be)(u1, N, p.gamma; ndrange=(N,N,N)); KA.synchronize(be)
     t = 0.0f0; step = 0
     while t < t_end
-        dt = compute_dt(u1, ct, p, be)
-        dt = min(dt, t_end - t)
-        step_multi!(u1, u2, rec, flx, ct, afield, p, dt, t, be; use_hlld=use_hlld, do_turb=false)
+        dtc = compute_dt(u1, ct, p, be)
+        dt = min(dtc, t_end - t)
+        step_multi!(u1, u2, rec, flx, ct, afield, p, dt, t, be; use_hlld=use_hlld, do_turb=false, dt_cfl=dtc)
         u1, u2 = u2, u1
         t += dt; step += 1
     end
@@ -2220,14 +2223,14 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
         while t >= f.next_time
             ou_advance!(f, p, be)
         end
-        dt = compute_dt(u1, ct, p, be)
-        dt = min(dt, f.next_time - t, t_end - t)
+        dtc = compute_dt(u1, ct, p, be)
+        dt = min(dtc, f.next_time - t, t_end - t)
         if gpu && solver === :plm        # Hancock + HLL + GLM + PLM, f16 shared; TB auto (6 if N%6==0 else 4)
-            step_plm!(u1, u2, f.afield, p, dt, t; do_turb=true, nthreads=nthreads, tb=0, half=true, riemann=:hll)
+            step_plm!(u1, u2, f.afield, p, dt, t; do_turb=true, nthreads=nthreads, tb=0, half=true, riemann=:hll, dt_cfl=dtc)
         elseif gpu
-            step_tiled!(u1, u2, f.afield, p, dt, t; use_hlld=use_hlld, do_turb=true, nthreads=nthreads)
+            step_tiled!(u1, u2, f.afield, p, dt, t; use_hlld=use_hlld, do_turb=true, nthreads=nthreads, dt_cfl=dtc)
         else
-            step_multi!(u1, u2, rec, flx, ct, f.afield, p, dt, t, be; use_hlld=use_hlld, do_turb=true)
+            step_multi!(u1, u2, rec, flx, ct, f.afield, p, dt, t, be; use_hlld=use_hlld, do_turb=true, dt_cfl=dtc)
         end
         u1, u2 = u2, u1
         t += dt; step += 1
@@ -2287,8 +2290,8 @@ function validate_tiled_ot(; N::Int=64, t_end::Float32=0.2f0, lean::Bool=false)
     ic_ot_kernel!(be)(u1, N, p.gamma; ndrange=(N,N,N)); KA.synchronize(be)
     t=0.0f0; step=0
     while t < t_end
-        dt = compute_dt(u1, ct, p, be); dt = min(dt, t_end-t)
-        step_tiled!(u1, u2, afield, p, dt, t; use_hlld=true, do_turb=false, lean=lean); CUDA.synchronize(); u1,u2=u2,u1
+        dtc = compute_dt(u1, ct, p, be); dt = min(dtc, t_end-t)
+        step_tiled!(u1, u2, afield, p, dt, t; use_hlld=true, do_turb=false, lean=lean, dt_cfl=dtc); CUDA.synchronize(); u1,u2=u2,u1
         t += dt; step += 1
     end
     d = diagnostics(u1, ct, p, be)
@@ -2335,8 +2338,8 @@ function validate_fused_ot(; N::Int=64, t_end::Float32=0.2f0)
     ic_ot_kernel!(be)(u1, N, p.gamma; ndrange=(N,N,N)); KA.synchronize(be)
     t=0.0f0; step=0
     while t < t_end
-        dt = compute_dt(u1, ct, p, be); dt = min(dt, t_end-t)
-        step_fused!(u1, u2, afield, p, dt, t, be; use_hlld=true, do_turb=false); u1,u2=u2,u1
+        dtc = compute_dt(u1, ct, p, be); dt = min(dtc, t_end-t)
+        step_fused!(u1, u2, afield, p, dt, t, be; use_hlld=true, do_turb=false, dt_cfl=dtc); u1,u2=u2,u1
         t += dt; step += 1
     end
     d = diagnostics(u1, ct, p, be)
