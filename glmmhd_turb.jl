@@ -995,7 +995,8 @@ end
 
 # Production PLM step. Default = Hancock + HLL + GLM + PLM, f16 shared, TB=6 (nsubgrid=3).
 # Supported configs: (tb=6,half=true,riemann=:hll|:llf), (tb=4,half=false,riemann=:hlld bit-repro),
-# (tb=4,half=true,riemann=:hll), and (tb=4|6,half=false,riemann=:hll|:llf). Other combos: error (add a branch if needed).
+# (tb=4,half=true,riemann=:hll), and (tb=4,half=false,riemann=:hll|:llf). Other combos: error (add a branch if needed).
+# A Float32 tile of 6 does not fit: 90 KB of static shared memory against 48 KB.
 # anchored (default: on with half): anchored Float16 storage, see _spA. anchored=false is the original storage.
 # fct: cell-centred constrained transport in place of GLM cleaning (scratch fs = fct_scratch(N)), see _fct_store!.
 function step_plm!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
@@ -1031,12 +1032,8 @@ function step_plm!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
             _plm_launch(Val(4),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb,av,fv,fsa)
         elseif tb==4 && !half && riemann===:hll
             _plm_launch(Val(4),Val(false),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb,av,fv,fsa)
-        elseif tb==6 && !half && riemann===:hll
-            _plm_launch(Val(6),Val(false),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb,av,fv,fsa)
         elseif tb==4 && !half && riemann===:llf
             _plm_launch(Val(4),Val(false),Val(:llf), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb,av,fv,fsa)
-        elseif tb==6 && !half && riemann===:llf
-            _plm_launch(Val(6),Val(false),Val(:llf), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb,av,fv,fsa)
         else
             error("step_plm!: unsupported (tb=$tb, half=$half, riemann=$riemann); add a branch")
         end
