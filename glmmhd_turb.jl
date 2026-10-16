@@ -224,7 +224,10 @@ end
     # transverse fields/velocities in L*, R* (Miyoshi-Kusano eq. 42-47)
     function star(d, u, v, w, by, bz, pt, S, dstar)
         denK = d*(S-u)*(S-SM) - bn*bn
-        small = abs(denK) < 1.0f-12
+        # Degenerate when bn^2 ~ d(S-u)(S-SM) (field along the normal, c_fast = c_Alfven): in Float32 denK is then
+        # rounding noise of the size of the total pressure times 1e-7, far above an absolute 1e-12, and the star
+        # states blew up (current sheet, GEM). Compare with the star total pressure instead.
+        small = abs(denK) < 1.0f-4*pts
         if small
             vy = v; vz = w; byS = by; bzS = bz
         else
