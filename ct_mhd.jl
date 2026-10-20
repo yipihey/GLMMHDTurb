@@ -3,7 +3,7 @@
 # What transfers from the GLM light line-march (verbatim): cell-centered Godunov with PLM(MonCen)
 # + MUSCL-Hancock predictor (flux differences of all three directions, as the GLM kernels) + HLL, fp32. What's NEW (the part that
 # does NOT transfer): the induction step. B is FACE-staggered (bxf,byf,bzf), updated by the curl of
-# edge-EMFs (Balsara-Spicer average of the Godunov magnetic fluxes) -> div·B = 0 to machine
+# edge-EMFs (Godunov magnetic fluxes, upwinded by the mass flux: Gardiner & Stone 2005) -> div·B = 0 to machine
 # precision by construction. Normal B at a face is the single continuous face value (no Riemann on
 # Bn). LEAN layout = 8 reals/cell (5 cell + 3 face), vs production CT's 22 and GLM's 9 -> fits 512³.
 #
@@ -145,19 +145,58 @@ function update_hydro_kernel!(U,Fx,Fy,Fz,dtdx,N)
     return
 end
 
-# edge EMFs (Balsara-Spicer average of Godunov magnetic fluxes). component index in F: Bx=6,By=7,Bz=8.
-function emf_kernel!(ex,ey,ez,Fx,Fy,Fz,N)
+# Edge EMF from the four face EMFs around an edge, upwinded by the mass flux through each face (Gardiner & Stone 2005,
+# eqs. 41-45, "CT-contact"). The edge sits at (a-1/2, b-1/2) in the plane of the two directions a, b across it: Ea0, Eam
+# are the EMFs on the a-faces (a-1/2, b) and (a-1/2, b-1), Eb0, Ebm on the b-faces (a, b-1/2) and (a-1, b-1/2), mA*, mB*
+# the mass fluxes through those faces, Er** the cell-centred EMFs of the cells (a+da, b+db), da, db in {0, -1}.
+# The plain average of the four face EMFs (the original) is the first term; with it alone the field loop got worse
+# with resolution once the slopes were fixed (relative L1 error of B 0.60, 0.54, 0.88 at 64^2-256^2; with this 0.26,
+# 0.16 at 64^2, 128^2 on the CPU emulation, the same as GLM). The cell-centred EMFs come from ecc_kernel!: the
+# predictor's half-step velocity with the field at the start of the step. (The start-of-step velocity makes linear
+# waves first order; the predictor's half-step field breaks the field loop again; this keeps the Alfven wave second
+# order and smooth advection as accurate as GLM.)
+@inline function gs05(Ea0,Eam,Eb0,Ebm,mA0,mAm,mB0,mBm,Er00,Erm0,Er0m,Ermm)
+    up(m,lower,upper)=ifelse(m>0f0,lower,ifelse(m<0f0,upper,0.5f0*(lower+upper)))   # lower: the -1 side
+    A1=up(mA0,Erm0-Ebm,Er00-Eb0)      # dE/db between the cell centres of row b and the b-face below them
+    A3=up(mAm,Ebm-Ermm,Eb0-Er0m)      # dE/db between the b-face and the cell centres of row b-1
+    B1=up(mB0,Er0m-Eam,Er00-Ea0)      # dE/da between the cell centres of column a and the a-face before them
+    B3=up(mBm,Eam-Ermm,Ea0-Erm0)      # dE/da between the a-face and the cell centres of column a-1
+    0.25f0*((Ea0+Eam+Eb0+Ebm)+(A3-A1)+(B3-B1))
+end
+# cell-centred reference EMF E = -v x B for gs05: velocity of the predictor's half step, field at the start of the step
+function ecc_kernel!(ecx,ecy,ecz,U,bccx,bccy,bccz,dtdx::Float32,N)
+    i=(blockIdx().x-1)*blockDim().x+threadIdx().x
+    if i<=N*N*N
+        @inbounds begin
+            k=(i-1)÷(N*N)+1; j=((i-1)÷N)%N+1; ii=(i-1)%N+1
+            mh,_=hanc3d(U,bccx,bccy,bccz,ii,j,k,1,dtdx,N)
+            vx=mh[2]; vy=mh[3]; vz=mh[4]; bx=bccx[ii,j,k]; by=bccy[ii,j,k]; bz=bccz[ii,j,k]
+            ecx[ii,j,k]=vz*by-vy*bz; ecy[ii,j,k]=vx*bz-vz*bx; ecz[ii,j,k]=vy*bx-vx*by
+        end
+    end
+    return
+end
+
+# edge EMFs from the Godunov magnetic fluxes (component index in F: rho=1, Bx=6, By=7, Bz=8), upwinded (gs05)
+function emf_kernel!(ex,ey,ez,Fx,Fy,Fz,ecx,ecy,ecz,N)
     i=(blockIdx().x-1)*blockDim().x+threadIdx().x
     if i<=N*N*N
         @inbounds begin
             k=(i-1)÷(N*N)+1; j=((i-1)÷N)%N+1; ii=(i-1)%N+1
             im=w(ii-1,N); jm=w(j-1,N); km=w(k-1,N)
-            # ez at z-edge (i-1/2,j-1/2,k): Fy[Bx] (comp6) at (i,j),(i-1,j) ; Fx[By] (comp7) at (i,j),(i,j-1)
-            ez[ii,j,k]=0.25f0*(Fy[ii,j,k,6]+Fy[im,j,k,6]-Fx[ii,j,k,7]-Fx[ii,jm,k,7])
-            # ex at x-edge (i,j-1/2,k-1/2): Fz[By](7) at (i,j),(i,j-1) ; Fy[Bz](8) at (i,j),(i,j,k-1)
-            ex[ii,j,k]=0.25f0*(Fz[ii,j,k,7]+Fz[ii,jm,k,7]-Fy[ii,j,k,8]-Fy[ii,j,km,8])
-            # ey at y-edge (i-1/2,j,k-1/2): Fx[Bz](8) at (i,j,k),(i,j,k-1) ; Fz[Bx](6) at (i,j),(i-1,j)
-            ey[ii,j,k]=0.25f0*(Fx[ii,j,k,8]+Fx[ii,j,km,8]-Fz[ii,j,k,6]-Fz[im,j,k,6])
+            E(a,b,c,comp)=comp==1 ? ecx[a,b,c] : (comp==2 ? ecy[a,b,c] : ecz[a,b,c])
+            # ez at z-edge (i-1/2,j-1/2,k): a = x, b = y. E_z on x-faces = -Fx[By], on y-faces = +Fy[Bx]
+            ez[ii,j,k]=gs05(-Fx[ii,j,k,7],-Fx[ii,jm,k,7],Fy[ii,j,k,6],Fy[im,j,k,6],
+                            Fx[ii,j,k,1],Fx[ii,jm,k,1],Fy[ii,j,k,1],Fy[im,j,k,1],
+                            E(ii,j,k,3),E(im,j,k,3),E(ii,jm,k,3),E(im,jm,k,3))
+            # ex at x-edge (i,j-1/2,k-1/2): a = y, b = z. E_x on y-faces = -Fy[Bz], on z-faces = +Fz[By]
+            ex[ii,j,k]=gs05(-Fy[ii,j,k,8],-Fy[ii,j,km,8],Fz[ii,j,k,7],Fz[ii,jm,k,7],
+                            Fy[ii,j,k,1],Fy[ii,j,km,1],Fz[ii,j,k,1],Fz[ii,jm,k,1],
+                            E(ii,j,k,1),E(ii,jm,k,1),E(ii,j,km,1),E(ii,jm,km,1))
+            # ey at y-edge (i-1/2,j,k-1/2): a = z, b = x. E_y on z-faces = -Fz[Bx], on x-faces = +Fx[Bz]
+            ey[ii,j,k]=gs05(-Fz[ii,j,k,6],-Fz[im,j,k,6],Fx[ii,j,k,8],Fx[ii,j,km,8],
+                            Fz[ii,j,k,1],Fz[im,j,k,1],Fx[ii,j,k,1],Fx[ii,j,km,1],
+                            E(ii,j,k,2),E(ii,j,km,2),E(im,j,k,2),E(im,j,km,2))
         end
     end
     return
@@ -181,13 +220,14 @@ function faceB_kernel!(bxf,byf,bzf,ex,ey,ez,dtdx,N)
 end
 
 # one CT step (fixed dt). Scratch passed in to avoid realloc.
-function step!(U,bxf,byf,bzf, bccx,bccy,bccz, Fx,Fy,Fz, ex,ey,ez, dt,dx,N)
+function step!(U,bxf,byf,bzf, bccx,bccy,bccz, Fx,Fy,Fz, ex,ey,ez, ecx,ecy,ecz, dt,dx,N)
     dtdx=dt/dx; nb=cld(N^3,256)
     @cuda threads=256 blocks=nb bcc_kernel!(bccx,bccy,bccz,bxf,byf,bzf,N)
     @cuda threads=256 blocks=nb flux_kernel!(Fx,U,bccx,bccy,bccz,bxf,1,dtdx,N)
     @cuda threads=256 blocks=nb flux_kernel!(Fy,U,bccx,bccy,bccz,byf,2,dtdx,N)
     @cuda threads=256 blocks=nb flux_kernel!(Fz,U,bccx,bccy,bccz,bzf,3,dtdx,N)
-    @cuda threads=256 blocks=nb emf_kernel!(ex,ey,ez,Fx,Fy,Fz,N)
+    @cuda threads=256 blocks=nb ecc_kernel!(ecx,ecy,ecz,U,bccx,bccy,bccz,dtdx,N)
+    @cuda threads=256 blocks=nb emf_kernel!(ex,ey,ez,Fx,Fy,Fz,ecx,ecy,ecz,N)
     @cuda threads=256 blocks=nb update_hydro_kernel!(U,Fx,Fy,Fz,dtdx,N)
     @cuda threads=256 blocks=nb faceB_kernel!(bxf,byf,bzf,ex,ey,ez,dtdx,N)
     return
@@ -195,7 +235,8 @@ end
 
 scratch(N)=(CUDA.zeros(Float32,N,N,N),CUDA.zeros(Float32,N,N,N),CUDA.zeros(Float32,N,N,N),
             CUDA.zeros(Float32,N,N,N,8),CUDA.zeros(Float32,N,N,N,8),CUDA.zeros(Float32,N,N,N,8),
-            CUDA.zeros(Float32,N,N,N),CUDA.zeros(Float32,N,N,N),CUDA.zeros(Float32,N,N,N))
+            CUDA.zeros(Float32,N,N,N),CUDA.zeros(Float32,N,N,N),CUDA.zeros(Float32,N,N,N),
+            CUDA.zeros(Float32,N,N,N),CUDA.zeros(Float32,N,N,N),CUDA.zeros(Float32,N,N,N))   # cell-centred reference EMFs
 
 # face div·B for cell i = (upper face - lower face)/dx per dim; bxf[i]=lower-x face so upper=bxf[i+1].
 function divB_max(bxf,byf,bzf,dx)
