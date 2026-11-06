@@ -2340,7 +2340,13 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
     rec = gpu ? nothing : KA.zeros(be, Float32, N,N,N,36)
     flx = gpu ? nothing : KA.zeros(be, Float32, N,N,N,27)
     sen = (gpu || !ducros) ? nothing : KA.zeros(be, Float32, N,N,N)
-    gpu && (ducros || riemann !== :default) && error("ducros/riemann kwargs: CPU multi-kernel path only (backend=:cpu)")
+    # solver=:multi runs the portable KA multi-kernel path (needed for ducros/riemann kwargs) on either backend
+    multi = !gpu || solver === :multi
+    gpu && !multi && (ducros || riemann !== :default) && error("ducros/riemann kwargs need solver=:multi on GPU")
+    if gpu && multi
+        rec = KA.zeros(be, Float32, N,N,N,36); flx = KA.zeros(be, Float32, N,N,N,27)
+        sen = ducros ? KA.zeros(be, Float32, N,N,N) : nothing
+    end
     p0 = p.rho0*p.cs0^2/p.gamma
     ic_uniform_kernel!(be)(u1, p.rho0, p0, p.b0, p.gamma; ndrange=(N,N,N)); KA.synchronize(be)
     gpu || Random.seed!(p.turb_seed)       # reproducible CPU forcing (CUDA.randn! has its own RNG)
@@ -2353,7 +2359,11 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
         end
         dt = compute_dt(u1, ct, p, be)
         dt = min(dt, f.next_time - t, t_end - t)
-        if gpu && solver === :plm        # Hancock + HLL + GLM + PLM, f16 shared; TB auto (6 if N%6==0 else 4)
+        if multi
+            step_multi!(u1, u2, rec, flx, ct, f.afield, p, dt, t, be; use_hlld=use_hlld, do_turb=true,
+                        riemann=riemann, ducros=ducros, sen=sen, phimin=phimin, deps=deps, rjump=rjump,
+                        widen=widen, thr=thr, rlow=rlow)
+        elseif gpu && solver === :plm        # Hancock + HLL + GLM + PLM, f16 shared; TB auto (6 if N%6==0 else 4)
             step_plm!(u1, u2, f.afield, p, dt, t; do_turb=true, nthreads=nthreads, tb=0, half=true, riemann=:hll)
         elseif gpu
             step_tiled!(u1, u2, f.afield, p, dt, t; use_hlld=use_hlld, do_turb=true, nthreads=nthreads)
@@ -2367,7 +2377,7 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
         if snap_cb !== nothing && !isempty(snap_times) && t >= snap_times[1]
             popfirst!(snap_times); snap_cb(u1, t, step, sen)
         end
-        if !all(isfinite, @view u1[:,:,:,1])
+        if step % 50 == 0 && !all(isfinite, @view u1[:,:,:,1])
             @printf("  NON-FINITE density at step=%d t=%.4f -> abort\n", step, t); break
         end
         if verbose && step % ncontrol == 0
