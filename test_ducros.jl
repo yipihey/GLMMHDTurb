@@ -69,7 +69,7 @@ function test_ot(N; names=String[], t_end=0.5f0)
     end
 end
 
-function test_turb(N, t_end; names=String[], tavg0=0.3f0, nsnap=6, outdir="ducros_out")
+function test_turb(N, t_end; names=String[], tavg0=0.3f0, nsnap=6, outdir=get(ENV,"OUTDIR","ducros_out"))
     mkpath(outdir)
     for c in pick(names)
         snaps = collect(range(tavg0, t_end; length=nsnap)) .|> Float32

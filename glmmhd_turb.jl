@@ -2342,6 +2342,7 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
     gpu && (ducros || riemann !== :default) && error("ducros/riemann kwargs: CPU multi-kernel path only (backend=:cpu)")
     p0 = p.rho0*p.cs0^2/p.gamma
     ic_uniform_kernel!(be)(u1, p.rho0, p0, p.b0, p.gamma; ndrange=(N,N,N)); KA.synchronize(be)
+    gpu || Random.seed!(p.turb_seed)       # reproducible CPU forcing (CUDA.randn! has its own RNG)
     f = Forcing(p, be; amp=amp)
     ou_advance!(f, p, be)                  # seed the first field
     t = 0.0f0; step = 0
