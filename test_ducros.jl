@@ -14,6 +14,7 @@ const SEED = parse(Int, get(ENV, "SEED", "1"))
 const TAVG0 = parse(Float32, get(ENV, "TAVG0", "0.3"))
 const NSNAP = parse(Int, get(ENV, "NSNAP", "6"))
 const BACKEND = Symbol(get(ENV, "BACKEND", "cpu"))
+const COURANT = parse(Float32, get(ENV, "COURANT", "0.7"))
 const AMP = parse(Float32, get(ENV, "AMP", "130"))
 
 # shell-averaged power spectrum of a 3-component field (N^3 each), k in units of 2pi/L
@@ -94,7 +95,7 @@ function test_turb(N, t_end; names=String[], tavg0=TAVG0, nsnap=NSNAP, outdir=ge
         t0 = time()
         d = G.run_turb(N=N, t_end=t_end, amp=AMP, backend=BACKEND, solver=:multi, pin=:none, ncontrol=400,
                        riemann=c.riemann, ducros=c.ducros, phimin=c.phimin, rjump=c.rjump,
-                       widen=c.widen, thr=c.thr, rlow=c.rlow, nstepmax=NSTEPMAX, seed=SEED,
+                       widen=c.widen, thr=c.thr, rlow=c.rlow, nstepmax=NSTEPMAX, seed=SEED, courant=COURANT,
                        snap_times=snaps, snap_cb=cb)
         wall = time() - t0
         fsh = isempty(phistats) ? NaN : mean(phistats)
