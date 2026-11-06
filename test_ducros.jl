@@ -9,6 +9,7 @@ include("glmmhd_turb.jl")
 using .GLMMHDTurb
 using FFTW, Printf, Statistics
 const G = GLMMHDTurb
+const NSTEPMAX = parse(Int, get(ENV, "NSTEPMAX", "20000"))
 const AMP = parse(Float32, get(ENV, "AMP", "130"))
 
 # shell-averaged power spectrum of a 3-component field (N^3 each), k in units of 2pi/L
@@ -36,13 +37,22 @@ function spectra(u, p)
     return Ek, Ev, Eb
 end
 
+# fields: base riemann, ducros on/off, phimin floor, rjump density guard, widen (4-cell
+# stencil), thr (binary: phi>thr -> 1), rlow (full dissipation where rho < rlow)
+C(name, riemann, ducros; phimin=0.0f0, rjump=0.0f0, widen=false, thr=0.0f0, rlow=0.0f0) =
+    (; name, riemann, ducros, phimin, rjump, widen, thr, rlow)
 const CONFIGS = [
-    (name="hll",            riemann=:hll,  ducros=false, phimin=0.0f0,  rjump=0.0f0),
-    (name="hlld",           riemann=:hlld, ducros=false, phimin=0.0f0,  rjump=0.0f0),
-    (name="hll_duc0",       riemann=:hll,  ducros=true,  phimin=0.0f0,  rjump=0.0f0),
-    (name="hll_duc0.1",     riemann=:hll,  ducros=true,  phimin=0.1f0,  rjump=0.0f0),
-    (name="hll_duc0.1_rj2", riemann=:hll,  ducros=true,  phimin=0.1f0,  rjump=2.0f0),
-    (name="hlld_duc0.1",    riemann=:hlld, ducros=true,  phimin=0.1f0,  rjump=0.0f0),
+    C("hll",            :hll,  false),
+    C("hlld",           :hlld, false),
+    C("hll_duc0",       :hll,  true),
+    C("hll_duc0.1",     :hll,  true; phimin=0.1f0),
+    C("hll_duc0.1_rj2", :hll,  true; phimin=0.1f0, rjump=2.0f0),
+    C("hlld_duc0.1",    :hlld, true; phimin=0.1f0),
+    C("hll_duc0.3",     :hll,  true; phimin=0.3f0),
+    C("hll_wide0.1",    :hll,  true; phimin=0.1f0, widen=true),
+    C("hll_wide_thr",   :hll,  true; phimin=0.1f0, widen=true, thr=0.2f0),
+    C("hll_wide_thr_rl",:hll,  true; phimin=0.1f0, widen=true, thr=0.2f0, rlow=0.1f0),
+    C("hll_rl",         :hll,  true; phimin=0.1f0, rlow=0.1f0),
 ]
 
 function pick(names)
@@ -76,6 +86,7 @@ function test_turb(N, t_end; names=String[], tavg0=0.3f0, nsnap=6, outdir="ducro
         t0 = time()
         d = G.run_turb(N=N, t_end=t_end, amp=AMP, backend=:cpu, pin=:none, ncontrol=400,
                        riemann=c.riemann, ducros=c.ducros, phimin=c.phimin, rjump=c.rjump,
+                       widen=c.widen, thr=c.thr, rlow=c.rlow, nstepmax=NSTEPMAX,
                        snap_times=snaps, snap_cb=cb)
         wall = time() - t0
         fsh = isempty(phistats) ? NaN : mean(phistats)

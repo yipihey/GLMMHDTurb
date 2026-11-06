@@ -421,7 +421,8 @@ end
 # > rjump forces phi=1 (rjump <= 0 disables).
 @kernel function flux_duc_kernel!(flx, @Const(rec), @Const(sen), gamma::Float32, ch::Float32,
                                   smallr::Float32, pfl::Float32, llf_dmin::Float32, llf_pmin::Float32,
-                                  base::Int, ducros::Bool, phimin::Float32, rjump::Float32, N::Int)
+                                  base::Int, ducros::Bool, phimin::Float32, rjump::Float32, N::Int,
+                                  widen::Bool, thr::Float32, rlow::Float32)
     i, j, k = @index(Global, NTuple)
     @inbounds begin
         mh0 = rec_mh(rec, i, j, k)
@@ -436,7 +437,19 @@ end
             else
                 mhn = rec_mh(rec,i,j,kp); sn = rec_s(rec,i,j,kp,off); s1 = ducros ? sen[i,j,kp] : 1.0f0
             end
+            if widen && ducros     # 4-cell stencil along the face normal (i-1..i+2), hybrid-scheme buffer
+                if dir == 1
+                    s0 = max(s0, sen[wrp(i-1,N),j,k]); s1 = max(s1, sen[wrp(i+2,N),j,k])
+                elseif dir == 2
+                    s0 = max(s0, sen[i,wrp(j-1,N),k]); s1 = max(s1, sen[i,wrp(j+2,N),k])
+                else
+                    s0 = max(s0, sen[i,j,wrp(k-1,N)]); s1 = max(s1, sen[i,j,wrp(k+2,N)])
+                end
+            end
             phi = max(max(s0, s1), phimin)
+            thr > 0.0f0 && (phi = ifelse(phi > thr, 1.0f0, phi))
+            rlow > 0.0f0 && (phi = ifelse(min(mh0[1], mhn[1]) < rlow, 1.0f0, phi))
+            s0 = ducros ? sen[i,j,k] : 1.0f0
             if rjump > 0.0f0
                 rr = max(mh0[1], mhn[1]) / max(min(mh0[1], mhn[1]), smallr)
                 phi = ifelse(rr > rjump, 1.0f0, phi)
@@ -2074,7 +2087,8 @@ end
 function step_multi!(uold, unew, rec, flx, ct, afield, p::Params, dt::Float32, t::Float32,
                      be; use_hlld::Bool=true, do_turb::Bool=false,
                      riemann::Symbol=:default, ducros::Bool=false, sen=nothing,
-                     phimin::Float32=0.0f0, deps::Float32=0.05f0, rjump::Float32=0.0f0)
+                     phimin::Float32=0.0f0, deps::Float32=0.05f0, rjump::Float32=0.0f0,
+                     widen::Bool=false, thr::Float32=0.0f0, rlow::Float32=0.0f0)
     N = p.N; dx = dxof(p); dtdx = dt/dx; pfl = pfloor(p)
     ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
@@ -2087,7 +2101,8 @@ function step_multi!(uold, unew, rec, flx, ct, afield, p::Params, dt::Float32, t
             ducros_kernel!(be)(sen, uold, p.gamma, p.smallr, pfl, deps, N; ndrange=(N,N,N))
         end
         flux_duc_kernel!(be)(flx, rec, ducros ? sen : ct, p.gamma, ch, p.smallr, pfl,
-                             p.switch_llf_dmin, p.switch_llf_pmin, base, ducros, phimin, rjump, N;
+                             p.switch_llf_dmin, p.switch_llf_pmin, base, ducros, phimin, rjump, N,
+                             widen, thr, rlow;
                              ndrange=(N,N,N))
     else
         flux_kernel!(be)(flx, rec, p.gamma, ch, p.smallr, pfl, p.switch_llf_dmin, p.switch_llf_pmin, use_hlld, N; ndrange=(N,N,N))
@@ -2304,6 +2319,7 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
                     backend::Symbol=:gpu, pin::Symbol=:numa, solver::Symbol=:plm,
                     riemann::Symbol=:default, ducros::Bool=false, phimin::Float32=0.0f0,
                     deps::Float32=0.05f0, rjump::Float32=0.0f0, return_state::Bool=false,
+                    widen::Bool=false, thr::Float32=0.0f0, rlow::Float32=0.0f0,
                     snap_times::Vector{Float32}=Float32[], snap_cb=nothing)
     gpu = backend === :gpu
     if gpu
@@ -2341,7 +2357,8 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
             step_tiled!(u1, u2, f.afield, p, dt, t; use_hlld=use_hlld, do_turb=true, nthreads=nthreads)
         else
             step_multi!(u1, u2, rec, flx, ct, f.afield, p, dt, t, be; use_hlld=use_hlld, do_turb=true,
-                        riemann=riemann, ducros=ducros, sen=sen, phimin=phimin, deps=deps, rjump=rjump)
+                        riemann=riemann, ducros=ducros, sen=sen, phimin=phimin, deps=deps, rjump=rjump,
+                        widen=widen, thr=thr, rlow=rlow)
         end
         u1, u2 = u2, u1
         t += dt; step += 1
