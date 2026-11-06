@@ -10,6 +10,9 @@ using .GLMMHDTurb
 using FFTW, Printf, Statistics
 const G = GLMMHDTurb
 const NSTEPMAX = parse(Int, get(ENV, "NSTEPMAX", "20000"))
+const SEED = parse(Int, get(ENV, "SEED", "1"))
+const TAVG0 = parse(Float32, get(ENV, "TAVG0", "0.3"))
+const NSNAP = parse(Int, get(ENV, "NSNAP", "6"))
 const AMP = parse(Float32, get(ENV, "AMP", "130"))
 
 # shell-averaged power spectrum of a 3-component field (N^3 each), k in units of 2pi/L
@@ -69,13 +72,17 @@ function test_ot(N; names=String[], t_end=0.5f0)
     end
 end
 
-function test_turb(N, t_end; names=String[], tavg0=0.3f0, nsnap=6, outdir=get(ENV,"OUTDIR","ducros_out"))
+function test_turb(N, t_end; names=String[], tavg0=TAVG0, nsnap=NSNAP, outdir=get(ENV,"OUTDIR","ducros_out"))
     mkpath(outdir)
     for c in pick(names)
         snaps = collect(range(tavg0, t_end; length=nsnap)) .|> Float32
         acc = Ref{Any}(nothing); ns = Ref(0); phistats = Float64[]
         cb = function (u, t, step, sen)
             Ek, Ev, Eb = spectra(Array(u), G.Params(N=N))
+            open(joinpath(outdir, @sprintf("snap_N%d_%s_t%.2f.csv", N, c.name, t)), "w") do io
+                println(io, "k,Ekin,Evel,Emag   # step=$step")
+                for k in eachindex(Ek); @printf(io, "%d,%.6e,%.6e,%.6e\n", k-1, Ek[k], Ev[k], Eb[k]); end
+            end
             acc[] = acc[] === nothing ? (Ek, Ev, Eb) : (acc[][1] .+ Ek, acc[][2] .+ Ev, acc[][3] .+ Eb)
             ns[] += 1
             if sen !== nothing
@@ -86,7 +93,7 @@ function test_turb(N, t_end; names=String[], tavg0=0.3f0, nsnap=6, outdir=get(EN
         t0 = time()
         d = G.run_turb(N=N, t_end=t_end, amp=AMP, backend=:cpu, pin=:none, ncontrol=400,
                        riemann=c.riemann, ducros=c.ducros, phimin=c.phimin, rjump=c.rjump,
-                       widen=c.widen, thr=c.thr, rlow=c.rlow, nstepmax=NSTEPMAX,
+                       widen=c.widen, thr=c.thr, rlow=c.rlow, nstepmax=NSTEPMAX, seed=SEED,
                        snap_times=snaps, snap_cb=cb)
         wall = time() - t0
         fsh = isempty(phistats) ? NaN : mean(phistats)

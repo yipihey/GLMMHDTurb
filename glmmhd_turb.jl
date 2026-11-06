@@ -2319,7 +2319,7 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
                     backend::Symbol=:gpu, pin::Symbol=:numa, solver::Symbol=:plm,
                     riemann::Symbol=:default, ducros::Bool=false, phimin::Float32=0.0f0,
                     deps::Float32=0.05f0, rjump::Float32=0.0f0, return_state::Bool=false,
-                    widen::Bool=false, thr::Float32=0.0f0, rlow::Float32=0.0f0,
+                    widen::Bool=false, thr::Float32=0.0f0, rlow::Float32=0.0f0, seed::Integer=1,
                     snap_times::Vector{Float32}=Float32[], snap_cb=nothing)
     gpu = backend === :gpu
     if gpu
@@ -2332,7 +2332,8 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
         error("backend must be :gpu or :cpu")
     end
     p0_ = (1.0f0)*(1.0f0)^2/1.01f0   # rho0*cs0^2/gamma with defaults
-    p = Params(N=N, turb_rms=amp, switch_llf_dmin=0.01f0, switch_llf_pmin=0.01f0*p0_)
+    p = Params(N=N, turb_rms=amp, switch_llf_dmin=0.01f0, switch_llf_pmin=0.01f0*p0_,
+               turb_seed=UInt32(seed))
     u1 = KA.zeros(be, Float32, N,N,N,NV); u2 = KA.zeros(be, Float32, N,N,N,NV)
     ct = KA.zeros(be, Float32, N,N,N)
     # the CPU multi-kernel path needs reconstruction/flux scratch; the GPU tiled path is scratch-free
