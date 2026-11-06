@@ -358,6 +358,99 @@ end
 @inline riemann_sel(::Val{:llf},  Lq,Rq,dir,gamma,ch,smallr,pfl,ld,lp) = riemann_lean(Lq,Rq,dir,gamma,ch,smallr,pfl)
 @inline riemann_sel(::Val{:hlld}, Lq,Rq,dir,gamma,ch,smallr,pfl,ld,lp) = riemann(Lq,Rq,dir,gamma,ch,smallr,pfl,ld,lp,true)
 
+# ============================================================================
+# DUCROS-SWITCHED DISSIPATION (hybrid central/upwind in Godunov form).
+# Johnsen, Larsson, Moin, Lele et al. (JCP 2010) / Larsson's hybrid: put upwind dissipation
+# only where a shock sensor fires. In flux form:  F = Fc + phi*(F_riem - Fc),
+# Fc = 0.5*(F(L) + F(R)) of the same (reconstructed, cleaned) face states, phi in [phimin,1].
+# phi=1 recovers the base Riemann solver exactly; phi=0 is the (Hancock-predicted) central flux.
+# The GLM pair (F[Bn]=psi*, F[psi]=ch^2 Bn*) is left untouched, so div-B cleaning is unchanged.
+# Faces that trip the low-rho/low-p LLF robustness switch always get full dissipation.
+#   base = 1 -> HLL,  base = 2 -> HLLD
+# ============================================================================
+@fastmath @inline function riemann_duc(Lq::NTuple{9}, Rq::NTuple{9}, dir::Int,
+                                       gamma::Float32, ch::Float32, smallr::Float32, pfl::Float32,
+                                       llf_dmin::Float32, llf_pmin::Float32, base::Int, phi::Float32)
+    L0 = rot_to(Lq, dir); R0 = rot_to(Rq, dir)
+    L = (max(L0[1],smallr), L0[2],L0[3],L0[4], max(L0[5],pfl), L0[6],L0[7],L0[8],L0[9])
+    R = (max(R0[1],smallr), R0[2],R0[3],R0[4], max(R0[5],pfl), R0[6],R0[7],R0[8],R0[9])
+    bns, psis = glm_pair(L[6], R[6], L[9], R[9], ch)
+    fbn = psis; fpsi = ch*ch*bns
+    Lc = (L[1],L[2],L[3],L[4],L[5],bns,L[7],L[8],L[9])
+    Rc = (R[1],R[2],R[3],R[4],R[5],bns,R[7],R[8],R[9])
+    uself = (llf_dmin > 0.0f0 && min(L[1],R[1]) < llf_dmin) ||
+            (llf_pmin > 0.0f0 && min(L[5],R[5]) < llf_pmin)
+    f = uself ? llf_x(Lc, Rc, gamma, ch, fbn, fpsi) :
+        (base == 2 ? hlld_x(Lc, Rc, gamma, ch, bns, fbn, fpsi) :
+                     hll_x(Lc, Rc, gamma, bns, fbn, fpsi))
+    ph = uself ? 1.0f0 : phi
+    fL = phys_flux_x(Lc, gamma); fR = phys_flux_x(Rc, gamma)
+    g = ntuple(i -> (fc = 0.5f0*(fL[i] + fR[i]); fc + ph*(f[i] - fc)), 9)
+    return rot_flux_from((g[1],g[2],g[3],g[4],g[5], fbn, g[7],g[8], fpsi), dir)
+end
+
+# Cell Ducros sensor  theta = (div v)^2 / ((div v)^2 + |curl v|^2 + (eps*cf)^2),
+# central differences in grid units (velocity differences over 2 cells), cf = fast speed.
+# eps sets the "quiet" floor: where |dv| over two cells << eps*cf the face is treated as smooth.
+@kernel function ducros_kernel!(sen, @Const(u), gamma::Float32, smallr::Float32, pfl::Float32,
+                                deps::Float32, N::Int)
+    i, j, k = @index(Global, NTuple)
+    @inbounds begin
+        m0  = cons2prim(loadc(u, i, j, k), gamma, smallr, pfl)
+        mxl = cons2prim(loadc(u, wrp(i-1,N), j, k), gamma, smallr, pfl)
+        mxr = cons2prim(loadc(u, wrp(i+1,N), j, k), gamma, smallr, pfl)
+        myl = cons2prim(loadc(u, i, wrp(j-1,N), k), gamma, smallr, pfl)
+        myr = cons2prim(loadc(u, i, wrp(j+1,N), k), gamma, smallr, pfl)
+        mzl = cons2prim(loadc(u, i, j, wrp(k-1,N)), gamma, smallr, pfl)
+        mzr = cons2prim(loadc(u, i, j, wrp(k+1,N)), gamma, smallr, pfl)
+        # d(v_a)/d(x_b) * 2dx
+        uxx = mxr[2]-mxl[2]; uyy = myr[3]-myl[3]; uzz = mzr[4]-mzl[4]
+        vxy = myr[2]-myl[2]; vxz = mzr[2]-mzl[2]     # d vx / dy, d vx / dz
+        vyx = mxr[3]-mxl[3]; vyz = mzr[3]-mzl[3]     # d vy / dx, d vy / dz
+        vzx = mxr[4]-mxl[4]; vzy = myr[4]-myl[4]     # d vz / dx, d vz / dy
+        dv = uxx + uyy + uzz
+        wx = vzy - vyz; wy = vxz - vzx; wz = vyx - vxy
+        cf = fast_speed(m0, gamma, 0.0f0)
+        e2 = (2.0f0*deps*cf)^2
+        sen[i, j, k] = dv*dv / (dv*dv + wx*wx + wy*wy + wz*wz + e2)
+    end
+end
+
+# Face fluxes with Ducros-scaled dissipation. phi_face = max(theta_i, theta_i+1, phimin);
+# optional density-jump guard: max(rho)/min(rho) of the two cell-centred predicted states
+# > rjump forces phi=1 (rjump <= 0 disables).
+@kernel function flux_duc_kernel!(flx, @Const(rec), @Const(sen), gamma::Float32, ch::Float32,
+                                  smallr::Float32, pfl::Float32, llf_dmin::Float32, llf_pmin::Float32,
+                                  base::Int, ducros::Bool, phimin::Float32, rjump::Float32, N::Int)
+    i, j, k = @index(Global, NTuple)
+    @inbounds begin
+        mh0 = rec_mh(rec, i, j, k)
+        ip = wrp(i+1, N); jp = wrp(j+1, N); kp = wrp(k+1, N)
+        s0 = ducros ? sen[i,j,k] : 1.0f0
+        for dir in 1:3
+            off = 9*dir
+            if dir == 1
+                mhn = rec_mh(rec,ip,j,k); sn = rec_s(rec,ip,j,k,off); s1 = ducros ? sen[ip,j,k] : 1.0f0
+            elseif dir == 2
+                mhn = rec_mh(rec,i,jp,k); sn = rec_s(rec,i,jp,k,off); s1 = ducros ? sen[i,jp,k] : 1.0f0
+            else
+                mhn = rec_mh(rec,i,j,kp); sn = rec_s(rec,i,j,kp,off); s1 = ducros ? sen[i,j,kp] : 1.0f0
+            end
+            phi = max(max(s0, s1), phimin)
+            if rjump > 0.0f0
+                rr = max(mh0[1], mhn[1]) / max(min(mh0[1], mhn[1]), smallr)
+                phi = ifelse(rr > rjump, 1.0f0, phi)
+            end
+            Lf = padd(mh0, rec_s(rec,i,j,k,off), 1.0f0)
+            Rf = padd(mhn, sn, -1.0f0)
+            F = riemann_duc(Lf, Rf, dir, gamma, ch, smallr, pfl, llf_dmin, llf_pmin, base, min(phi, 1.0f0))
+            for v in 1:9
+                flx[i, j, k, 9*(dir-1)+v] = F[v]
+            end
+        end
+    end
+end
+
 # Compile-time dispatch: Val{true}=lean (minmod+LLF-bound), Val{false}=full (MonCen+HLLD).
 @inline slope_d(::Val{true},  L, M, R) = prim_slope_mm(L, M, R)
 @inline slope_d(::Val{false}, L, M, R) = prim_slope(L, M, R)
@@ -1979,13 +2072,26 @@ end
 
 # ---- multi-kernel step (validation path) -----------------------------------
 function step_multi!(uold, unew, rec, flx, ct, afield, p::Params, dt::Float32, t::Float32,
-                     be; use_hlld::Bool=true, do_turb::Bool=false)
+                     be; use_hlld::Bool=true, do_turb::Bool=false,
+                     riemann::Symbol=:default, ducros::Bool=false, sen=nothing,
+                     phimin::Float32=0.0f0, deps::Float32=0.05f0, rjump::Float32=0.0f0)
     N = p.N; dx = dxof(p); dtdx = dt/dx; pfl = pfloor(p)
     ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0)
     recon_kernel!(be)(rec, uold, p.gamma, p.smallr, pfl, dtdx, N; ndrange=(N,N,N))
-    flux_kernel!(be)(flx, rec, p.gamma, ch, p.smallr, pfl, p.switch_llf_dmin, p.switch_llf_pmin, use_hlld, N; ndrange=(N,N,N))
+    if ducros || riemann !== :default
+        # riemann = :hll / :hlld picks the base solver (:default -> HLLD if use_hlld else HLL)
+        base = riemann === :hll ? 1 : (riemann === :hlld ? 2 : (use_hlld ? 2 : 1))
+        if ducros
+            ducros_kernel!(be)(sen, uold, p.gamma, p.smallr, pfl, deps, N; ndrange=(N,N,N))
+        end
+        flux_duc_kernel!(be)(flx, rec, ducros ? sen : ct, p.gamma, ch, p.smallr, pfl,
+                             p.switch_llf_dmin, p.switch_llf_pmin, base, ducros, phimin, rjump, N;
+                             ndrange=(N,N,N))
+    else
+        flux_kernel!(be)(flx, rec, p.gamma, ch, p.smallr, pfl, p.switch_llf_dmin, p.switch_llf_pmin, use_hlld, N; ndrange=(N,N,N))
+    end
     update_kernel!(be)(unew, uold, flx, afield, dtdx, glm_fac, N, p.boxlen, ramp, dt,
                        p.smallr, p.smallc, p.gamma, pfl, p.turb_min_rho, do_turb; ndrange=(N,N,N))
     KA.synchronize(be)
@@ -2039,7 +2145,9 @@ end
 # Orszag-Tang on the portable multi-kernel path. backend=:gpu or :cpu (same KA kernels);
 # the CPU path pins threads via `pin`. Useful as a cross-platform correctness check.
 function run_ot(; N::Int=128, t_end::Float32=0.5f0, use_hlld::Bool=true,
-                  backend::Symbol=:gpu, pin::Symbol=:numa)
+                  backend::Symbol=:gpu, pin::Symbol=:numa,
+                  riemann::Symbol=:default, ducros::Bool=false, phimin::Float32=0.0f0,
+                  deps::Float32=0.05f0, rjump::Float32=0.0f0, return_state::Bool=false)
     if backend === :gpu
         be = CUDABackend()
     elseif backend === :cpu
@@ -2052,19 +2160,22 @@ function run_ot(; N::Int=128, t_end::Float32=0.5f0, use_hlld::Bool=true,
     rec = KA.zeros(be, Float32, N,N,N,36); flx = KA.zeros(be, Float32, N,N,N,27)
     ct  = KA.zeros(be, Float32, N,N,N)
     afield = KA.zeros(be, Float32, 3,TURB_GS,TURB_GS,TURB_GS)
+    sen = ducros ? KA.zeros(be, Float32, N,N,N) : nothing
     ic_ot_kernel!(be)(u1, N, p.gamma; ndrange=(N,N,N)); KA.synchronize(be)
     t = 0.0f0; step = 0
     while t < t_end
         dt = compute_dt(u1, ct, p, be)
         dt = min(dt, t_end - t)
-        step_multi!(u1, u2, rec, flx, ct, afield, p, dt, t, be; use_hlld=use_hlld, do_turb=false)
+        step_multi!(u1, u2, rec, flx, ct, afield, p, dt, t, be; use_hlld=use_hlld, do_turb=false,
+                    riemann=riemann, ducros=ducros, sen=sen, phimin=phimin, deps=deps, rjump=rjump)
         u1, u2 = u2, u1
         t += dt; step += 1
     end
     d = diagnostics(u1, ct, p, be)
-    @printf("OT[%s] N=%d HLLD=%s: steps=%d t=%.3f vrms=%.4f divBmax=%.3e rhomin=%.4f finite=%s\n",
-            backend, N, use_hlld, step, t, d.vrms, d.divbmax, d.rhomin, d.finite)
-    return d
+    @printf("OT[%s] N=%d riemann=%s ducros=%s phimin=%.2f: steps=%d t=%.3f vrms=%.4f divBmax=%.3e rhomin=%.4f finite=%s\n",
+            backend, N, riemann === :default ? (use_hlld ? :hlld : :llf) : riemann, ducros, phimin,
+            step, t, d.vrms, d.divbmax, d.rhomin, d.finite)
+    return return_state ? (d, u1, p) : d
 end
 
 # ============================================================================
@@ -2190,7 +2301,10 @@ end
 # Same physics either way; the forcing FFT dispatches CUFFT/FFTW automatically.
 function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_hlld::Bool=true,
                     ncontrol::Int=200, verbose::Bool=true, nstepmax::Int=20000, nthreads::Int=192,
-                    backend::Symbol=:gpu, pin::Symbol=:numa, solver::Symbol=:plm)
+                    backend::Symbol=:gpu, pin::Symbol=:numa, solver::Symbol=:plm,
+                    riemann::Symbol=:default, ducros::Bool=false, phimin::Float32=0.0f0,
+                    deps::Float32=0.05f0, rjump::Float32=0.0f0, return_state::Bool=false,
+                    snap_times::Vector{Float32}=Float32[], snap_cb=nothing)
     gpu = backend === :gpu
     if gpu
         be = CUDABackend()
@@ -2208,6 +2322,8 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
     # the CPU multi-kernel path needs reconstruction/flux scratch; the GPU tiled path is scratch-free
     rec = gpu ? nothing : KA.zeros(be, Float32, N,N,N,36)
     flx = gpu ? nothing : KA.zeros(be, Float32, N,N,N,27)
+    sen = (gpu || !ducros) ? nothing : KA.zeros(be, Float32, N,N,N)
+    gpu && (ducros || riemann !== :default) && error("ducros/riemann kwargs: CPU multi-kernel path only (backend=:cpu)")
     p0 = p.rho0*p.cs0^2/p.gamma
     ic_uniform_kernel!(be)(u1, p.rho0, p0, p.b0, p.gamma; ndrange=(N,N,N)); KA.synchronize(be)
     f = Forcing(p, be; amp=amp)
@@ -2224,10 +2340,17 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
         elseif gpu
             step_tiled!(u1, u2, f.afield, p, dt, t; use_hlld=use_hlld, do_turb=true, nthreads=nthreads)
         else
-            step_multi!(u1, u2, rec, flx, ct, f.afield, p, dt, t, be; use_hlld=use_hlld, do_turb=true)
+            step_multi!(u1, u2, rec, flx, ct, f.afield, p, dt, t, be; use_hlld=use_hlld, do_turb=true,
+                        riemann=riemann, ducros=ducros, sen=sen, phimin=phimin, deps=deps, rjump=rjump)
         end
         u1, u2 = u2, u1
         t += dt; step += 1
+        if snap_cb !== nothing && !isempty(snap_times) && t >= snap_times[1]
+            popfirst!(snap_times); snap_cb(u1, t, step, sen)
+        end
+        if !all(isfinite, @view u1[:,:,:,1])
+            @printf("  NON-FINITE density at step=%d t=%.4f -> abort\n", step, t); break
+        end
         if verbose && step % ncontrol == 0
             d = diagnostics(u1, ct, p, be)
             @printf("  step=%d t=%.4f dt=%.2e Mach=%.3f divBmax=%.2e rhomin=%.3e finite=%s\n",
@@ -2237,7 +2360,7 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
     d = diagnostics(u1, ct, p, be)
     @printf("TURB[%s] N=%d amp=%.0f: steps=%d t=%.3f Mach=%.3f divBmax=%.2e rhomin=%.3e finite=%s\n",
             backend, N, amp, step, t, d.mach, d.divbmax, d.rhomin, d.finite)
-    return d
+    return return_state ? (d, u1, p) : d
 end
 
 # ============================================================================
