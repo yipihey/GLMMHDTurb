@@ -49,6 +49,7 @@ Base.@kwdef struct Params
     comp_frac::Float32 = 0.5f0       # compressive fraction (Helmholtz)
     turb_min_rho::Float32 = 1.0f-5
     turb_seed::UInt32  = 0x00000001
+    turb_kmax::Float32 = 0.0f0       # forcing band 1<=|k|<=kmax (0 -> legacy TURB_GS/2, i.e. flat to grid scale)
 end
 
 @inline dxof(p::Params) = p.boxlen / p.N
@@ -156,6 +157,25 @@ end
 
 @inline padd(q::NTuple{9}, s::NTuple{9}, a::Float32) =
     ntuple(i -> q[i] + a*s[i], 9)
+
+# Positivity / CFL-consistency guard for MUSCL-Hancock interface states. A face (or Hancock
+# centre) state whose density drops below FACE_RFRAC * rho^n of its cell is rejected and the
+# cell falls back to first order. Without it, Hancock + slope can drive a face to rho<=0; the
+# clamped (rho=smallr) face then carries c_f ~ |B|/sqrt(smallr) that the cell-centred CFL dt
+# never saw (face Courant ~10 measured at Mach 4), HLL drains the cell to the floor in one
+# step, and the floor/psi/B runaway + dt collapse follow. rho_face >= rho^n/4 bounds the face
+# Alfven speed by 2x the cell's, keeping faces inside the CFL budget. 0 disables (old behaviour).
+const FACE_RFRAC = 0.25f0
+@inline facebad(f, m0, smallr, pfl) = (f[1] < max(smallr, FACE_RFRAC*m0[1])) | (f[5] < pfl)
+# cell-wise fallback for the paths that store (mh, slopes) and build faces later (multi, fused)
+@inline function pos_fallback(m0, mh, sx, sy, sz, smallr, pfl)
+    bad = (mh[1] <= smallr) | (mh[5] <= pfl) | (mh[1] < FACE_RFRAC*m0[1])
+    bad |= facebad(padd(mh,sx,1.0f0),m0,smallr,pfl) | facebad(padd(mh,sx,-1.0f0),m0,smallr,pfl)
+    bad |= facebad(padd(mh,sy,1.0f0),m0,smallr,pfl) | facebad(padd(mh,sy,-1.0f0),m0,smallr,pfl)
+    bad |= facebad(padd(mh,sz,1.0f0),m0,smallr,pfl) | facebad(padd(mh,sz,-1.0f0),m0,smallr,pfl)
+    z = ntuple(_ -> 0.0f0, 9)
+    return bad ? (m0, z, z, z) : (mh, sx, sy, sz)
+end
 
 # Directional ideal-MHD flux of a primitive state in direction `dir` (rotate, flux, rotate back).
 @inline dir_flux(q::NTuple{9}, dir::Int, gamma::Float32) =
@@ -496,9 +516,7 @@ end
         sz = prim_slope(mzl, m0, mzr)
         uh = hancock(m0, sx, sy, sz, dtdx, gamma)
         mh = cons2prim(uh, gamma, smallr, pfl)
-        if mh[1] <= smallr || mh[5] <= pfl
-            mh = m0
-        end
+        mh, sx, sy, sz = pos_fallback(m0, mh, sx, sy, sz, smallr, pfl)
         for v in 1:9
             rec[i, j, k, v]      = mh[v]
             rec[i, j, k, 9+v]    = sx[v]
@@ -628,10 +646,7 @@ end
     sx = prim_slope(mxl, m0, mxr); sy = prim_slope(myl, m0, myr); sz = prim_slope(mzl, m0, mzr)
     uh = hancock(m0, sx, sy, sz, dtdx, gamma)
     mh = cons2prim(uh, gamma, smallr, pfl)
-    if mh[1] <= smallr || mh[5] <= pfl
-        mh = m0
-    end
-    return mh, sx, sy, sz
+    return pos_fallback(m0, mh, sx, sy, sz, smallr, pfl)
 end
 
 @kernel function integrator_fused!(unew, @Const(uold), @Const(afield),
@@ -683,9 +698,9 @@ end
 
 # Fused step (no scratch): one kernel uold -> unew.
 function step_fused!(uold, unew, afield, p::Params, dt::Float32, t::Float32, be;
-                     use_hlld::Bool=true, do_turb::Bool=false)
+                     use_hlld::Bool=true, do_turb::Bool=false, dtc::Float32=dt)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dtc/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0)
     integrator_fused!(be)(unew, uold, afield, p.gamma, p.smallr, pfl, p.smallc, dt, dx, ch, glm_fac,
@@ -721,7 +736,7 @@ const NCF = (TB+1)*TB*TB              # 80   faces per direction
     end
 end
 # Revert an interface state to first-order (cell value m0) if it went unphysical.
-@inline iflo(f, m0, smallr, pfl) = (f[1] < smallr || f[5] < pfl) ? m0 : f
+@inline iflo(f, m0, smallr, pfl) = facebad(f, m0, smallr, pfl) ? m0 : f
 
 function integrator_tiled!(lv::Val, unew, uold, afield,
                            gamma::Float32, smallr::Float32, pfl::Float32, smallc::Float32,
@@ -757,7 +772,7 @@ function integrator_tiled!(lv::Val, unew, uold, afield,
             sz = slope_d(lv, shget(SP,lin_tile(pi,pj,pk-1)), m0, shget(SP,lin_tile(pi,pj,pk+1)))
             uh = hancock(m0, sx, sy, sz, dtdx, gamma)
             mh = cons2prim(uh, gamma, smallr, pfl)
-            if mh[1] <= smallr || mh[5] <= pfl
+            if mh[1] <= smallr || mh[5] <= pfl || mh[1] < FACE_RFRAC*m0[1]
                 mh = m0
             end
             inxt = (pj >= 2 && pj <= TB+1) && (pk >= 2 && pk <= TB+1)
@@ -851,10 +866,10 @@ end
 # Tiled step (no scratch): one kernel launch, (N/4)^3 blocks of 128 threads.
 function step_tiled!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
                      use_hlld::Bool=true, do_turb::Bool=false, nthreads::Int=192, maxregs::Int=0,
-                     lean::Bool=false)
+                     lean::Bool=false, dtc::Float32=dt)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
     @assert N % TB == 0 "N must be a multiple of $TB"
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dtc/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0)
     nb = N ÷ TB
@@ -881,6 +896,14 @@ end
 # the f32/TB4/HLLD kernel). Shared element type halved -> nsubgrid=3 fits; its lower halo (4.6×
 # vs 8×) is the win. f32/TB4/:hlld remains a flag for bit-reproducibility.
 # ============================================================================
+# f16 tiles store the scaled flux dt/dx*F (= the conserved increment, |.| <~ CFL*U) instead of F:
+# with gamma=1.01, E ~ 100p ~ 1e4 in shocked gas and the energy flux (E+ptot)v reaches ~5e4 at cell
+# centres (more at HLL faces) -> overflows f16 (65504) -> Inf/NaN. Same relative precision either
+# way. f32 tiles (HALF=false) are untouched (bit-identical to before).
+@inline _fsc(::Val{true},  F, s) = ntuple(v -> F[v]*s, 9)
+@inline _fsc(::Val{false}, F, s) = F
+@inline _usc(::Val{true},  s) = 1.0f0
+@inline _usc(::Val{false}, s) = s
 @inline _sgT(S, lin) = ntuple(v -> Float32(@inbounds(S[9*lin + v])), 9)   # ST -> f32 on read
 @inline function _spT(S, lin, q)                                          # f32 -> ST on write
     @inbounds for v in 1:9; S[9*lin + v] = q[v]; end
@@ -913,7 +936,7 @@ function integrator_plm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, afield
             sy = prim_slope(_sgT(SP,lt(pi,pj-1,pk)), m0, _sgT(SP,lt(pi,pj+1,pk)))
             sz = prim_slope(_sgT(SP,lt(pi,pj,pk-1)), m0, _sgT(SP,lt(pi,pj,pk+1)))
             mh = cons2prim(hancock(m0,sx,sy,sz,dtdx,gamma), gamma,smallr,pfl)
-            (mh[1]<=smallr || mh[5]<=pfl) && (mh = m0)
+            (mh[1]<=smallr || mh[5]<=pfl || mh[1]<FACE_RFRAC*m0[1]) && (mh = m0)
             inxt=(pj>=2&&pj<=TB+1)&&(pk>=2&&pk<=TB+1); inyt=(pi>=2&&pi<=TB+1)&&(pk>=2&&pk<=TB+1); inzt=(pi>=2&&pi<=TB+1)&&(pj>=2&&pj<=TB+1)
             if inxt
                 pi<=TB+1 && _spT(LX, lfx(pi-1,pj-2,pk-2), iflo(padd(mh,sx,1.0f0),m0,smallr,pfl))
@@ -933,13 +956,13 @@ function integrator_plm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, afield
         while t <= 3*nfx
             if t<=nfx
                 l=t-1;fi=l%(TB+1);fj=(l÷(TB+1))%TB;fk=l÷((TB+1)*TB)
-                _spT(LX, lfx(fi,fj,fk), riemann_sel(rv, _sgT(LX,lfx(fi,fj,fk)), _sgT(RX,lfx(fi,fj,fk)), 1, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+                _spT(LX, lfx(fi,fj,fk), _fsc(Val(HALF), riemann_sel(rv, _sgT(LX,lfx(fi,fj,fk)), _sgT(RX,lfx(fi,fj,fk)), 1, gamma,ch,smallr,pfl,llf_dmin,llf_pmin), dtdx))
             elseif t<=2*nfx
                 l=t-1-nfx;fi=l%TB;fj=(l÷TB)%(TB+1);fk=l÷(TB*(TB+1))
-                _spT(LY, lfy(fi,fj,fk), riemann_sel(rv, _sgT(LY,lfy(fi,fj,fk)), _sgT(RY,lfy(fi,fj,fk)), 2, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+                _spT(LY, lfy(fi,fj,fk), _fsc(Val(HALF), riemann_sel(rv, _sgT(LY,lfy(fi,fj,fk)), _sgT(RY,lfy(fi,fj,fk)), 2, gamma,ch,smallr,pfl,llf_dmin,llf_pmin), dtdx))
             else
                 l=t-1-2*nfx;fi=l%TB;fj=(l÷TB)%TB;fk=l÷(TB*TB)
-                _spT(LZ, lfz(fi,fj,fk), riemann_sel(rv, _sgT(LZ,lfz(fi,fj,fk)), _sgT(RZ,lfz(fi,fj,fk)), 3, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+                _spT(LZ, lfz(fi,fj,fk), _fsc(Val(HALF), riemann_sel(rv, _sgT(LZ,lfz(fi,fj,fk)), _sgT(RZ,lfz(fi,fj,fk)), 3, gamma,ch,smallr,pfl,llf_dmin,llf_pmin), dtdx))
             end
             t+=nth
         end
@@ -948,7 +971,7 @@ function integrator_plm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, afield
             l=t-1;a=l%TB;b=(l÷TB)%TB;c=l÷(TB*TB); gi=wrp(ox+a+1,N);gj=wrp(oy+b+1,N);gk=wrp(oz+c+1,N)
             Fxl=_sgT(LX,lfx(a,b,c));Fxh=_sgT(LX,lfx(a+1,b,c));Fyl=_sgT(LY,lfy(a,b,c));Fyh=_sgT(LY,lfy(a,b+1,c));Fzl=_sgT(LZ,lfz(a,b,c));Fzh=_sgT(LZ,lfz(a,b,c+1))
             u0 = loadc(uold,gi,gj,gk)   # f32 update: increment promoted to f32, added to f32 state
-            r1 = ntuple(v -> u0[v] + dtdx*((Fxl[v]-Fxh[v])+(Fyl[v]-Fyh[v])+(Fzl[v]-Fzh[v])), 9)
+            r1 = ntuple(v -> u0[v] + _usc(Val(HALF),dtdx)*((Fxl[v]-Fxh[v])+(Fyl[v]-Fyh[v])+(Fzl[v]-Fzh[v])), 9)
             if r1[1] < smallr
                 emag=0.5f0*(r1[6]*r1[6]+r1[7]*r1[7]+r1[8]*r1[8])
                 r1=(smallr,0.0f0,0.0f0,0.0f0,pfl/(gamma-1.0f0)+emag,r1[6],r1[7],r1[8],r1[9])
@@ -983,11 +1006,11 @@ end
 # (tb=4,half=true,riemann=:hll). Other combos: error (add a branch if needed).
 function step_plm!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
                    do_turb::Bool=false, nthreads::Int=192, tb::Int=0, half::Bool=true,
-                   riemann::Symbol=:hll, recon::Symbol=:plm)
+                   riemann::Symbol=:hll, recon::Symbol=:plm, dtc::Float32=dt)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
     tb == 0 && (tb = N % 6 == 0 ? 6 : 4)   # auto: nsubgrid=3 when it divides N, else nsubgrid=2
     @assert N % tb == 0 "N=$N not divisible by tb=$tb (need N%6==0 for the fast TB=6 path, or N%4==0)"
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dtc/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0); nb = N ÷ tb
     if recon === :ppm   # lean parabolic-PPM (single-zone edges + Hancock + shock fallback); f16+HLL only
@@ -1007,6 +1030,10 @@ function step_plm!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
         _plm_launch(Val(4),Val(false),Val(:hlld), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
     elseif tb==4 && half && riemann===:hll
         _plm_launch(Val(4),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
+    elseif tb==6 && half && riemann===:hlld   # f16-shared HLLD (Ducros / accuracy comparison)
+        _plm_launch(Val(6),Val(true),Val(:hlld), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
+    elseif tb==4 && half && riemann===:hlld
+        _plm_launch(Val(4),Val(true),Val(:hlld), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
     else
         error("step_plm!: unsupported (tb=$tb, half=$half, riemann=$riemann); add a branch")
     end
@@ -1061,7 +1088,7 @@ function integrator_plm_ppm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, af
             mxl=_sgT(SP,lt(pi-1,pj,pk));mxr=_sgT(SP,lt(pi+1,pj,pk));myl=_sgT(SP,lt(pi,pj-1,pk));myr=_sgT(SP,lt(pi,pj+1,pk));mzl=_sgT(SP,lt(pi,pj,pk-1));mzr=_sgT(SP,lt(pi,pj,pk+1))
             sx=prim_slope(mxl,m0,mxr); sy=prim_slope(myl,m0,myr); sz=prim_slope(mzl,m0,mzr)
             mh = cons2prim(hancock(m0,sx,sy,sz,dtdx,gamma), gamma,smallr,pfl)
-            (mh[1]<=smallr || mh[5]<=pfl) && (mh = m0)
+            (mh[1]<=smallr || mh[5]<=pfl || mh[1]<FACE_RFRAC*m0[1]) && (mh = m0)
             up = !(spj(mxl[5],m0[5],mxr[5])||spj(myl[5],m0[5],myr[5])||spj(mzl[5],m0[5],mzr[5]))
             pmx,ppx=ppm9(mxl,m0,mxr); pmy,ppy=ppm9(myl,m0,myr); pmz,ppz=ppm9(mzl,m0,mzr)
             inxt=(pj>=2&&pj<=TB+1)&&(pk>=2&&pk<=TB+1); inyt=(pi>=2&&pi<=TB+1)&&(pk>=2&&pk<=TB+1); inzt=(pi>=2&&pi<=TB+1)&&(pj>=2&&pj<=TB+1)
@@ -1083,13 +1110,13 @@ function integrator_plm_ppm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, af
         while t <= 3*nfx
             if t<=nfx
                 l=t-1;fi=l%(TB+1);fj=(l÷(TB+1))%TB;fk=l÷((TB+1)*TB)
-                _spT(LX, lfx(fi,fj,fk), riemann_sel(rv, _sgT(LX,lfx(fi,fj,fk)), _sgT(RX,lfx(fi,fj,fk)), 1, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+                _spT(LX, lfx(fi,fj,fk), _fsc(Val(HALF), riemann_sel(rv, _sgT(LX,lfx(fi,fj,fk)), _sgT(RX,lfx(fi,fj,fk)), 1, gamma,ch,smallr,pfl,llf_dmin,llf_pmin), dtdx))
             elseif t<=2*nfx
                 l=t-1-nfx;fi=l%TB;fj=(l÷TB)%(TB+1);fk=l÷(TB*(TB+1))
-                _spT(LY, lfy(fi,fj,fk), riemann_sel(rv, _sgT(LY,lfy(fi,fj,fk)), _sgT(RY,lfy(fi,fj,fk)), 2, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+                _spT(LY, lfy(fi,fj,fk), _fsc(Val(HALF), riemann_sel(rv, _sgT(LY,lfy(fi,fj,fk)), _sgT(RY,lfy(fi,fj,fk)), 2, gamma,ch,smallr,pfl,llf_dmin,llf_pmin), dtdx))
             else
                 l=t-1-2*nfx;fi=l%TB;fj=(l÷TB)%TB;fk=l÷(TB*TB)
-                _spT(LZ, lfz(fi,fj,fk), riemann_sel(rv, _sgT(LZ,lfz(fi,fj,fk)), _sgT(RZ,lfz(fi,fj,fk)), 3, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+                _spT(LZ, lfz(fi,fj,fk), _fsc(Val(HALF), riemann_sel(rv, _sgT(LZ,lfz(fi,fj,fk)), _sgT(RZ,lfz(fi,fj,fk)), 3, gamma,ch,smallr,pfl,llf_dmin,llf_pmin), dtdx))
             end
             t+=nth
         end
@@ -1098,7 +1125,7 @@ function integrator_plm_ppm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, af
             l=t-1;a=l%TB;b=(l÷TB)%TB;c=l÷(TB*TB); gi=wrp(ox+a+1,N);gj=wrp(oy+b+1,N);gk=wrp(oz+c+1,N)
             Fxl=_sgT(LX,lfx(a,b,c));Fxh=_sgT(LX,lfx(a+1,b,c));Fyl=_sgT(LY,lfy(a,b,c));Fyh=_sgT(LY,lfy(a,b+1,c));Fzl=_sgT(LZ,lfz(a,b,c));Fzh=_sgT(LZ,lfz(a,b,c+1))
             u0 = loadc(uold,gi,gj,gk)
-            r1 = ntuple(v -> u0[v] + dtdx*((Fxl[v]-Fxh[v])+(Fyl[v]-Fyh[v])+(Fzl[v]-Fzh[v])), 9)
+            r1 = ntuple(v -> u0[v] + _usc(Val(HALF),dtdx)*((Fxl[v]-Fxh[v])+(Fyl[v]-Fyh[v])+(Fzl[v]-Fzh[v])), 9)
             if r1[1] < smallr
                 emag=0.5f0*(r1[6]*r1[6]+r1[7]*r1[7]+r1[8]*r1[8])
                 r1=(smallr,0.0f0,0.0f0,0.0f0,pfl/(gamma-1.0f0)+emag,r1[6],r1[7],r1[8],r1[9])
@@ -1890,7 +1917,7 @@ end
             sz = prim_slope(sg(PP,ppi(sm,tx,ty)),   m0, sg(PP,ppi(sp,tx,ty)))
             uh = hancock(m0, sx, sy, sz, dtdx, gamma)
             mh = cons2prim(uh, gamma, smallr, pfl)
-            if mh[1] <= smallr || mh[5] <= pfl
+            if mh[1] <= smallr || mh[5] <= pfl || mh[1] < FACE_RFRAC*m0[1]
                 mh = m0
             end
             if ty >= 2 && ty <= SBY+1           # owned y row -> x faces
@@ -2052,10 +2079,10 @@ function integrator_stream!(unew, uold, afield,
 end
 
 function step_stream!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
-                      use_hlld::Bool=true, do_turb::Bool=false, nthreads::Int=64)
+                      use_hlld::Bool=true, do_turb::Bool=false, nthreads::Int=64, dtc::Float32=dt)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
     @assert N % SBX == 0 && N % SBY == 0 && N % SCZ == 0 "N must be a multiple of $SBX and $SCZ"
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dtc/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0)
     @cuda threads=nthreads blocks=(N÷SBX, N÷SBY, N÷SCZ) integrator_stream!(
@@ -2088,9 +2115,9 @@ function step_multi!(uold, unew, rec, flx, ct, afield, p::Params, dt::Float32, t
                      be; use_hlld::Bool=true, do_turb::Bool=false,
                      riemann::Symbol=:default, ducros::Bool=false, sen=nothing,
                      phimin::Float32=0.0f0, deps::Float32=0.05f0, rjump::Float32=0.0f0,
-                     widen::Bool=false, thr::Float32=0.0f0, rlow::Float32=0.0f0)
+                     widen::Bool=false, thr::Float32=0.0f0, rlow::Float32=0.0f0, dtc::Float32=dt)
     N = p.N; dx = dxof(p); dtdx = dt/dx; pfl = pfloor(p)
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dtc/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0)
     recon_kernel!(be)(rec, uold, p.gamma, p.smallr, pfl, dtdx, N; ndrange=(N,N,N))
@@ -2179,10 +2206,10 @@ function run_ot(; N::Int=128, t_end::Float32=0.5f0, use_hlld::Bool=true,
     ic_ot_kernel!(be)(u1, N, p.gamma; ndrange=(N,N,N)); KA.synchronize(be)
     t = 0.0f0; step = 0
     while t < t_end
-        dt = compute_dt(u1, ct, p, be)
-        dt = min(dt, t_end - t)
+        dtc = compute_dt(u1, ct, p, be)
+        dt = min(dtc, t_end - t)
         step_multi!(u1, u2, rec, flx, ct, afield, p, dt, t, be; use_hlld=use_hlld, do_turb=false,
-                    riemann=riemann, ducros=ducros, sen=sen, phimin=phimin, deps=deps, rjump=rjump)
+                    riemann=riemann, ducros=ducros, sen=sen, phimin=phimin, deps=deps, rjump=rjump, dtc=dtc)
         u1, u2 = u2, u1
         t += dt; step += 1
     end
@@ -2201,12 +2228,12 @@ end
 @inline kfreq(i::Int, n::Int) = i-1 <= n÷2 ? Float32(i-1) : Float32(i-1-n)
 
 # Precompute power spectrum sqrt(P)=|k|^-1 (P=k^-2), 1<=|k|<=n/2, and unit-k for Helmholtz.
-@kernel function ou_init_kernel!(sqp, unitk, n::Int)
+@kernel function ou_init_kernel!(sqp, unitk, n::Int, kmax::Float32)
     i, j, k = @index(Global, NTuple)
     @inbounds begin
         kx = kfreq(i,n); ky = kfreq(j,n); kz = kfreq(k,n)
         kk = sqrt(kx*kx + ky*ky + kz*kz)
-        if kk >= 1.0f0 && kk <= Float32(n÷2)
+        if kk >= 1.0f0 && kk <= kmax
             sqp[i,j,k] = 1.0f0/kk            # sqrt(P) = |k|^-1
             unitk[1,i,j,k]=kx/kk; unitk[2,i,j,k]=ky/kk; unitk[3,i,j,k]=kz/kk
         else
@@ -2252,8 +2279,9 @@ mutable struct Forcing
     next_time::Float32
 end
 
-# Portable Gaussian fill: CUDA's device RNG for CuArray, Random for Array.
-_randn!(g::CuArray) = CUDA.randn!(g)
+# Portable Gaussian fill from the (seeded) host RNG on both backends, so a given turb_seed
+# gives bit-identical forcing Gaussians on CPU and GPU (6*64^3 floats per OU step: cheap).
+_randn!(g::CuArray) = copyto!(g, randn(Float32, size(g)))
 _randn!(g::AbstractArray) = Random.randn!(g)
 
 function Forcing(p::Params, be; amp::Float32=p.turb_rms)
@@ -2263,7 +2291,8 @@ function Forcing(p::Params, be; amp::Float32=p.turb_rms)
     afield = KA.zeros(be, Float32, 3,n,n,n); gbuf = KA.zeros(be, Float32, 6,n,n,n)
     tmp = KA.zeros(be, ComplexF32, n,n,n)
     plan = AbstractFFTs.plan_bfft!(tmp)        # CUFFT for CuArray, FFTW for Array
-    ou_init_kernel!(be)(sqp, unitk, n; ndrange=(n,n,n)); KA.synchronize(be)
+    kmax = p.turb_kmax > 0 ? p.turb_kmax : Float32(n÷2)
+    ou_init_kernel!(be)(sqp, unitk, n, kmax; ndrange=(n,n,n)); KA.synchronize(be)
     f = Forcing(Fhat, sqp, unitk, afield, gbuf, tmp, plan, amp, 0.0f0)
     return f
 end
@@ -2320,7 +2349,8 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
                     riemann::Symbol=:default, ducros::Bool=false, phimin::Float32=0.0f0,
                     deps::Float32=0.05f0, rjump::Float32=0.0f0, return_state::Bool=false,
                     widen::Bool=false, thr::Float32=0.0f0, rlow::Float32=0.0f0, seed::Integer=1,
-                    courant::Float32=0.7f0, snap_times::Vector{Float32}=Float32[], snap_cb=nothing)
+                    courant::Float32=0.7f0, snap_times::Vector{Float32}=Float32[], snap_cb=nothing,
+                    fkmax::Real=0, pkw::NamedTuple=(;))   # pkw: extra Params overrides, e.g. (smallr=1f-3,)
     gpu = backend === :gpu
     if gpu
         be = CUDABackend()
@@ -2333,7 +2363,7 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
     end
     p0_ = (1.0f0)*(1.0f0)^2/1.01f0   # rho0*cs0^2/gamma with defaults
     p = Params(N=N, turb_rms=amp, switch_llf_dmin=0.01f0, switch_llf_pmin=0.01f0*p0_,
-               turb_seed=UInt32(seed), courant=courant)
+               turb_seed=UInt32(seed), courant=courant, turb_kmax=Float32(fkmax); pkw...)
     u1 = KA.zeros(be, Float32, N,N,N,NV); u2 = KA.zeros(be, Float32, N,N,N,NV)
     ct = KA.zeros(be, Float32, N,N,N)
     # the CPU multi-kernel path needs reconstruction/flux scratch; the GPU tiled path is scratch-free
@@ -2349,7 +2379,7 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
     end
     p0 = p.rho0*p.cs0^2/p.gamma
     ic_uniform_kernel!(be)(u1, p.rho0, p0, p.b0, p.gamma; ndrange=(N,N,N)); KA.synchronize(be)
-    gpu || Random.seed!(p.turb_seed)       # reproducible CPU forcing (CUDA.randn! has its own RNG)
+    Random.seed!(p.turb_seed)              # reproducible forcing (host RNG feeds both backends)
     f = Forcing(p, be; amp=amp)
     ou_advance!(f, p, be)                  # seed the first field
     t = 0.0f0; step = 0
@@ -2357,20 +2387,20 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
         while t >= f.next_time
             ou_advance!(f, p, be)
         end
-        dt = compute_dt(u1, ct, p, be)
-        dt = min(dt, f.next_time - t, t_end - t)
+        dtc = compute_dt(u1, ct, p, be)     # CFL step: sets the GLM speed ch (not the clamped dt,
+        dt = min(dtc, f.next_time - t, t_end - t)   # else ch~1/dt spikes on forcing/t_end clamps)
         if multi
             step_multi!(u1, u2, rec, flx, ct, f.afield, p, dt, t, be; use_hlld=use_hlld, do_turb=true,
                         riemann=riemann, ducros=ducros, sen=sen, phimin=phimin, deps=deps, rjump=rjump,
-                        widen=widen, thr=thr, rlow=rlow)
+                        widen=widen, thr=thr, rlow=rlow, dtc=dtc)
         elseif gpu && solver === :plm        # Hancock + HLL + GLM + PLM, f16 shared; TB auto (6 if N%6==0 else 4)
-            step_plm!(u1, u2, f.afield, p, dt, t; do_turb=true, nthreads=nthreads, tb=0, half=true, riemann=:hll)
+            step_plm!(u1, u2, f.afield, p, dt, t; do_turb=true, nthreads=nthreads, tb=0, half=true, riemann=:hll, dtc=dtc)
         elseif gpu
-            step_tiled!(u1, u2, f.afield, p, dt, t; use_hlld=use_hlld, do_turb=true, nthreads=nthreads)
+            step_tiled!(u1, u2, f.afield, p, dt, t; use_hlld=use_hlld, do_turb=true, nthreads=nthreads, dtc=dtc)
         else
             step_multi!(u1, u2, rec, flx, ct, f.afield, p, dt, t, be; use_hlld=use_hlld, do_turb=true,
                         riemann=riemann, ducros=ducros, sen=sen, phimin=phimin, deps=deps, rjump=rjump,
-                        widen=widen, thr=thr, rlow=rlow)
+                        widen=widen, thr=thr, rlow=rlow, dtc=dtc)
         end
         u1, u2 = u2, u1
         t += dt; step += 1

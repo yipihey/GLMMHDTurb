@@ -16,6 +16,9 @@ const NSNAP = parse(Int, get(ENV, "NSNAP", "6"))
 const BACKEND = Symbol(get(ENV, "BACKEND", "cpu"))
 const COURANT = parse(Float32, get(ENV, "COURANT", "0.7"))
 const AMP = parse(Float32, get(ENV, "AMP", "130"))
+const FKMAX = parse(Float32, get(ENV, "FKMAX", "0"))   # forcing band |k|<=FKMAX (0 = legacy flat to k=32)
+const SMALLR = parse(Float32, get(ENV, "SMALLR", "0"))  # density floor override (0 = Params default 1e-6)
+const PKW = SMALLR > 0 ? (smallr=SMALLR,) : (;)
 
 # shell-averaged power spectrum of a 3-component field (N^3 each), k in units of 2pi/L
 function shell_spectrum(fx, fy, fz)
@@ -80,9 +83,12 @@ function test_turb(N, t_end; names=String[], tavg0=TAVG0, nsnap=NSNAP, outdir=ge
         snaps = collect(range(tavg0, t_end; length=nsnap)) .|> Float32
         acc = Ref{Any}(nothing); ns = Ref(0); phistats = Float64[]
         cb = function (u, t, step, sen)
-            Ek, Ev, Eb = spectra(Array(u), G.Params(N=N))
+            ua = Array(u); pp = G.Params(N=N; PKW...)
+            Ek, Ev, Eb = spectra(ua, pp)
+            ffl = mean(@view(ua[:,:,:,1]) .<= 1.01f0*pp.smallr)   # floored-cell fraction
+            @printf("  SNAP %-14s t=%.3f step=%d floorfrac=%.2e rhomin=%.2e\n", c.name, t, step, ffl, minimum(@view ua[:,:,:,1]))
             open(joinpath(outdir, @sprintf("snap_N%d_%s_t%.2f.csv", N, c.name, t)), "w") do io
-                println(io, "k,Ekin,Evel,Emag   # step=$step")
+                println(io, "k,Ekin,Evel,Emag   # step=$step floorfrac=$ffl")
                 for k in eachindex(Ek); @printf(io, "%d,%.6e,%.6e,%.6e\n", k-1, Ek[k], Ev[k], Eb[k]); end
             end
             acc[] = acc[] === nothing ? (Ek, Ev, Eb) : (acc[][1] .+ Ek, acc[][2] .+ Ev, acc[][3] .+ Eb)
@@ -96,6 +102,7 @@ function test_turb(N, t_end; names=String[], tavg0=TAVG0, nsnap=NSNAP, outdir=ge
         d = G.run_turb(N=N, t_end=t_end, amp=AMP, backend=BACKEND, solver=:multi, pin=:none, ncontrol=400,
                        riemann=c.riemann, ducros=c.ducros, phimin=c.phimin, rjump=c.rjump,
                        widen=c.widen, thr=c.thr, rlow=c.rlow, nstepmax=NSTEPMAX, seed=SEED, courant=COURANT,
+                       fkmax=FKMAX, pkw=PKW,
                        snap_times=snaps, snap_cb=cb)
         wall = time() - t0
         fsh = isempty(phistats) ? NaN : mean(phistats)
