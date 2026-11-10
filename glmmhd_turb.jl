@@ -913,10 +913,25 @@ end
 # global cell sensor `sen` (ducros_kernel! prepass) along the face normal: cells (i,i+1), or
 # (i-1..i+2) if widen. Reading sen from global memory sidesteps the tile halo (the widened
 # stencil needs u at i-2..i+3 = halo 3; the tile has 2). (gi,gj,gk) = global left cell.
-@inline _plm_face(::Val{false}, rv, L, R, dir, gamma,ch,smallr,pfl,ld,lp, sen,gi,gj,gk,N,phimin,thr,widen) =
+# DUC modes: 0 plain | 1 global prepass sensor `sen` | 2 fused: sensor computed in the tile into
+# shared SEN (tile coords (qi,qj,qk) = left cell), see integrator_plm!.
+@inline _plm_face(::Val{0}, rv, L, R, dir, gamma,ch,smallr,pfl,ld,lp, sen,gi,gj,gk,N,phimin,thr,widen, SEN,TT,qi,qj,qk) =
     riemann_sel(rv, L, R, dir, gamma,ch,smallr,pfl,ld,lp)
-@inline function _plm_face(::Val{true}, ::Val{RIEM}, L, R, dir, gamma,ch,smallr,pfl,ld,lp,
-                           sen, gi,gj,gk, N, phimin, thr, widen) where {RIEM}
+@inline function _duc_phi_flux(::Val{RIEM}, L, R, dir, gamma,ch,smallr,pfl,ld,lp, s, phimin, thr) where {RIEM}
+    phi = max(s, phimin)
+    thr > 0.0f0 && (phi = ifelse(phi > thr, 1.0f0, phi))
+    return riemann_duc(L, R, dir, gamma, ch, smallr, pfl, ld, lp, RIEM === :hlld ? 2 : 1, min(phi, 1.0f0))
+end
+@inline function _plm_face(::Val{2}, rv, L, R, dir, gamma,ch,smallr,pfl,ld,lp,
+                           sen, gi,gj,gk, N, phimin, thr, widen, SEN, TT, qi,qj,qk)
+    di = dir==1 ? 1 : 0; dj = dir==2 ? 1 : 0; dk = dir==3 ? 1 : 0
+    sl(a,b,c) = Float32(@inbounds SEN[a+TT*(b+TT*c)+1])
+    s = max(sl(qi,qj,qk), sl(qi+di,qj+dj,qk+dk))
+    widen && (s = max(s, max(sl(qi-di,qj-dj,qk-dk), sl(qi+2di,qj+2dj,qk+2dk))))
+    return _duc_phi_flux(rv, L, R, dir, gamma,ch,smallr,pfl,ld,lp, s, phimin, thr)
+end
+@inline function _plm_face(::Val{1}, ::Val{RIEM}, L, R, dir, gamma,ch,smallr,pfl,ld,lp,
+                           sen, gi,gj,gk, N, phimin, thr, widen, SEN,TT,qi,qj,qk) where {RIEM}
     @inbounds begin
         di = dir==1 ? 1 : 0; dj = dir==2 ? 1 : 0; dk = dir==3 ? 1 : 0
         s = max(sen[gi,gj,gk], sen[wrp(gi+di,N),wrp(gj+dj,N),wrp(gk+dk,N)])
@@ -925,9 +940,34 @@ end
                            sen[wrp(gi+2di,N),wrp(gj+2dj,N),wrp(gk+2dk,N)]))
         end
     end
-    phi = max(s, phimin)
-    thr > 0.0f0 && (phi = ifelse(phi > thr, 1.0f0, phi))
-    return riemann_duc(L, R, dir, gamma, ch, smallr, pfl, ld, lp, RIEM === :hlld ? 2 : 1, min(phi, 1.0f0))
+    return _duc_phi_flux(Val(RIEM), L, R, dir, gamma,ch,smallr,pfl,ld,lp, s, phimin, thr)
+end
+
+# Ducros sensor of one tile cell from shared prims; a neighbour outside the tile (only ever the
+# outward one along a normal, for the outermost halo layer) is loaded from global memory and
+# rounded through ST like the tile. Same formula as ducros_kernel!. Neighbours contribute only
+# their velocity (3 scalars) -- loading full 9-tuples through a runtime shared/global branch
+# put ~530 B/thread of tuples on the local-memory stack and made the fused kernel 8x slower.
+@inline function _tile_vel(SP, uold, a, b, c, TT, ox,oy,oz, N, smallr, ::Type{ST}) where {ST}
+    @inbounds if (0 <= a < TT) & (0 <= b < TT) & (0 <= c < TT)
+        o = 9*(a + TT*(b + TT*c))
+        return (Float32(SP[o+2]), Float32(SP[o+3]), Float32(SP[o+4]))
+    else
+        gi = wrp(ox+a-1,N); gj = wrp(oy+b-1,N); gk = wrp(oz+c-1,N)
+        ir = 1.0f0 / max(uold[gi,gj,gk,1], smallr)
+        return (Float32(ST(uold[gi,gj,gk,2]*ir)), Float32(ST(uold[gi,gj,gk,3]*ir)), Float32(ST(uold[gi,gj,gk,4]*ir)))
+    end
+end
+@inline function _tile_sensor(SP, uold, pi,pj,pk, TT, ox,oy,oz, N, gamma, smallr, pfl, deps, ::Type{ST}) where {ST}
+    xl = _tile_vel(SP,uold,pi-1,pj,pk,TT,ox,oy,oz,N,smallr,ST); xr = _tile_vel(SP,uold,pi+1,pj,pk,TT,ox,oy,oz,N,smallr,ST)
+    yl = _tile_vel(SP,uold,pi,pj-1,pk,TT,ox,oy,oz,N,smallr,ST); yr = _tile_vel(SP,uold,pi,pj+1,pk,TT,ox,oy,oz,N,smallr,ST)
+    zl = _tile_vel(SP,uold,pi,pj,pk-1,TT,ox,oy,oz,N,smallr,ST); zr = _tile_vel(SP,uold,pi,pj,pk+1,TT,ox,oy,oz,N,smallr,ST)
+    dv = (xr[1]-xl[1]) + (yr[2]-yl[2]) + (zr[3]-zl[3])
+    wx = (yr[3]-yl[3]) - (zr[2]-zl[2])     # dvz/dy - dvy/dz
+    wy = (zr[1]-zl[1]) - (xr[3]-xl[3])     # dvx/dz - dvz/dx
+    wz = (xr[2]-xl[2]) - (yr[1]-yl[1])     # dvy/dx - dvx/dy
+    cf = fast_speed(_sgT(SP, pi+TT*(pj+TT*pk)), gamma, 0.0f0); e2 = (2.0f0*deps*cf)^2
+    return dv*dv / (dv*dv + wx*wx + wy*wy + wz*wz + e2)
 end
 
 function integrator_plm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, afield,
@@ -935,9 +975,10 @@ function integrator_plm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, afield
                          dt::Float32, dx::Float32, ch::Float32, glm_fac::Float32,
                          llf_dmin::Float32, llf_pmin::Float32, N::Int,
                          boxlen::Float32, ramp::Float32, turb_min_rho::Float32, do_turb::Bool,
-                         sen, phimin::Float32, thr::Float32, widen::Bool, ::Val{DUC}) where {TB,HALF,RIEM,DUC}
+                         sen, phimin::Float32, thr::Float32, widen::Bool, deps::Float32, ::Val{DUC}) where {TB,HALF,RIEM,DUC}
     TT = TB + 4; ST = HALF ? Float16 : Float32
     SP = CuStaticSharedArray(ST, 9*TT*TT*TT)
+    SEN = CuStaticSharedArray(ST, DUC == 2 ? TT*TT*TT : 1)   # fused Ducros sensor (DUC=2 only)
     LX = CuStaticSharedArray(ST, 9*(TB+1)*TB*TB); RX = CuStaticSharedArray(ST, 9*(TB+1)*TB*TB)
     LY = CuStaticSharedArray(ST, 9*TB*(TB+1)*TB); RY = CuStaticSharedArray(ST, 9*TB*(TB+1)*TB)
     LZ = CuStaticSharedArray(ST, 9*TB*TB*(TB+1)); RZ = CuStaticSharedArray(ST, 9*TB*TB*(TB+1))
@@ -951,7 +992,22 @@ function integrator_plm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, afield
             l=t-1; pi=l%TT; pj=(l÷TT)%TT; pk=l÷(TT*TT)
             _spT(SP, lt(pi,pj,pk), cons2prim(loadc(uold, wrp(ox+pi-1,N), wrp(oy+pj-1,N), wrp(oz+pk-1,N)), gamma,smallr,pfl)); t+=nth
         end
-        sync_threads(); t=tid
+        sync_threads()
+        if DUC == 2   # fused sensor on the 'plus' region the faces need: interior TB^3, plus along each
+            nI = TB*TB*TB; nL = 4*TB*TB; t = tid      # normal the layers {0,1,TB+2,TB+3} x interior
+            while t <= nI + 3*nL
+                if t <= nI
+                    l=t-1; qi=l%TB+2; qj=(l÷TB)%TB+2; qk=l÷(TB*TB)+2
+                else
+                    l=t-1-nI; d=l÷nL; r=l%nL; e=r÷(TB*TB); rr=r%(TB*TB); a2=rr%TB+2; b2=rr÷TB+2
+                    al = e==0 ? 0 : (e==1 ? 1 : (e==2 ? TB+2 : TB+3))
+                    qi = d==0 ? al : a2; qj = d==1 ? al : (d==0 ? a2 : b2); qk = d==2 ? al : b2
+                end
+                SEN[lt(qi,qj,qk)+1] = _tile_sensor(SP, uold, qi,qj,qk, TT, ox,oy,oz, N, gamma, smallr, pfl, deps, ST)
+                t += nth
+            end
+        end
+        t=tid
         while t <= (TB+2)^3
             l=t-1; ci=l%(TB+2); cj=(l÷(TB+2))%(TB+2); ck=l÷((TB+2)*(TB+2)); pi=ci+1;pj=cj+1;pk=ck+1
             m0 = _sgT(SP, lt(pi,pj,pk))
@@ -980,15 +1036,15 @@ function integrator_plm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, afield
             if t<=nfx
                 l=t-1;fi=l%(TB+1);fj=(l÷(TB+1))%TB;fk=l÷((TB+1)*TB)
                 _spT(LX, lfx(fi,fj,fk), _fsc(Val(HALF), _plm_face(Val(DUC), rv, _sgT(LX,lfx(fi,fj,fk)), _sgT(RX,lfx(fi,fj,fk)), 1, gamma,ch,smallr,pfl,llf_dmin,llf_pmin,
-                    sen, wrp(ox+fi,N), wrp(oy+fj+1,N), wrp(oz+fk+1,N), N, phimin, thr, widen), dtdx))
+                    sen, wrp(ox+fi,N), wrp(oy+fj+1,N), wrp(oz+fk+1,N), N, phimin, thr, widen, SEN, TT, fi+1, fj+2, fk+2), dtdx))
             elseif t<=2*nfx
                 l=t-1-nfx;fi=l%TB;fj=(l÷TB)%(TB+1);fk=l÷(TB*(TB+1))
                 _spT(LY, lfy(fi,fj,fk), _fsc(Val(HALF), _plm_face(Val(DUC), rv, _sgT(LY,lfy(fi,fj,fk)), _sgT(RY,lfy(fi,fj,fk)), 2, gamma,ch,smallr,pfl,llf_dmin,llf_pmin,
-                    sen, wrp(ox+fi+1,N), wrp(oy+fj,N), wrp(oz+fk+1,N), N, phimin, thr, widen), dtdx))
+                    sen, wrp(ox+fi+1,N), wrp(oy+fj,N), wrp(oz+fk+1,N), N, phimin, thr, widen, SEN, TT, fi+2, fj+1, fk+2), dtdx))
             else
                 l=t-1-2*nfx;fi=l%TB;fj=(l÷TB)%TB;fk=l÷(TB*TB)
                 _spT(LZ, lfz(fi,fj,fk), _fsc(Val(HALF), _plm_face(Val(DUC), rv, _sgT(LZ,lfz(fi,fj,fk)), _sgT(RZ,lfz(fi,fj,fk)), 3, gamma,ch,smallr,pfl,llf_dmin,llf_pmin,
-                    sen, wrp(ox+fi+1,N), wrp(oy+fj+1,N), wrp(oz+fk,N), N, phimin, thr, widen), dtdx))
+                    sen, wrp(ox+fi+1,N), wrp(oy+fj+1,N), wrp(oz+fk,N), N, phimin, thr, widen, SEN, TT, fi+2, fj+2, fk+1), dtdx))
             end
             t+=nth
         end
@@ -1023,11 +1079,27 @@ end
 @inline function _plm_launch(tv::Val, hv::Val, rv::Val, nthreads, nb, unew, uold, afield, p::Params,
                              pfl, dt, dx, ch, glm_fac, ramp, do_turb;
                              sen=afield, phimin::Float32=0.0f0, thr::Float32=0.0f0, widen::Bool=false,
-                             dv::Val=Val(false))
+                             deps::Float32=0.05f0, dv::Val=Val(0))
     @cuda threads=nthreads blocks=(nb,nb,nb) integrator_plm!(
         tv, hv, rv, unew, uold, afield, p.gamma, p.smallr, pfl, p.smallc, dt, dx, ch, glm_fac,
         p.switch_llf_dmin, p.switch_llf_pmin, p.N, p.boxlen, ramp, p.turb_min_rho, do_turb,
-        sen, phimin, thr, widen, dv)
+        sen, phimin, thr, widen, deps, dv)
+end
+
+# Ducros tile launches; dv = Val(1) global-prepass sensor | Val(2) fused (literal at the call site).
+function _plm_duc_dispatch(dv::Val, sen, tb, half, riemann, nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb, phimin,thr,widen,deps)
+    kw = (; sen=sen, phimin=phimin, thr=thr, widen=widen, deps=deps, dv=dv)
+    if tb==6 && half && riemann===:hll
+        _plm_launch(Val(6),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb; kw...)
+    elseif tb==4 && half && riemann===:hll
+        _plm_launch(Val(4),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb; kw...)
+    elseif tb==6 && half && riemann===:hlld
+        _plm_launch(Val(6),Val(true),Val(:hlld), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb; kw...)
+    elseif tb==4 && !half && riemann===:hll   # f32 tile: validation of the port against the multi path
+        _plm_launch(Val(4),Val(false),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb; kw...)
+    else
+        error("step_plm! ducros: unsupported (tb=$tb, half=$half, riemann=$riemann); add a branch")
+    end
 end
 
 # Production PLM step. Default = Hancock + HLL + GLM + PLM, f16 shared, TB=6 (nsubgrid=3).
@@ -1037,28 +1109,23 @@ function step_plm!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
                    do_turb::Bool=false, nthreads::Int=192, tb::Int=0, half::Bool=true,
                    riemann::Symbol=:hll, recon::Symbol=:plm, dtc::Float32=dt,
                    ducros::Bool=false, sen=nothing, phimin::Float32=0.0f0, thr::Float32=0.0f0,
-                   widen::Bool=false, deps::Float32=0.05f0)
+                   widen::Bool=false, deps::Float32=0.05f0, fused::Bool=true)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
     tb == 0 && (tb = N % 6 == 0 ? 6 : 4)   # auto: nsubgrid=3 when it divides N, else nsubgrid=2
     @assert N % tb == 0 "N=$N not divisible by tb=$tb (need N%6==0 for the fast TB=6 path, or N%4==0)"
     ch = p.courant*dx/dtc/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0); nb = N ÷ tb
-    if ducros   # Ducros-scaled dissipation: sensor prepass (global, so no tile-halo limit), then the tile
+    if ducros   # Ducros-scaled dissipation (sensor fused into the tile by default)
         recon === :plm || error("step_plm! ducros=true needs recon=:plm")
-        sen === nothing && error("step_plm! ducros=true needs a sen::CuArray(N,N,N) scratch")
-        ducros_kernel!(CUDABackend())(sen, uold, p.gamma, p.smallr, pfl, deps, N; ndrange=(N,N,N))
-        kw = (; sen=sen, phimin=phimin, thr=thr, widen=widen, dv=Val(true))
-        if tb==6 && half && riemann===:hll
-            _plm_launch(Val(6),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb; kw...)
-        elseif tb==4 && half && riemann===:hll
-            _plm_launch(Val(4),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb; kw...)
-        elseif tb==6 && half && riemann===:hlld
-            _plm_launch(Val(6),Val(true),Val(:hlld), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb; kw...)
-        elseif tb==4 && !half && riemann===:hll   # f32 tile: validation of the port against the multi path
-            _plm_launch(Val(4),Val(false),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb; kw...)
+        # fused (default): sensor computed inside the tile, no prepass and no sen array needed.
+        # fused=false: global ducros_kernel! prepass into `sen` (validation of the fused path).
+        if fused
+            _plm_duc_dispatch(Val(2), afield, tb, half, riemann, nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb, phimin,thr,widen,deps)
         else
-            error("step_plm! ducros: unsupported (tb=$tb, riemann=$riemann); add a branch")
+            sen === nothing && error("step_plm! ducros=true, fused=false needs a sen::CuArray(N,N,N) scratch")
+            ducros_kernel!(CUDABackend())(sen, uold, p.gamma, p.smallr, pfl, deps, N; ndrange=(N,N,N))
+            _plm_duc_dispatch(Val(1), sen, tb, half, riemann, nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb, phimin,thr,widen,deps)
         end
     elseif recon === :ppm   # lean parabolic-PPM (single-zone edges + Hancock + shock fallback); f16+HLL only
         (half && riemann===:hll) || error("step_plm! recon=:ppm supports only half=true,riemann=:hll (got half=$half, riemann=$riemann)")
@@ -2403,7 +2470,7 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
                     deps::Float32=0.05f0, rjump::Float32=0.0f0, return_state::Bool=false,
                     widen::Bool=false, thr::Float32=0.0f0, rlow::Float32=0.0f0, seed::Integer=1,
                     courant::Float32=0.7f0, snap_times::Vector{Float32}=Float32[], snap_cb=nothing,
-                    fkmax::Real=0, pkw::NamedTuple=(;))   # pkw: extra Params overrides, e.g. (smallr=1f-3,)
+                    fkmax::Real=0, pkw::NamedTuple=(;), duc_fused::Bool=true)   # pkw: extra Params overrides, e.g. (smallr=1f-3,)
     gpu = backend === :gpu
     if gpu
         be = CUDABackend()
@@ -2429,7 +2496,7 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
         error("ducros/riemann kwargs need solver=:multi or :plm on GPU")
     plm = gpu && solver === :plm
     plm && ducros && (rjump > 0 || rlow > 0) && error("solver=:plm ducros supports phimin/thr/widen only (not rjump/rlow)")
-    plm && ducros && (sen = KA.zeros(be, Float32, N,N,N))
+    plm && ducros && !duc_fused && (sen = KA.zeros(be, Float32, N,N,N))   # fused tile needs no sensor array
     if gpu && multi
         rec = KA.zeros(be, Float32, N,N,N,36); flx = KA.zeros(be, Float32, N,N,N,27)
         sen = ducros ? KA.zeros(be, Float32, N,N,N) : nothing
@@ -2452,7 +2519,7 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
         elseif gpu && solver === :plm        # Hancock + HLL + GLM + PLM, f16 shared; TB auto (6 if N%6==0 else 4)
             step_plm!(u1, u2, f.afield, p, dt, t; do_turb=true, nthreads=nthreads, tb=0, half=true,
                       riemann=(riemann === :default ? :hll : riemann), dtc=dtc,
-                      ducros=ducros, sen=sen, phimin=phimin, thr=thr, widen=widen, deps=deps)
+                      ducros=ducros, sen=sen, phimin=phimin, thr=thr, widen=widen, deps=deps, fused=duc_fused)
         elseif gpu
             step_tiled!(u1, u2, f.afield, p, dt, t; use_hlld=use_hlld, do_turb=true, nthreads=nthreads, dtc=dtc)
         else

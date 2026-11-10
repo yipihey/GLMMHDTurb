@@ -7,10 +7,10 @@ include("glmmhd_turb.jl"); using .GLMMHDTurb; const G = GLMMHDTurb
 using CUDA, KernelAbstractions, Printf, Statistics
 N  = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 384
 NS = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 30
-# (tb, half, riemann, ducros). ducros rows = hll_wide_thr (phimin .1, widen, thr .2), timed INCLUDING
-# the ducros_kernel! sensor prepass.
-CFGS = [(6,true,:hll,false), (6,true,:hlld,false), (6,true,:hll,true), (6,true,:hlld,true),
-        (4,true,:hll,false), (4,true,:hlld,false), (4,true,:hll,true), (4,false,:hlld,false)]
+# (tb, half, riemann, duc): duc 0 = plain, 1 = hll_wide_thr with the global ducros_kernel! sensor
+# prepass (timed INCLUDING the prepass), 2 = hll_wide_thr with the sensor fused into the tile.
+CFGS = [(6,true,:hll,0), (6,true,:hlld,0), (6,true,:hll,1), (6,true,:hll,2), (6,true,:hlld,2),
+        (4,true,:hll,0), (4,true,:hlld,0), (4,true,:hll,2), (4,false,:hlld,0)]
 sen = CUDA.zeros(Float32, N,N,N)
 DUCKW = (phimin=0.1f0, thr=0.2f0, widen=true)
 be = CUDABackend()
@@ -23,7 +23,7 @@ function kinfo(tb, half, riem, duc, nth)
     pfl = G.pfloor(p); dx = G.dxof(p); ch = p.courant*dx/dt/3f0*p.glm_ch_scale
     k = @cuda launch=false G.integrator_plm!(Val(tb),Val(half),Val(riem), u0,u0,afield, p.gamma,p.smallr,pfl,p.smallc,
         dt,dx,ch,1f0, p.switch_llf_dmin,p.switch_llf_pmin, N,p.boxlen,1f0,p.turb_min_rho,false,
-        duc ? sen : afield, 0.1f0, 0.2f0, true, Val(duc))
+        duc == 1 ? sen : afield, 0.1f0, 0.2f0, true, 0.05f0, Val(duc))
     regs = CUDA.registers(k); smem = CUDA.memory(k).shared
     nb = CUDA.active_blocks(k.fun, nth)
     return regs, smem, nb
@@ -35,7 +35,7 @@ results = []
 for nth in (192, 128)
   for (tb,half,riem,duc) in CFGS
     regs, smem, nb = kinfo(tb,half,riem,duc,nth)
-    kw = duc ? (; ducros=true, sen=sen, DUCKW...) : (;)
+    kw = duc == 0 ? (;) : (; ducros=true, sen=sen, fused=(duc == 2), DUCKW...)
     u1 = copy(u0); u2 = similar(u0)
     for s in 1:3; G.step_plm!(u1,u2,afield,p,dt,0f0; tb=tb,half=half,riemann=riem,nthreads=nth,kw...); u1,u2=u2,u1; end
     CUDA.synchronize()
@@ -47,14 +47,14 @@ for nth in (192, 128)
     ua = copy(u0); ub = similar(u0)
     for s in 1:10; G.step_plm!(ua,ub,afield,p,dt,0f0; tb=tb,half=half,riemann=riem,nthreads=nth,kw...); ua,ub=ub,ua; end
     r = Array(@view ua[:,:,:,1])
-    if (tb,half,riem,duc) == (4,false,:hlld,false) && nth == 192; global ref = r; end
+    if (tb,half,riem,duc) == (4,false,:hlld,0) && nth == 192; global ref = r; end
     err = ref === nothing ? NaN : maximum(abs.(r .- ref))
     push!(results, (tb,half,riem,nth,regs,smem,nb,mc,err,r,duc))
-    @printf("tb=%d %s %-9s %4d %6d %8d %9d %9d %10.1f %12.3e\n", tb, half ? "f16" : "f32", string(riem, duc ? "+duc" : ""), nth, regs, smem, nb, nb*cld(nth,32), mc, err)
+    @printf("tb=%d %s %-15s %4d %6d %8d %9d %9d %10.1f %12.3e\n", tb, half ? "f16" : "f32", string(riem, ("", "+duc_pre", "+duc_fused")[duc+1]), nth, regs, smem, nb, nb*cld(nth,32), mc, err)
   end
 end
 # errors vs ref for the 192 rows computed before ref existed
 println("\naccuracy vs f32/TB4/HLLD (10 OT steps, max|Δρ|, ρ~O(1)):")
 for r in results
-    r[4] == 192 && @printf("  tb=%d %s %-9s  %.3e\n", r[1], r[2] ? "f16" : "f32", string(r[3], r[11] ? "+duc" : ""), maximum(abs.(r[10] .- ref)))
+    r[4] == 192 && @printf("  tb=%d %s %-15s  %.3e\n", r[1], r[2] ? "f16" : "f32", string(r[3], ("", "+duc_pre", "+duc_fused")[r[11]+1]), maximum(abs.(r[10] .- ref)))
 end

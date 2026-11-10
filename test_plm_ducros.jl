@@ -31,12 +31,16 @@ function run(kind)
             G.step_plm!(u1,u2,af,p,dt,0f0; tb=4, half=false, riemann=:hll)
         elseif kind === :plm32_duc
             G.step_plm!(u1,u2,af,p,dt,0f0; tb=4, half=false, riemann=:hll, ducros=true, sen=sen, duc...)
+        elseif kind === :plm32_duc_pre
+            G.step_plm!(u1,u2,af,p,dt,0f0; tb=4, half=false, riemann=:hll, ducros=true, sen=sen, fused=false, duc...)
+        elseif kind === :plm_duc_pre
+            G.step_plm!(u1,u2,af,p,dt,0f0; tb=6, half=true, riemann=:hll, ducros=true, sen=sen, fused=false, duc...)
         end
         u1, u2 = u2, u1
     end
     CUDA.synchronize(); return Array(u1)
 end
-R = Dict(k => run(k) for k in (:multi_hll, :multi_duc, :plm_hll, :plm_duc, :plm_duc_tb4, :plm32_hll, :plm32_duc))
+R = Dict(k => run(k) for k in (:multi_hll, :multi_duc, :plm_hll, :plm_duc, :plm_duc_tb4, :plm32_hll, :plm32_duc, :plm32_duc_pre, :plm_duc_pre))
 d(a,b,v) = (x = R[a][:,:,:,v] .- R[b][:,:,:,v]; (maximum(abs.(x)), sqrt(mean(abs2, x))))
 println("OT N=$N, $NS steps, dt=$dt")
 for (v,nm) in ((1,"rho"),(5,"E"),(6,"Bx"))
@@ -46,5 +50,9 @@ end
 for (v,nm) in ((1,"rho"),(5,"E"),(6,"Bx"))
     @printf("%-3s  f32 tile: |plm32_hll-multi_hll| max %.2e | |plm32_duc-multi_duc| max %.2e   (f32 port check)\n",
             nm, d(:plm32_hll,:multi_hll,v)[1], d(:plm32_duc,:multi_duc,v)[1])
+end
+for (v,nm) in ((1,"rho"),(5,"E"),(6,"Bx"))
+    @printf("%-3s  fused vs prepass: f32 |plm32_duc-plm32_duc_pre| max %.2e | f16 |plm_duc-plm_duc_pre| max %.2e\n",
+            nm, d(:plm32_duc,:plm32_duc_pre,v)[1], d(:plm_duc,:plm_duc_pre,v)[1])
 end
 println("finite: ", all(all(isfinite, R[k]) for k in keys(R)))
