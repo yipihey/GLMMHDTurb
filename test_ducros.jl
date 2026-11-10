@@ -15,6 +15,7 @@ const TAVG0 = parse(Float32, get(ENV, "TAVG0", "0.3"))
 const NSNAP = parse(Int, get(ENV, "NSNAP", "6"))
 const BACKEND = Symbol(get(ENV, "BACKEND", "cpu"))
 const COURANT = parse(Float32, get(ENV, "COURANT", "0.7"))
+const SOLVER = Symbol(get(ENV, "SOLVER", "multi"))   # multi (KA multi-kernel) | plm (fast f16 tile, GPU)
 const AMP = parse(Float32, get(ENV, "AMP", "130"))
 const FKMAX = parse(Float32, get(ENV, "FKMAX", "0"))   # forcing band |k|<=FKMAX (0 = legacy flat to k=32)
 const SMALLR = parse(Float32, get(ENV, "SMALLR", "0"))  # density floor override (0 = Params default 1e-6)
@@ -99,7 +100,7 @@ function test_turb(N, t_end; names=String[], tavg0=TAVG0, nsnap=NSNAP, outdir=ge
             end
         end
         t0 = time()
-        d = G.run_turb(N=N, t_end=t_end, amp=AMP, backend=BACKEND, solver=:multi, pin=:none, ncontrol=400,
+        d = G.run_turb(N=N, t_end=t_end, amp=AMP, backend=BACKEND, solver=SOLVER, pin=:none, ncontrol=400,
                        riemann=c.riemann, ducros=c.ducros, phimin=c.phimin, rjump=c.rjump,
                        widen=c.widen, thr=c.thr, rlow=c.rlow, nstepmax=NSTEPMAX, seed=SEED, courant=COURANT,
                        fkmax=FKMAX, pkw=PKW,

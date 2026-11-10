@@ -908,11 +908,34 @@ end
 @inline function _spT(S, lin, q)                                          # f32 -> ST on write
     @inbounds for v in 1:9; S[9*lin + v] = q[v]; end
 end
+# Face flux for the plm tile. DUC=false: the plain Riemann solver. DUC=true: the Ducros-scaled
+# flux of the multi-kernel path (riemann_duc, identical physics), with phi from the precomputed
+# global cell sensor `sen` (ducros_kernel! prepass) along the face normal: cells (i,i+1), or
+# (i-1..i+2) if widen. Reading sen from global memory sidesteps the tile halo (the widened
+# stencil needs u at i-2..i+3 = halo 3; the tile has 2). (gi,gj,gk) = global left cell.
+@inline _plm_face(::Val{false}, rv, L, R, dir, gamma,ch,smallr,pfl,ld,lp, sen,gi,gj,gk,N,phimin,thr,widen) =
+    riemann_sel(rv, L, R, dir, gamma,ch,smallr,pfl,ld,lp)
+@inline function _plm_face(::Val{true}, ::Val{RIEM}, L, R, dir, gamma,ch,smallr,pfl,ld,lp,
+                           sen, gi,gj,gk, N, phimin, thr, widen) where {RIEM}
+    @inbounds begin
+        di = dir==1 ? 1 : 0; dj = dir==2 ? 1 : 0; dk = dir==3 ? 1 : 0
+        s = max(sen[gi,gj,gk], sen[wrp(gi+di,N),wrp(gj+dj,N),wrp(gk+dk,N)])
+        if widen
+            s = max(s, max(sen[wrp(gi-di,N),wrp(gj-dj,N),wrp(gk-dk,N)],
+                           sen[wrp(gi+2di,N),wrp(gj+2dj,N),wrp(gk+2dk,N)]))
+        end
+    end
+    phi = max(s, phimin)
+    thr > 0.0f0 && (phi = ifelse(phi > thr, 1.0f0, phi))
+    return riemann_duc(L, R, dir, gamma, ch, smallr, pfl, ld, lp, RIEM === :hlld ? 2 : 1, min(phi, 1.0f0))
+end
+
 function integrator_plm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, afield,
                          gamma::Float32, smallr::Float32, pfl::Float32, smallc::Float32,
                          dt::Float32, dx::Float32, ch::Float32, glm_fac::Float32,
                          llf_dmin::Float32, llf_pmin::Float32, N::Int,
-                         boxlen::Float32, ramp::Float32, turb_min_rho::Float32, do_turb::Bool) where {TB,HALF,RIEM}
+                         boxlen::Float32, ramp::Float32, turb_min_rho::Float32, do_turb::Bool,
+                         sen, phimin::Float32, thr::Float32, widen::Bool, ::Val{DUC}) where {TB,HALF,RIEM,DUC}
     TT = TB + 4; ST = HALF ? Float16 : Float32
     SP = CuStaticSharedArray(ST, 9*TT*TT*TT)
     LX = CuStaticSharedArray(ST, 9*(TB+1)*TB*TB); RX = CuStaticSharedArray(ST, 9*(TB+1)*TB*TB)
@@ -956,13 +979,16 @@ function integrator_plm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, afield
         while t <= 3*nfx
             if t<=nfx
                 l=t-1;fi=l%(TB+1);fj=(l÷(TB+1))%TB;fk=l÷((TB+1)*TB)
-                _spT(LX, lfx(fi,fj,fk), _fsc(Val(HALF), riemann_sel(rv, _sgT(LX,lfx(fi,fj,fk)), _sgT(RX,lfx(fi,fj,fk)), 1, gamma,ch,smallr,pfl,llf_dmin,llf_pmin), dtdx))
+                _spT(LX, lfx(fi,fj,fk), _fsc(Val(HALF), _plm_face(Val(DUC), rv, _sgT(LX,lfx(fi,fj,fk)), _sgT(RX,lfx(fi,fj,fk)), 1, gamma,ch,smallr,pfl,llf_dmin,llf_pmin,
+                    sen, wrp(ox+fi,N), wrp(oy+fj+1,N), wrp(oz+fk+1,N), N, phimin, thr, widen), dtdx))
             elseif t<=2*nfx
                 l=t-1-nfx;fi=l%TB;fj=(l÷TB)%(TB+1);fk=l÷(TB*(TB+1))
-                _spT(LY, lfy(fi,fj,fk), _fsc(Val(HALF), riemann_sel(rv, _sgT(LY,lfy(fi,fj,fk)), _sgT(RY,lfy(fi,fj,fk)), 2, gamma,ch,smallr,pfl,llf_dmin,llf_pmin), dtdx))
+                _spT(LY, lfy(fi,fj,fk), _fsc(Val(HALF), _plm_face(Val(DUC), rv, _sgT(LY,lfy(fi,fj,fk)), _sgT(RY,lfy(fi,fj,fk)), 2, gamma,ch,smallr,pfl,llf_dmin,llf_pmin,
+                    sen, wrp(ox+fi+1,N), wrp(oy+fj,N), wrp(oz+fk+1,N), N, phimin, thr, widen), dtdx))
             else
                 l=t-1-2*nfx;fi=l%TB;fj=(l÷TB)%TB;fk=l÷(TB*TB)
-                _spT(LZ, lfz(fi,fj,fk), _fsc(Val(HALF), riemann_sel(rv, _sgT(LZ,lfz(fi,fj,fk)), _sgT(RZ,lfz(fi,fj,fk)), 3, gamma,ch,smallr,pfl,llf_dmin,llf_pmin), dtdx))
+                _spT(LZ, lfz(fi,fj,fk), _fsc(Val(HALF), _plm_face(Val(DUC), rv, _sgT(LZ,lfz(fi,fj,fk)), _sgT(RZ,lfz(fi,fj,fk)), 3, gamma,ch,smallr,pfl,llf_dmin,llf_pmin,
+                    sen, wrp(ox+fi+1,N), wrp(oy+fj+1,N), wrp(oz+fk,N), N, phimin, thr, widen), dtdx))
             end
             t+=nth
         end
@@ -995,10 +1021,13 @@ end
 # Launch helper: the (TB,HALF,RIEM) Vals MUST be concrete literals at the call site (a runtime
 # Val(tb)/Val(riemann) is type-unstable and crashes the host LLVM), so step_plm! branches below.
 @inline function _plm_launch(tv::Val, hv::Val, rv::Val, nthreads, nb, unew, uold, afield, p::Params,
-                             pfl, dt, dx, ch, glm_fac, ramp, do_turb)
+                             pfl, dt, dx, ch, glm_fac, ramp, do_turb;
+                             sen=afield, phimin::Float32=0.0f0, thr::Float32=0.0f0, widen::Bool=false,
+                             dv::Val=Val(false))
     @cuda threads=nthreads blocks=(nb,nb,nb) integrator_plm!(
         tv, hv, rv, unew, uold, afield, p.gamma, p.smallr, pfl, p.smallc, dt, dx, ch, glm_fac,
-        p.switch_llf_dmin, p.switch_llf_pmin, p.N, p.boxlen, ramp, p.turb_min_rho, do_turb)
+        p.switch_llf_dmin, p.switch_llf_pmin, p.N, p.boxlen, ramp, p.turb_min_rho, do_turb,
+        sen, phimin, thr, widen, dv)
 end
 
 # Production PLM step. Default = Hancock + HLL + GLM + PLM, f16 shared, TB=6 (nsubgrid=3).
@@ -1006,14 +1035,32 @@ end
 # (tb=4,half=true,riemann=:hll). Other combos: error (add a branch if needed).
 function step_plm!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
                    do_turb::Bool=false, nthreads::Int=192, tb::Int=0, half::Bool=true,
-                   riemann::Symbol=:hll, recon::Symbol=:plm, dtc::Float32=dt)
+                   riemann::Symbol=:hll, recon::Symbol=:plm, dtc::Float32=dt,
+                   ducros::Bool=false, sen=nothing, phimin::Float32=0.0f0, thr::Float32=0.0f0,
+                   widen::Bool=false, deps::Float32=0.05f0)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
     tb == 0 && (tb = N % 6 == 0 ? 6 : 4)   # auto: nsubgrid=3 when it divides N, else nsubgrid=2
     @assert N % tb == 0 "N=$N not divisible by tb=$tb (need N%6==0 for the fast TB=6 path, or N%4==0)"
     ch = p.courant*dx/dtc/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0); nb = N ÷ tb
-    if recon === :ppm   # lean parabolic-PPM (single-zone edges + Hancock + shock fallback); f16+HLL only
+    if ducros   # Ducros-scaled dissipation: sensor prepass (global, so no tile-halo limit), then the tile
+        recon === :plm || error("step_plm! ducros=true needs recon=:plm")
+        sen === nothing && error("step_plm! ducros=true needs a sen::CuArray(N,N,N) scratch")
+        ducros_kernel!(CUDABackend())(sen, uold, p.gamma, p.smallr, pfl, deps, N; ndrange=(N,N,N))
+        kw = (; sen=sen, phimin=phimin, thr=thr, widen=widen, dv=Val(true))
+        if tb==6 && half && riemann===:hll
+            _plm_launch(Val(6),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb; kw...)
+        elseif tb==4 && half && riemann===:hll
+            _plm_launch(Val(4),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb; kw...)
+        elseif tb==6 && half && riemann===:hlld
+            _plm_launch(Val(6),Val(true),Val(:hlld), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb; kw...)
+        elseif tb==4 && !half && riemann===:hll   # f32 tile: validation of the port against the multi path
+            _plm_launch(Val(4),Val(false),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb; kw...)
+        else
+            error("step_plm! ducros: unsupported (tb=$tb, riemann=$riemann); add a branch")
+        end
+    elseif recon === :ppm   # lean parabolic-PPM (single-zone edges + Hancock + shock fallback); f16+HLL only
         (half && riemann===:hll) || error("step_plm! recon=:ppm supports only half=true,riemann=:hll (got half=$half, riemann=$riemann)")
         if tb==6
             _plm_ppm_launch(Val(6),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
@@ -1034,6 +1081,8 @@ function step_plm!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
         _plm_launch(Val(6),Val(true),Val(:hlld), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
     elseif tb==4 && half && riemann===:hlld
         _plm_launch(Val(4),Val(true),Val(:hlld), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
+    elseif tb==4 && !half && riemann===:hll    # f32 tile HLL (validation)
+        _plm_launch(Val(4),Val(false),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
     else
         error("step_plm!: unsupported (tb=$tb, half=$half, riemann=$riemann); add a branch")
     end
@@ -2277,12 +2326,16 @@ mutable struct Forcing
     plan                               # reused inverse-FFT plan (CUFFT or FFTW)
     amp::Float32                       # calibration amplitude
     next_time::Float32
+    rng::Random.Xoshiro                # forcing-private RNG, seeded from p.turb_seed
 end
 
-# Portable Gaussian fill from the (seeded) host RNG on both backends, so a given turb_seed
-# gives bit-identical forcing Gaussians on CPU and GPU (6*64^3 floats per OU step: cheap).
-_randn!(g::CuArray) = copyto!(g, randn(Float32, size(g)))
-_randn!(g::AbstractArray) = Random.randn!(g)
+# Gaussian fill from the forcing's OWN host RNG on both backends: a given turb_seed gives
+# bit-identical forcing on CPU and GPU, independent of anything else drawing random numbers.
+# (A shared global RNG is not enough: CUDA.jl reductions -- sum/maximum/all, so compute_dt,
+# diagnostics, finiteness checks -- consume the task-local RNG, so the forcing realization
+# depended on how many reductions ran, i.e. on step counts and verbosity.)
+_randn!(g::CuArray, rng) = copyto!(g, randn(rng, Float32, size(g)))
+_randn!(g::AbstractArray, rng) = Random.randn!(rng, g)
 
 function Forcing(p::Params, be; amp::Float32=p.turb_rms)
     n = TURB_GS
@@ -2293,7 +2346,7 @@ function Forcing(p::Params, be; amp::Float32=p.turb_rms)
     plan = AbstractFFTs.plan_bfft!(tmp)        # CUFFT for CuArray, FFTW for Array
     kmax = p.turb_kmax > 0 ? p.turb_kmax : Float32(n÷2)
     ou_init_kernel!(be)(sqp, unitk, n, kmax; ndrange=(n,n,n)); KA.synchronize(be)
-    f = Forcing(Fhat, sqp, unitk, afield, gbuf, tmp, plan, amp, 0.0f0)
+    f = Forcing(Fhat, sqp, unitk, afield, gbuf, tmp, plan, amp, 0.0f0, Random.Xoshiro(p.turb_seed))
     return f
 end
 
@@ -2303,7 +2356,7 @@ function ou_advance!(f::Forcing, p::Params, be)
     dt = p.turb_T/Float32(p.turb_Ndt)
     alpha = 1.0f0 - dt/p.turb_T
     beta  = sqrt(2.0f0*dt/p.turb_T)
-    _randn!(f.gbuf)
+    _randn!(f.gbuf, f.rng)
     ou_step_kernel!(be)(f.Fhat, f.gbuf, f.sqp, f.unitk, alpha, beta, p.comp_frac, 1.0f0-p.comp_frac; ndrange=(n,n,n))
     KA.synchronize(be)
     for c in 1:3
@@ -2372,14 +2425,17 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
     sen = (gpu || !ducros) ? nothing : KA.zeros(be, Float32, N,N,N)
     # solver=:multi runs the portable KA multi-kernel path (needed for ducros/riemann kwargs) on either backend
     multi = !gpu || solver === :multi
-    gpu && !multi && (ducros || riemann !== :default) && error("ducros/riemann kwargs need solver=:multi on GPU")
+    gpu && !multi && solver !== :plm && (ducros || riemann !== :default) &&
+        error("ducros/riemann kwargs need solver=:multi or :plm on GPU")
+    plm = gpu && solver === :plm
+    plm && ducros && (rjump > 0 || rlow > 0) && error("solver=:plm ducros supports phimin/thr/widen only (not rjump/rlow)")
+    plm && ducros && (sen = KA.zeros(be, Float32, N,N,N))
     if gpu && multi
         rec = KA.zeros(be, Float32, N,N,N,36); flx = KA.zeros(be, Float32, N,N,N,27)
         sen = ducros ? KA.zeros(be, Float32, N,N,N) : nothing
     end
     p0 = p.rho0*p.cs0^2/p.gamma
     ic_uniform_kernel!(be)(u1, p.rho0, p0, p.b0, p.gamma; ndrange=(N,N,N)); KA.synchronize(be)
-    Random.seed!(p.turb_seed)              # reproducible forcing (host RNG feeds both backends)
     f = Forcing(p, be; amp=amp)
     ou_advance!(f, p, be)                  # seed the first field
     t = 0.0f0; step = 0
@@ -2394,7 +2450,9 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
                         riemann=riemann, ducros=ducros, sen=sen, phimin=phimin, deps=deps, rjump=rjump,
                         widen=widen, thr=thr, rlow=rlow, dtc=dtc)
         elseif gpu && solver === :plm        # Hancock + HLL + GLM + PLM, f16 shared; TB auto (6 if N%6==0 else 4)
-            step_plm!(u1, u2, f.afield, p, dt, t; do_turb=true, nthreads=nthreads, tb=0, half=true, riemann=:hll, dtc=dtc)
+            step_plm!(u1, u2, f.afield, p, dt, t; do_turb=true, nthreads=nthreads, tb=0, half=true,
+                      riemann=(riemann === :default ? :hll : riemann), dtc=dtc,
+                      ducros=ducros, sen=sen, phimin=phimin, thr=thr, widen=widen, deps=deps)
         elseif gpu
             step_tiled!(u1, u2, f.afield, p, dt, t; use_hlld=use_hlld, do_turb=true, nthreads=nthreads, dtc=dtc)
         else
