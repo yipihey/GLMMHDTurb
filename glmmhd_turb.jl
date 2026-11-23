@@ -224,7 +224,10 @@ end
     # transverse fields/velocities in L*, R* (Miyoshi-Kusano eq. 42-47)
     function star(d, u, v, w, by, bz, pt, S, dstar)
         denK = d*(S-u)*(S-SM) - bn*bn
-        small = abs(denK) < 1.0f-12
+        # Degenerate when bn^2 ~ d(S-u)(S-SM) (field along the normal, c_fast = c_Alfven): in Float32 denK is then
+        # rounding noise of the size of the total pressure times 1e-7, far above an absolute 1e-12, and the star
+        # states blew up (current sheet, GEM). Compare with the star total pressure instead.
+        small = abs(denK) < 1.0f-4*pts
         if small
             vy = v; vz = w; byS = by; bzS = bz
         else
@@ -576,10 +579,13 @@ end
 end
 
 # Fused step (no scratch): one kernel uold -> unew.
+# c_h = courant*dx/(NDIM*dt_cfl)*glm_ch_scale. Pass dt_cfl = the CFL step (compute_dt) when dt is shortened to land
+# on an output or t_end: with c_h from the shortened dt, c_h and the flux of psi (c_h^2 bn*) grow without bound on
+# such steps (a factor 1e2-1e4 on the sweep's movie runs, which then failed). Every step_* below takes the same keyword.
 function step_fused!(uold, unew, afield, p::Params, dt::Float32, t::Float32, be;
-                     use_hlld::Bool=true, do_turb::Bool=false)
+                     use_hlld::Bool=true, do_turb::Bool=false, dt_cfl::Float32=dt)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dt_cfl/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0)
     integrator_fused!(be)(unew, uold, afield, p.gamma, p.smallr, pfl, p.smallc, dt, dx, ch, glm_fac,
@@ -745,10 +751,10 @@ end
 # Tiled step (no scratch): one kernel launch, (N/4)^3 blocks of 128 threads.
 function step_tiled!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
                      use_hlld::Bool=true, do_turb::Bool=false, nthreads::Int=192, maxregs::Int=0,
-                     lean::Bool=false)
+                     lean::Bool=false, dt_cfl::Float32=dt)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
     @assert N % TB == 0 "N must be a multiple of $TB"
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dt_cfl/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0)
     nb = N ÷ TB
@@ -779,75 +785,181 @@ end
 @inline function _spT(S, lin, q)                                          # f32 -> ST on write
     @inbounds for v in 1:9; S[9*lin + v] = q[v]; end
 end
+# Anchored half-precision storage (ANC = true; with HALF). A cell or interface state is stored as its Float16
+# difference from an anchor: the Float32 primitive state of the first owned cell of the tile its cell belongs to. AN
+# holds the anchors of the 27 tiles around the block's own; every block computes them identically, so a state that two
+# blocks share is decoded identically and the fluxes of a shared face, and with them the update, stay conservative.
+# Fluxes are stored as dt/dx*F split into a Float16 head (in L*) and tail (in R*), 22 bits in all.
+# Plain Float16 storage rounds primitives, interface states and fluxes to 11 bits; slopes of a smooth flow are then
+# differences of rounded numbers and the error grows with resolution past 64-128 cells (entropy wave, PLM/HLL, 256^2,
+# CPU emulation: 2.44e-3 rounded, 6.02e-5 anchored, 5.89e-5 Float32). dt/dx*F also keeps the flux of psi, c_h^2 bn*,
+# inside the Float16 range (65504), which it left on the magnetised blasts.
+@inline _toff(p, TB) = p < 2 ? 0 : (p > TB+1 ? 2 : 1)                    # tile-cell p is in the tile below, this, above
+@inline _ai(pi, pj, pk, TB) = _toff(pi,TB) + 3*_toff(pj,TB) + 9*_toff(pk,TB)
+@inline _sgA(::Val{false}, S, lin, AN, a) = _sgT(S, lin)
+@inline _sgA(::Val{true}, S, lin, AN, a) = ntuple(v -> @inbounds(AN[9*a + v]) + Float32(@inbounds(S[9*lin + v])), 9)
+@inline _spA(::Val{false}, S, lin, q, AN, a) = _spT(S, lin, q)
+@inline function _spA(::Val{true}, S, lin, q, AN, a)
+    @inbounds for v in 1:9; S[9*lin + v] = q[v] - AN[9*a + v]; end
+end
+@inline _sgF(::Val{false}, L, R, lin) = _sgT(L, lin)
+@inline _sgF(::Val{true}, L, R, lin) = ntuple(v -> Float32(@inbounds(L[9*lin + v])) + Float32(@inbounds(R[9*lin + v])), 9)
+@inline _spF(::Val{false}, L, R, lin, f, dtdx) = _spT(L, lin, f)
+@inline function _spF(::Val{true}, L, R, lin, f, dtdx)
+    @inbounds for v in 1:9
+        g = dtdx*f[v]; h = convert(eltype(L), g); L[9*lin + v] = h; R[9*lin + v] = g - Float32(h)
+    end
+end
+# With cell-centred CT (FCT) psi is not a variable: it is read as 0 (c_h is 1e-20 there, so any psi jump across a face
+# would enter the Riemann solver as jump/c_h).
+@inline _nopsi(::Val{false}, q) = q
+@inline _nopsi(::Val{true}, q) = (q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], 0.0f0)
+# Load the 27 anchors (ANC) into AN.
+@inline function _anchors!(::Val{TB}, fv::Val, AN, uold, ox, oy, oz, N, gamma, smallr, pfl, tid, nth) where {TB}
+    t = tid
+    @inbounds while t <= 27
+        l = t-1; a = l%3 - 1; b = (l÷3)%3 - 1; c = l÷9 - 1
+        q = _nopsi(fv, cons2prim(loadc(uold, wrp(ox+a*TB+1,N), wrp(oy+b*TB+1,N), wrp(oz+c*TB+1,N)), gamma, smallr, pfl))
+        for v in 1:9; AN[9*l + v] = q[v]; end
+        t += nth
+    end
+end
+# Cell-centred constrained transport (FCT = true; Toth 2000 sec. 4.3, flux-CT) in place of GLM cleaning. The tile kernel
+# leaves B and psi = 0 as they are and writes the six transverse B fluxes of each cell's upper faces to fs[...,1:6];
+# fct_emf_kernel! averages the four face fluxes around each cell edge into an EMF (fs[...,7:9]) and fct_update_kernel!
+# advances B by central differences of them, which keeps the divergence of B at cell corners at rounding. No psi, no
+# c_h. GLM leaves 111x (128^2) and 21x (256^2) the reference field in the field-free vortex of kh_localized whatever
+# the damping; this leaves 3.2x and 2.4x (CPU emulation, LLF).
+@inline function _fct_store!(::Val{false}, fs, gi, gj, gk, Fxh, Fyh, Fzh) end
+@inline function _fct_store!(::Val{true}, fs, gi, gj, gk, Fxh, Fyh, Fzh)
+    @inbounds begin
+        fs[gi,gj,gk,1] = Fxh[7]; fs[gi,gj,gk,2] = Fxh[8]    # Fx[By] = -Ez, Fx[Bz] = +Ey  at (i+1/2, j, k)
+        fs[gi,gj,gk,3] = Fyh[6]; fs[gi,gj,gk,4] = Fyh[8]    # Fy[Bx] = +Ez, Fy[Bz] = -Ex  at (i, j+1/2, k)
+        fs[gi,gj,gk,5] = Fzh[6]; fs[gi,gj,gk,6] = Fzh[7]    # Fz[Bx] = -Ey, Fz[By] = +Ex  at (i, j, k+1/2)
+    end
+end
+function fct_emf_kernel!(fs, N)
+    i = (blockIdx().x-1)*blockDim().x + threadIdx().x
+    if i <= N*N*N
+        @inbounds begin
+            k = (i-1)÷(N*N)+1; j = ((i-1)÷N)%N+1; ii = (i-1)%N+1
+            ip = wrp(ii+1,N); jp = wrp(j+1,N); kp = wrp(k+1,N)
+            fs[ii,j,k,7] = 0.25f0*(fs[ii,j,k,6]+fs[ii,jp,k,6]-fs[ii,j,k,4]-fs[ii,j,kp,4])   # Ex at (i, j+1/2, k+1/2)
+            fs[ii,j,k,8] = 0.25f0*(fs[ii,j,k,2]+fs[ii,j,kp,2]-fs[ii,j,k,5]-fs[ip,j,k,5])   # Ey at (i+1/2, j, k+1/2)
+            fs[ii,j,k,9] = 0.25f0*(fs[ii,j,k,3]+fs[ip,j,k,3]-fs[ii,j,k,1]-fs[ii,jp,k,1])   # Ez at (i+1/2, j+1/2, k)
+        end
+    end
+    return nothing
+end
+function fct_update_kernel!(unew, uold, fs, s::Float32, N)       # s = dt/dx, or 1 when the fluxes are dt/dx*F (ANC)
+    i = (blockIdx().x-1)*blockDim().x + threadIdx().x
+    if i <= N*N*N
+        @inbounds begin
+            k = (i-1)÷(N*N)+1; j = ((i-1)÷N)%N+1; ii = (i-1)%N+1
+            im = wrp(ii-1,N); jm = wrp(j-1,N); km = wrp(k-1,N)
+            # dx times the derivatives of E at the cell centre, each from the four corners around it
+            ezy = 0.5f0*((fs[ii,j,k,9]+fs[im,j,k,9]) - (fs[ii,jm,k,9]+fs[im,jm,k,9]))
+            ezx = 0.5f0*((fs[ii,j,k,9]+fs[ii,jm,k,9]) - (fs[im,j,k,9]+fs[im,jm,k,9]))
+            eyz = 0.5f0*((fs[ii,j,k,8]+fs[im,j,k,8]) - (fs[ii,j,km,8]+fs[im,j,km,8]))
+            eyx = 0.5f0*((fs[ii,j,k,8]+fs[ii,j,km,8]) - (fs[im,j,k,8]+fs[im,j,km,8]))
+            exz = 0.5f0*((fs[ii,j,k,7]+fs[ii,jm,k,7]) - (fs[ii,j,km,7]+fs[ii,jm,km,7]))
+            exy = 0.5f0*((fs[ii,j,k,7]+fs[ii,j,km,7]) - (fs[ii,jm,k,7]+fs[ii,jm,km,7]))
+            unew[ii,j,k,6] = uold[ii,j,k,6] - s*(ezy - eyz)
+            unew[ii,j,k,7] = uold[ii,j,k,7] - s*(exz - ezx)
+            unew[ii,j,k,8] = uold[ii,j,k,8] - s*(eyx - exy)
+            unew[ii,j,k,9] = 0.0f0
+        end
+    end
+    return nothing
+end
+"Scratch for step_plm!(...; fct=true): transverse B fluxes of the upper faces (1:6) and the edge EMFs (7:9)."
+fct_scratch(N::Int) = CUDA.zeros(Float32, N, N, N, 9)
+
 function integrator_plm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, afield,
                          gamma::Float32, smallr::Float32, pfl::Float32, smallc::Float32,
                          dt::Float32, dx::Float32, ch::Float32, glm_fac::Float32,
                          llf_dmin::Float32, llf_pmin::Float32, N::Int,
-                         boxlen::Float32, ramp::Float32, turb_min_rho::Float32, do_turb::Bool) where {TB,HALF,RIEM}
+                         boxlen::Float32, ramp::Float32, turb_min_rho::Float32, do_turb::Bool,
+                         ::Val{ANC}=Val(false), ::Val{FCT}=Val(false), fs=unew) where {TB,HALF,RIEM,ANC,FCT}
     TT = TB + 4; ST = HALF ? Float16 : Float32
     SP = CuStaticSharedArray(ST, 9*TT*TT*TT)
     LX = CuStaticSharedArray(ST, 9*(TB+1)*TB*TB); RX = CuStaticSharedArray(ST, 9*(TB+1)*TB*TB)
     LY = CuStaticSharedArray(ST, 9*TB*(TB+1)*TB); RY = CuStaticSharedArray(ST, 9*TB*(TB+1)*TB)
     LZ = CuStaticSharedArray(ST, 9*TB*TB*(TB+1)); RZ = CuStaticSharedArray(ST, 9*TB*TB*(TB+1))
+    AN = ANC ? CuStaticSharedArray(Float32, 9*27) : nothing
     lt(pi,pj,pk)=pi+TT*(pj+TT*pk); lfx(fi,fj,fk)=fi+(TB+1)*(fj+TB*fk); lfy(fi,fj,fk)=fi+TB*(fj+(TB+1)*fk); lfz(fi,fj,fk)=fi+TB*(fj+TB*fk)
+    ai(pi,pj,pk)=_ai(pi,pj,pk,TB); av = Val(ANC)
     rv = Val(RIEM)
     @fastmath @inbounds begin
         dtdx = dt/dx; tid = threadIdx().x; nth = blockDim().x
         ox=(blockIdx().x-1)*TB; oy=(blockIdx().y-1)*TB; oz=(blockIdx().z-1)*TB
+        if ANC
+            _anchors!(Val(TB), Val(FCT), AN, uold, ox, oy, oz, N, gamma, smallr, pfl, tid, nth); sync_threads()
+        end
         t = tid
         while t <= TT*TT*TT
             l=t-1; pi=l%TT; pj=(l÷TT)%TT; pk=l÷(TT*TT)
-            _spT(SP, lt(pi,pj,pk), cons2prim(loadc(uold, wrp(ox+pi-1,N), wrp(oy+pj-1,N), wrp(oz+pk-1,N)), gamma,smallr,pfl)); t+=nth
+            _spA(av, SP, lt(pi,pj,pk), _nopsi(Val(FCT), cons2prim(loadc(uold, wrp(ox+pi-1,N), wrp(oy+pj-1,N), wrp(oz+pk-1,N)), gamma,smallr,pfl)), AN, ai(pi,pj,pk)); t+=nth
         end
         sync_threads(); t=tid
         while t <= (TB+2)^3
             l=t-1; ci=l%(TB+2); cj=(l÷(TB+2))%(TB+2); ck=l÷((TB+2)*(TB+2)); pi=ci+1;pj=cj+1;pk=ck+1
-            m0 = _sgT(SP, lt(pi,pj,pk))
-            sx = prim_slope(_sgT(SP,lt(pi-1,pj,pk)), m0, _sgT(SP,lt(pi+1,pj,pk)))
-            sy = prim_slope(_sgT(SP,lt(pi,pj-1,pk)), m0, _sgT(SP,lt(pi,pj+1,pk)))
-            sz = prim_slope(_sgT(SP,lt(pi,pj,pk-1)), m0, _sgT(SP,lt(pi,pj,pk+1)))
+            sg(a,b,c) = _sgA(av, SP, lt(a,b,c), AN, ai(a,b,c)); a0 = ai(pi,pj,pk)
+            m0 = sg(pi,pj,pk)
+            sx = prim_slope(sg(pi-1,pj,pk), m0, sg(pi+1,pj,pk))
+            sy = prim_slope(sg(pi,pj-1,pk), m0, sg(pi,pj+1,pk))
+            sz = prim_slope(sg(pi,pj,pk-1), m0, sg(pi,pj,pk+1))
             mh = cons2prim(hancock(m0,sx,sy,sz,dtdx,gamma), gamma,smallr,pfl)
             (mh[1]<=smallr || mh[5]<=pfl) && (mh = m0)
             inxt=(pj>=2&&pj<=TB+1)&&(pk>=2&&pk<=TB+1); inyt=(pi>=2&&pi<=TB+1)&&(pk>=2&&pk<=TB+1); inzt=(pi>=2&&pi<=TB+1)&&(pj>=2&&pj<=TB+1)
             if inxt
-                pi<=TB+1 && _spT(LX, lfx(pi-1,pj-2,pk-2), iflo(padd(mh,sx,1.0f0),m0,smallr,pfl))
-                pi>=2    && _spT(RX, lfx(pi-2,pj-2,pk-2), iflo(padd(mh,sx,-1.0f0),m0,smallr,pfl))
+                pi<=TB+1 && _spA(av, LX, lfx(pi-1,pj-2,pk-2), iflo(padd(mh,sx,1.0f0),m0,smallr,pfl), AN, a0)
+                pi>=2    && _spA(av, RX, lfx(pi-2,pj-2,pk-2), iflo(padd(mh,sx,-1.0f0),m0,smallr,pfl), AN, a0)
             end
             if inyt
-                pj<=TB+1 && _spT(LY, lfy(pi-2,pj-1,pk-2), iflo(padd(mh,sy,1.0f0),m0,smallr,pfl))
-                pj>=2    && _spT(RY, lfy(pi-2,pj-2,pk-2), iflo(padd(mh,sy,-1.0f0),m0,smallr,pfl))
+                pj<=TB+1 && _spA(av, LY, lfy(pi-2,pj-1,pk-2), iflo(padd(mh,sy,1.0f0),m0,smallr,pfl), AN, a0)
+                pj>=2    && _spA(av, RY, lfy(pi-2,pj-2,pk-2), iflo(padd(mh,sy,-1.0f0),m0,smallr,pfl), AN, a0)
             end
             if inzt
-                pk<=TB+1 && _spT(LZ, lfz(pi-2,pj-2,pk-1), iflo(padd(mh,sz,1.0f0),m0,smallr,pfl))
-                pk>=2    && _spT(RZ, lfz(pi-2,pj-2,pk-2), iflo(padd(mh,sz,-1.0f0),m0,smallr,pfl))
+                pk<=TB+1 && _spA(av, LZ, lfz(pi-2,pj-2,pk-1), iflo(padd(mh,sz,1.0f0),m0,smallr,pfl), AN, a0)
+                pk>=2    && _spA(av, RZ, lfz(pi-2,pj-2,pk-2), iflo(padd(mh,sz,-1.0f0),m0,smallr,pfl), AN, a0)
             end
             t+=nth
         end
+        # face (fi,fj,fk): its left state came from tile-cell (fi+1,fj+2,fk+2) (x faces), its right state from (fi+2,..)
         sync_threads(); nfx=(TB+1)*TB*TB; t=tid
         while t <= 3*nfx
             if t<=nfx
-                l=t-1;fi=l%(TB+1);fj=(l÷(TB+1))%TB;fk=l÷((TB+1)*TB)
-                _spT(LX, lfx(fi,fj,fk), riemann_sel(rv, _sgT(LX,lfx(fi,fj,fk)), _sgT(RX,lfx(fi,fj,fk)), 1, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+                l=t-1;fi=l%(TB+1);fj=(l÷(TB+1))%TB;fk=l÷((TB+1)*TB); f=lfx(fi,fj,fk)
+                F = riemann_sel(rv, _sgA(av,LX,f,AN,ai(fi+1,fj+2,fk+2)), _sgA(av,RX,f,AN,ai(fi+2,fj+2,fk+2)), 1, gamma,ch,smallr,pfl,llf_dmin,llf_pmin)
+                _spF(av, LX, RX, f, F, dtdx)
             elseif t<=2*nfx
-                l=t-1-nfx;fi=l%TB;fj=(l÷TB)%(TB+1);fk=l÷(TB*(TB+1))
-                _spT(LY, lfy(fi,fj,fk), riemann_sel(rv, _sgT(LY,lfy(fi,fj,fk)), _sgT(RY,lfy(fi,fj,fk)), 2, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+                l=t-1-nfx;fi=l%TB;fj=(l÷TB)%(TB+1);fk=l÷(TB*(TB+1)); f=lfy(fi,fj,fk)
+                F = riemann_sel(rv, _sgA(av,LY,f,AN,ai(fi+2,fj+1,fk+2)), _sgA(av,RY,f,AN,ai(fi+2,fj+2,fk+2)), 2, gamma,ch,smallr,pfl,llf_dmin,llf_pmin)
+                _spF(av, LY, RY, f, F, dtdx)
             else
-                l=t-1-2*nfx;fi=l%TB;fj=(l÷TB)%TB;fk=l÷(TB*TB)
-                _spT(LZ, lfz(fi,fj,fk), riemann_sel(rv, _sgT(LZ,lfz(fi,fj,fk)), _sgT(RZ,lfz(fi,fj,fk)), 3, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+                l=t-1-2*nfx;fi=l%TB;fj=(l÷TB)%TB;fk=l÷(TB*TB); f=lfz(fi,fj,fk)
+                F = riemann_sel(rv, _sgA(av,LZ,f,AN,ai(fi+2,fj+2,fk+1)), _sgA(av,RZ,f,AN,ai(fi+2,fj+2,fk+2)), 3, gamma,ch,smallr,pfl,llf_dmin,llf_pmin)
+                _spF(av, LZ, RZ, f, F, dtdx)
             end
             t+=nth
         end
         sync_threads(); t=tid
+        sc = ANC ? 1.0f0 : dtdx                      # the stored fluxes are already dt/dx*F with ANC
         while t <= TB*TB*TB
             l=t-1;a=l%TB;b=(l÷TB)%TB;c=l÷(TB*TB); gi=wrp(ox+a+1,N);gj=wrp(oy+b+1,N);gk=wrp(oz+c+1,N)
-            Fxl=_sgT(LX,lfx(a,b,c));Fxh=_sgT(LX,lfx(a+1,b,c));Fyl=_sgT(LY,lfy(a,b,c));Fyh=_sgT(LY,lfy(a,b+1,c));Fzl=_sgT(LZ,lfz(a,b,c));Fzh=_sgT(LZ,lfz(a,b,c+1))
+            Fxl=_sgF(av,LX,RX,lfx(a,b,c));Fxh=_sgF(av,LX,RX,lfx(a+1,b,c));Fyl=_sgF(av,LY,RY,lfy(a,b,c));Fyh=_sgF(av,LY,RY,lfy(a,b+1,c));Fzl=_sgF(av,LZ,RZ,lfz(a,b,c));Fzh=_sgF(av,LZ,RZ,lfz(a,b,c+1))
             u0 = loadc(uold,gi,gj,gk)   # f32 update: increment promoted to f32, added to f32 state
-            r1 = ntuple(v -> u0[v] + dtdx*((Fxl[v]-Fxh[v])+(Fyl[v]-Fyh[v])+(Fzl[v]-Fzh[v])), 9)
+            r1 = ntuple(v -> u0[v] + sc*((Fxl[v]-Fxh[v])+(Fyl[v]-Fyh[v])+(Fzl[v]-Fzh[v])), 9)
             if r1[1] < smallr
                 emag=0.5f0*(r1[6]*r1[6]+r1[7]*r1[7]+r1[8]*r1[8])
                 r1=(smallr,0.0f0,0.0f0,0.0f0,pfl/(gamma-1.0f0)+emag,r1[6],r1[7],r1[8],r1[9])
             end
             r=(r1[1],r1[2],r1[3],r1[4],r1[5],r1[6],r1[7],r1[8], r1[9]*glm_fac)
+            if FCT                                   # B by fct_update_kernel!
+                _fct_store!(Val(FCT), fs, gi, gj, gk, Fxh, Fyh, Fzh)
+                r=(r[1],r[2],r[3],r[4],r[5],u0[6],u0[7],u0[8],0.0f0)
+            end
             if do_turb && r[1] >= turb_min_rho
                 ax,ay,az = turb_interp(afield, gi,gj,gk, boxlen/N, boxlen, ramp)
                 rhom=max(r[1],smallr); sc2=smallc*smallc; rho=r[1]; e=r[5]
@@ -865,44 +977,71 @@ end
 
 # Launch helper: the (TB,HALF,RIEM) Vals MUST be concrete literals at the call site (a runtime
 # Val(tb)/Val(riemann) is type-unstable and crashes the host LLVM), so step_plm! branches below.
+# av = Val(anchored storage), fv = Val(cell-centred CT) with its scratch fs (see above); both off by default.
 @inline function _plm_launch(tv::Val, hv::Val, rv::Val, nthreads, nb, unew, uold, afield, p::Params,
-                             pfl, dt, dx, ch, glm_fac, ramp, do_turb)
+                             pfl, dt, dx, ch, glm_fac, ramp, do_turb, av::Val=Val(false), fv::Val=Val(false), fs=unew)
     @cuda threads=nthreads blocks=(nb,nb,nb) integrator_plm!(
         tv, hv, rv, unew, uold, afield, p.gamma, p.smallr, pfl, p.smallc, dt, dx, ch, glm_fac,
-        p.switch_llf_dmin, p.switch_llf_pmin, p.N, p.boxlen, ramp, p.turb_min_rho, do_turb)
+        p.switch_llf_dmin, p.switch_llf_pmin, p.N, p.boxlen, ramp, p.turb_min_rho, do_turb, av, fv, fs)
+end
+# The two switches as concrete Vals (four branches with literal Vals, for the same reason).
+@inline function _with_flags(f, anchored::Bool, fct::Bool)
+    if anchored
+        fct ? f(Val(true), Val(true)) : f(Val(true), Val(false))
+    else
+        fct ? f(Val(false), Val(true)) : f(Val(false), Val(false))
+    end
 end
 
 # Production PLM step. Default = Hancock + HLL + GLM + PLM, f16 shared, TB=6 (nsubgrid=3).
 # Supported configs: (tb=6,half=true,riemann=:hll|:llf), (tb=4,half=false,riemann=:hlld bit-repro),
-# (tb=4,half=true,riemann=:hll). Other combos: error (add a branch if needed).
+# (tb=4,half=true,riemann=:hll), and (tb=4,half=false,riemann=:hll|:llf). Other combos: error (add a branch if needed).
+# A Float32 tile of 6 does not fit: 90 KB of static shared memory against 48 KB.
+# anchored (default: on with half): anchored Float16 storage, see _spA. anchored=false is the original storage.
+# fct: cell-centred constrained transport in place of GLM cleaning (scratch fs = fct_scratch(N)), see _fct_store!.
 function step_plm!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
                    do_turb::Bool=false, nthreads::Int=192, tb::Int=0, half::Bool=true,
-                   riemann::Symbol=:hll, recon::Symbol=:plm)
+                   riemann::Symbol=:hll, recon::Symbol=:plm, dt_cfl::Float32=dt,
+                   anchored::Bool=half, fct::Bool=false, fs=nothing)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
     tb == 0 && (tb = N % 6 == 0 ? 6 : 4)   # auto: nsubgrid=3 when it divides N, else nsubgrid=2
     @assert N % tb == 0 "N=$N not divisible by tb=$tb (need N%6==0 for the fast TB=6 path, or N%4==0)"
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
-    glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
+    anchored && !half && error("step_plm!: anchored storage is for the Float16 tile (half=true)")
+    fct && fs === nothing && error("step_plm!: fct=true needs its scratch, fs=fct_scratch(N)")
+    ch = fct ? 1.0f-20 : p.courant*dx/dt_cfl/Float32(NDIM)*p.glm_ch_scale    # no cleaning wave with CT
+    glm_fac = (p.glm_cp_coef > 0 && !fct) ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0); nb = N ÷ tb
-    if recon === :ppm   # lean parabolic-PPM (single-zone edges + Hancock + shock fallback); f16+HLL only
-        (half && riemann===:hll) || error("step_plm! recon=:ppm supports only half=true,riemann=:hll (got half=$half, riemann=$riemann)")
-        if tb==6
-            _plm_ppm_launch(Val(6),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
-        elseif tb==4
-            _plm_ppm_launch(Val(4),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
+    fsa = fs === nothing ? unew : fs
+    _with_flags(anchored, fct) do av, fv
+        if recon === :ppm   # lean parabolic-PPM (single-zone edges + Hancock + shock fallback); f16+HLL only
+            (half && riemann===:hll) || error("step_plm! recon=:ppm supports only half=true,riemann=:hll (got half=$half, riemann=$riemann)")
+            if tb==6
+                _plm_ppm_launch(Val(6),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb,av,fv,fsa)
+            elseif tb==4
+                _plm_ppm_launch(Val(4),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb,av,fv,fsa)
+            else
+                error("step_plm! recon=:ppm: unsupported tb=$tb (use 4 or 6)")
+            end
+        elseif tb==6 && half && riemann===:hll
+            _plm_launch(Val(6),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb,av,fv,fsa)
+        elseif tb==6 && half && riemann===:llf
+            _plm_launch(Val(6),Val(true),Val(:llf), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb,av,fv,fsa)
+        elseif tb==4 && !half && riemann===:hlld
+            _plm_launch(Val(4),Val(false),Val(:hlld), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb,av,fv,fsa)
+        elseif tb==4 && half && riemann===:hll
+            _plm_launch(Val(4),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb,av,fv,fsa)
+        elseif tb==4 && !half && riemann===:hll
+            _plm_launch(Val(4),Val(false),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb,av,fv,fsa)
+        elseif tb==4 && !half && riemann===:llf
+            _plm_launch(Val(4),Val(false),Val(:llf), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb,av,fv,fsa)
         else
-            error("step_plm! recon=:ppm: unsupported tb=$tb (use 4 or 6)")
+            error("step_plm!: unsupported (tb=$tb, half=$half, riemann=$riemann); add a branch")
         end
-    elseif tb==6 && half && riemann===:hll
-        _plm_launch(Val(6),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
-    elseif tb==6 && half && riemann===:llf
-        _plm_launch(Val(6),Val(true),Val(:llf), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
-    elseif tb==4 && !half && riemann===:hlld
-        _plm_launch(Val(4),Val(false),Val(:hlld), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
-    elseif tb==4 && half && riemann===:hll
-        _plm_launch(Val(4),Val(true),Val(:hll), nthreads,nb,unew,uold,afield,p,pfl,dt,dx,ch,glm_fac,ramp,do_turb)
-    else
-        error("step_plm!: unsupported (tb=$tb, half=$half, riemann=$riemann); add a branch")
+    end
+    if fct
+        nbl = cld(N*N*N, 256)
+        @cuda threads=256 blocks=nbl fct_emf_kernel!(fsa, N)
+        @cuda threads=256 blocks=nbl fct_update_kernel!(unew, uold, fsa, anchored ? 1.0f0 : dt/dx, N)
     end
     return nothing
 end
@@ -927,32 +1066,39 @@ end
 
 # MHD lean parabolic-PPM kernel: identical to integrator_plm! except the reconstruction stage —
 # MonCen slope + Hancock predictor (unchanged), PPM only sets the spatial face mh+edge-m0, with a
-# per-cell strong_pressure_jump -> PLM fallback at shocks.
+# per-cell strong_pressure_jump -> PLM fallback at shocks. ANC, FCT, fs as in integrator_plm!.
 function integrator_plm_ppm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, afield,
                          gamma::Float32, smallr::Float32, pfl::Float32, smallc::Float32,
                          dt::Float32, dx::Float32, ch::Float32, glm_fac::Float32,
                          llf_dmin::Float32, llf_pmin::Float32, N::Int,
-                         boxlen::Float32, ramp::Float32, turb_min_rho::Float32, do_turb::Bool) where {TB,HALF,RIEM}
+                         boxlen::Float32, ramp::Float32, turb_min_rho::Float32, do_turb::Bool,
+                         ::Val{ANC}=Val(false), ::Val{FCT}=Val(false), fs=unew) where {TB,HALF,RIEM,ANC,FCT}
     TT = TB + 4; ST = HALF ? Float16 : Float32
     SP = CuStaticSharedArray(ST, 9*TT*TT*TT)
     LX = CuStaticSharedArray(ST, 9*(TB+1)*TB*TB); RX = CuStaticSharedArray(ST, 9*(TB+1)*TB*TB)
     LY = CuStaticSharedArray(ST, 9*TB*(TB+1)*TB); RY = CuStaticSharedArray(ST, 9*TB*(TB+1)*TB)
     LZ = CuStaticSharedArray(ST, 9*TB*TB*(TB+1)); RZ = CuStaticSharedArray(ST, 9*TB*TB*(TB+1))
+    AN = ANC ? CuStaticSharedArray(Float32, 9*27) : nothing
     lt(pi,pj,pk)=pi+TT*(pj+TT*pk); lfx(fi,fj,fk)=fi+(TB+1)*(fj+TB*fk); lfy(fi,fj,fk)=fi+TB*(fj+(TB+1)*fk); lfz(fi,fj,fk)=fi+TB*(fj+TB*fk)
+    ai(pi,pj,pk)=_ai(pi,pj,pk,TB); av = Val(ANC)
     rv = Val(RIEM)
     @fastmath @inbounds begin
         dtdx = dt/dx; tid = threadIdx().x; nth = blockDim().x
         ox=(blockIdx().x-1)*TB; oy=(blockIdx().y-1)*TB; oz=(blockIdx().z-1)*TB
+        if ANC
+            _anchors!(Val(TB), Val(FCT), AN, uold, ox, oy, oz, N, gamma, smallr, pfl, tid, nth); sync_threads()
+        end
         t = tid
         while t <= TT*TT*TT
             l=t-1; pi=l%TT; pj=(l÷TT)%TT; pk=l÷(TT*TT)
-            _spT(SP, lt(pi,pj,pk), cons2prim(loadc(uold, wrp(ox+pi-1,N), wrp(oy+pj-1,N), wrp(oz+pk-1,N)), gamma,smallr,pfl)); t+=nth
+            _spA(av, SP, lt(pi,pj,pk), _nopsi(Val(FCT), cons2prim(loadc(uold, wrp(ox+pi-1,N), wrp(oy+pj-1,N), wrp(oz+pk-1,N)), gamma,smallr,pfl)), AN, ai(pi,pj,pk)); t+=nth
         end
         sync_threads(); t=tid
         while t <= (TB+2)^3
             l=t-1; ci=l%(TB+2); cj=(l÷(TB+2))%(TB+2); ck=l÷((TB+2)*(TB+2)); pi=ci+1;pj=cj+1;pk=ck+1
-            m0 = _sgT(SP, lt(pi,pj,pk))
-            mxl=_sgT(SP,lt(pi-1,pj,pk));mxr=_sgT(SP,lt(pi+1,pj,pk));myl=_sgT(SP,lt(pi,pj-1,pk));myr=_sgT(SP,lt(pi,pj+1,pk));mzl=_sgT(SP,lt(pi,pj,pk-1));mzr=_sgT(SP,lt(pi,pj,pk+1))
+            sg(a,b,c) = _sgA(av, SP, lt(a,b,c), AN, ai(a,b,c)); a0 = ai(pi,pj,pk)
+            m0 = sg(pi,pj,pk)
+            mxl=sg(pi-1,pj,pk);mxr=sg(pi+1,pj,pk);myl=sg(pi,pj-1,pk);myr=sg(pi,pj+1,pk);mzl=sg(pi,pj,pk-1);mzr=sg(pi,pj,pk+1)
             sx=prim_slope(mxl,m0,mxr); sy=prim_slope(myl,m0,myr); sz=prim_slope(mzl,m0,mzr)
             mh = cons2prim(hancock(m0,sx,sy,sz,dtdx,gamma), gamma,smallr,pfl)
             (mh[1]<=smallr || mh[5]<=pfl) && (mh = m0)
@@ -960,44 +1106,52 @@ function integrator_plm_ppm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, af
             pmx,ppx=ppm9(mxl,m0,mxr); pmy,ppy=ppm9(myl,m0,myr); pmz,ppz=ppm9(mzl,m0,mzr)
             inxt=(pj>=2&&pj<=TB+1)&&(pk>=2&&pk<=TB+1); inyt=(pi>=2&&pi<=TB+1)&&(pk>=2&&pk<=TB+1); inzt=(pi>=2&&pi<=TB+1)&&(pj>=2&&pj<=TB+1)
             if inxt
-                pi<=TB+1 && _spT(LX, lfx(pi-1,pj-2,pk-2), iflo(up ? mhd_face9(mh,ppx,m0) : padd(mh,sx,1.0f0),m0,smallr,pfl))
-                pi>=2    && _spT(RX, lfx(pi-2,pj-2,pk-2), iflo(up ? mhd_face9(mh,pmx,m0) : padd(mh,sx,-1.0f0),m0,smallr,pfl))
+                pi<=TB+1 && _spA(av, LX, lfx(pi-1,pj-2,pk-2), iflo(up ? mhd_face9(mh,ppx,m0) : padd(mh,sx,1.0f0),m0,smallr,pfl), AN, a0)
+                pi>=2    && _spA(av, RX, lfx(pi-2,pj-2,pk-2), iflo(up ? mhd_face9(mh,pmx,m0) : padd(mh,sx,-1.0f0),m0,smallr,pfl), AN, a0)
             end
             if inyt
-                pj<=TB+1 && _spT(LY, lfy(pi-2,pj-1,pk-2), iflo(up ? mhd_face9(mh,ppy,m0) : padd(mh,sy,1.0f0),m0,smallr,pfl))
-                pj>=2    && _spT(RY, lfy(pi-2,pj-2,pk-2), iflo(up ? mhd_face9(mh,pmy,m0) : padd(mh,sy,-1.0f0),m0,smallr,pfl))
+                pj<=TB+1 && _spA(av, LY, lfy(pi-2,pj-1,pk-2), iflo(up ? mhd_face9(mh,ppy,m0) : padd(mh,sy,1.0f0),m0,smallr,pfl), AN, a0)
+                pj>=2    && _spA(av, RY, lfy(pi-2,pj-2,pk-2), iflo(up ? mhd_face9(mh,pmy,m0) : padd(mh,sy,-1.0f0),m0,smallr,pfl), AN, a0)
             end
             if inzt
-                pk<=TB+1 && _spT(LZ, lfz(pi-2,pj-2,pk-1), iflo(up ? mhd_face9(mh,ppz,m0) : padd(mh,sz,1.0f0),m0,smallr,pfl))
-                pk>=2    && _spT(RZ, lfz(pi-2,pj-2,pk-2), iflo(up ? mhd_face9(mh,pmz,m0) : padd(mh,sz,-1.0f0),m0,smallr,pfl))
+                pk<=TB+1 && _spA(av, LZ, lfz(pi-2,pj-2,pk-1), iflo(up ? mhd_face9(mh,ppz,m0) : padd(mh,sz,1.0f0),m0,smallr,pfl), AN, a0)
+                pk>=2    && _spA(av, RZ, lfz(pi-2,pj-2,pk-2), iflo(up ? mhd_face9(mh,pmz,m0) : padd(mh,sz,-1.0f0),m0,smallr,pfl), AN, a0)
             end
             t+=nth
         end
         sync_threads(); nfx=(TB+1)*TB*TB; t=tid
         while t <= 3*nfx
             if t<=nfx
-                l=t-1;fi=l%(TB+1);fj=(l÷(TB+1))%TB;fk=l÷((TB+1)*TB)
-                _spT(LX, lfx(fi,fj,fk), riemann_sel(rv, _sgT(LX,lfx(fi,fj,fk)), _sgT(RX,lfx(fi,fj,fk)), 1, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+                l=t-1;fi=l%(TB+1);fj=(l÷(TB+1))%TB;fk=l÷((TB+1)*TB); f=lfx(fi,fj,fk)
+                F = riemann_sel(rv, _sgA(av,LX,f,AN,ai(fi+1,fj+2,fk+2)), _sgA(av,RX,f,AN,ai(fi+2,fj+2,fk+2)), 1, gamma,ch,smallr,pfl,llf_dmin,llf_pmin)
+                _spF(av, LX, RX, f, F, dtdx)
             elseif t<=2*nfx
-                l=t-1-nfx;fi=l%TB;fj=(l÷TB)%(TB+1);fk=l÷(TB*(TB+1))
-                _spT(LY, lfy(fi,fj,fk), riemann_sel(rv, _sgT(LY,lfy(fi,fj,fk)), _sgT(RY,lfy(fi,fj,fk)), 2, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+                l=t-1-nfx;fi=l%TB;fj=(l÷TB)%(TB+1);fk=l÷(TB*(TB+1)); f=lfy(fi,fj,fk)
+                F = riemann_sel(rv, _sgA(av,LY,f,AN,ai(fi+2,fj+1,fk+2)), _sgA(av,RY,f,AN,ai(fi+2,fj+2,fk+2)), 2, gamma,ch,smallr,pfl,llf_dmin,llf_pmin)
+                _spF(av, LY, RY, f, F, dtdx)
             else
-                l=t-1-2*nfx;fi=l%TB;fj=(l÷TB)%TB;fk=l÷(TB*TB)
-                _spT(LZ, lfz(fi,fj,fk), riemann_sel(rv, _sgT(LZ,lfz(fi,fj,fk)), _sgT(RZ,lfz(fi,fj,fk)), 3, gamma,ch,smallr,pfl,llf_dmin,llf_pmin))
+                l=t-1-2*nfx;fi=l%TB;fj=(l÷TB)%TB;fk=l÷(TB*TB); f=lfz(fi,fj,fk)
+                F = riemann_sel(rv, _sgA(av,LZ,f,AN,ai(fi+2,fj+2,fk+1)), _sgA(av,RZ,f,AN,ai(fi+2,fj+2,fk+2)), 3, gamma,ch,smallr,pfl,llf_dmin,llf_pmin)
+                _spF(av, LZ, RZ, f, F, dtdx)
             end
             t+=nth
         end
         sync_threads(); t=tid
+        sc = ANC ? 1.0f0 : dtdx
         while t <= TB*TB*TB
             l=t-1;a=l%TB;b=(l÷TB)%TB;c=l÷(TB*TB); gi=wrp(ox+a+1,N);gj=wrp(oy+b+1,N);gk=wrp(oz+c+1,N)
-            Fxl=_sgT(LX,lfx(a,b,c));Fxh=_sgT(LX,lfx(a+1,b,c));Fyl=_sgT(LY,lfy(a,b,c));Fyh=_sgT(LY,lfy(a,b+1,c));Fzl=_sgT(LZ,lfz(a,b,c));Fzh=_sgT(LZ,lfz(a,b,c+1))
+            Fxl=_sgF(av,LX,RX,lfx(a,b,c));Fxh=_sgF(av,LX,RX,lfx(a+1,b,c));Fyl=_sgF(av,LY,RY,lfy(a,b,c));Fyh=_sgF(av,LY,RY,lfy(a,b+1,c));Fzl=_sgF(av,LZ,RZ,lfz(a,b,c));Fzh=_sgF(av,LZ,RZ,lfz(a,b,c+1))
             u0 = loadc(uold,gi,gj,gk)
-            r1 = ntuple(v -> u0[v] + dtdx*((Fxl[v]-Fxh[v])+(Fyl[v]-Fyh[v])+(Fzl[v]-Fzh[v])), 9)
+            r1 = ntuple(v -> u0[v] + sc*((Fxl[v]-Fxh[v])+(Fyl[v]-Fyh[v])+(Fzl[v]-Fzh[v])), 9)
             if r1[1] < smallr
                 emag=0.5f0*(r1[6]*r1[6]+r1[7]*r1[7]+r1[8]*r1[8])
                 r1=(smallr,0.0f0,0.0f0,0.0f0,pfl/(gamma-1.0f0)+emag,r1[6],r1[7],r1[8],r1[9])
             end
             r=(r1[1],r1[2],r1[3],r1[4],r1[5],r1[6],r1[7],r1[8], r1[9]*glm_fac)
+            if FCT
+                _fct_store!(Val(FCT), fs, gi, gj, gk, Fxh, Fyh, Fzh)
+                r=(r[1],r[2],r[3],r[4],r[5],u0[6],u0[7],u0[8],0.0f0)
+            end
             if do_turb && r[1] >= turb_min_rho
                 ax,ay,az = turb_interp(afield, gi,gj,gk, boxlen/N, boxlen, ramp)
                 rhom=max(r[1],smallr); sc2=smallc*smallc; rho=r[1]; e=r[5]
@@ -1014,10 +1168,10 @@ function integrator_plm_ppm!(::Val{TB}, ::Val{HALF}, ::Val{RIEM}, unew, uold, af
 end
 
 @inline function _plm_ppm_launch(tv::Val, hv::Val, rv::Val, nthreads, nb, unew, uold, afield, p::Params,
-                                 pfl, dt, dx, ch, glm_fac, ramp, do_turb)
+                                 pfl, dt, dx, ch, glm_fac, ramp, do_turb, av::Val=Val(false), fv::Val=Val(false), fs=unew)
     @cuda threads=nthreads blocks=(nb,nb,nb) integrator_plm_ppm!(
         tv, hv, rv, unew, uold, afield, p.gamma, p.smallr, pfl, p.smallc, dt, dx, ch, glm_fac,
-        p.switch_llf_dmin, p.switch_llf_pmin, p.N, p.boxlen, ramp, p.turb_min_rho, do_turb)
+        p.switch_llf_dmin, p.switch_llf_pmin, p.N, p.boxlen, ramp, p.turb_min_rho, do_turb, av, fv, fs)
 end
 
 # ============================================================================
@@ -1946,10 +2100,10 @@ function integrator_stream!(unew, uold, afield,
 end
 
 function step_stream!(uold, unew, afield, p::Params, dt::Float32, t::Float32;
-                      use_hlld::Bool=true, do_turb::Bool=false, nthreads::Int=64)
+                      use_hlld::Bool=true, do_turb::Bool=false, nthreads::Int=64, dt_cfl::Float32=dt)
     N = p.N; dx = dxof(p); pfl = pfloor(p)
     @assert N % SBX == 0 && N % SBY == 0 && N % SCZ == 0 "N must be a multiple of $SBX and $SCZ"
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dt_cfl/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0)
     @cuda threads=nthreads blocks=(N÷SBX, N÷SBY, N÷SCZ) integrator_stream!(
@@ -1979,9 +2133,9 @@ end
 
 # ---- multi-kernel step (validation path) -----------------------------------
 function step_multi!(uold, unew, rec, flx, ct, afield, p::Params, dt::Float32, t::Float32,
-                     be; use_hlld::Bool=true, do_turb::Bool=false)
+                     be; use_hlld::Bool=true, do_turb::Bool=false, dt_cfl::Float32=dt)
     N = p.N; dx = dxof(p); dtdx = dt/dx; pfl = pfloor(p)
-    ch = p.courant*dx/dt/Float32(NDIM)*p.glm_ch_scale
+    ch = p.courant*dx/dt_cfl/Float32(NDIM)*p.glm_ch_scale
     glm_fac = p.glm_cp_coef > 0 ? exp(-(ch*ch/(p.glm_cp_coef*p.boxlen*ch))*dt) : 1.0f0
     ramp = min(t/p.turb_T, 1.0f0)
     recon_kernel!(be)(rec, uold, p.gamma, p.smallr, pfl, dtdx, N; ndrange=(N,N,N))
@@ -2055,9 +2209,9 @@ function run_ot(; N::Int=128, t_end::Float32=0.5f0, use_hlld::Bool=true,
     ic_ot_kernel!(be)(u1, N, p.gamma; ndrange=(N,N,N)); KA.synchronize(be)
     t = 0.0f0; step = 0
     while t < t_end
-        dt = compute_dt(u1, ct, p, be)
-        dt = min(dt, t_end - t)
-        step_multi!(u1, u2, rec, flx, ct, afield, p, dt, t, be; use_hlld=use_hlld, do_turb=false)
+        dtc = compute_dt(u1, ct, p, be)
+        dt = min(dtc, t_end - t)
+        step_multi!(u1, u2, rec, flx, ct, afield, p, dt, t, be; use_hlld=use_hlld, do_turb=false, dt_cfl=dtc)
         u1, u2 = u2, u1
         t += dt; step += 1
     end
@@ -2217,14 +2371,14 @@ function run_turb(; N::Int=128, t_end::Float32=0.6f0, amp::Float32=130.0f0, use_
         while t >= f.next_time
             ou_advance!(f, p, be)
         end
-        dt = compute_dt(u1, ct, p, be)
-        dt = min(dt, f.next_time - t, t_end - t)
+        dtc = compute_dt(u1, ct, p, be)
+        dt = min(dtc, f.next_time - t, t_end - t)
         if gpu && solver === :plm        # Hancock + HLL + GLM + PLM, f16 shared; TB auto (6 if N%6==0 else 4)
-            step_plm!(u1, u2, f.afield, p, dt, t; do_turb=true, nthreads=nthreads, tb=0, half=true, riemann=:hll)
+            step_plm!(u1, u2, f.afield, p, dt, t; do_turb=true, nthreads=nthreads, tb=0, half=true, riemann=:hll, dt_cfl=dtc)
         elseif gpu
-            step_tiled!(u1, u2, f.afield, p, dt, t; use_hlld=use_hlld, do_turb=true, nthreads=nthreads)
+            step_tiled!(u1, u2, f.afield, p, dt, t; use_hlld=use_hlld, do_turb=true, nthreads=nthreads, dt_cfl=dtc)
         else
-            step_multi!(u1, u2, rec, flx, ct, f.afield, p, dt, t, be; use_hlld=use_hlld, do_turb=true)
+            step_multi!(u1, u2, rec, flx, ct, f.afield, p, dt, t, be; use_hlld=use_hlld, do_turb=true, dt_cfl=dtc)
         end
         u1, u2 = u2, u1
         t += dt; step += 1
@@ -2284,8 +2438,8 @@ function validate_tiled_ot(; N::Int=64, t_end::Float32=0.2f0, lean::Bool=false)
     ic_ot_kernel!(be)(u1, N, p.gamma; ndrange=(N,N,N)); KA.synchronize(be)
     t=0.0f0; step=0
     while t < t_end
-        dt = compute_dt(u1, ct, p, be); dt = min(dt, t_end-t)
-        step_tiled!(u1, u2, afield, p, dt, t; use_hlld=true, do_turb=false, lean=lean); CUDA.synchronize(); u1,u2=u2,u1
+        dtc = compute_dt(u1, ct, p, be); dt = min(dtc, t_end-t)
+        step_tiled!(u1, u2, afield, p, dt, t; use_hlld=true, do_turb=false, lean=lean, dt_cfl=dtc); CUDA.synchronize(); u1,u2=u2,u1
         t += dt; step += 1
     end
     d = diagnostics(u1, ct, p, be)
@@ -2332,8 +2486,8 @@ function validate_fused_ot(; N::Int=64, t_end::Float32=0.2f0)
     ic_ot_kernel!(be)(u1, N, p.gamma; ndrange=(N,N,N)); KA.synchronize(be)
     t=0.0f0; step=0
     while t < t_end
-        dt = compute_dt(u1, ct, p, be); dt = min(dt, t_end-t)
-        step_fused!(u1, u2, afield, p, dt, t, be; use_hlld=true, do_turb=false); u1,u2=u2,u1
+        dtc = compute_dt(u1, ct, p, be); dt = min(dtc, t_end-t)
+        step_fused!(u1, u2, afield, p, dt, t, be; use_hlld=true, do_turb=false, dt_cfl=dtc); u1,u2=u2,u1
         t += dt; step += 1
     end
     d = diagnostics(u1, ct, p, be)
